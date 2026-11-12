@@ -119,6 +119,74 @@ class ASCAModel(nn.Module):
             idx = torch.cat([idx, torch.multinomial(probs, 1)], dim=1)
         return idx
 
+    # --------------------------------------------------------------- decode
+    def init_cache(self, batch: int = 1, device=None, dtype=None) -> dict:
+        """Inisialisasi cache decode inkremental (KV lokal + state linear + memori)."""
+        p = next(self.parameters())
+        device = device or p.device
+        dtype = dtype or p.dtype
+        cache = {
+            "pos": 0,
+            "sem": self.sem.init_state(batch, device, dtype)
+            if hasattr(self.sem, "init_state")
+            else {},
+            "layers": [blk.init_state(batch, device, dtype) for blk in self.blocks],
+        }
+        return cache
+
+    def forward_step(self, idx_t: torch.Tensor, cache: dict) -> torch.Tensor:
+        """Satu token dengan cache: ``idx_t`` berbentuk ``(B,1)`` -> logits ``(B,1,V)``.
+
+        Secara matematis identik dengan ``forward`` pada sekuens penuh (diverifikasi
+        ``tests/run_tests.py::test_incremental_matches_full_forward``), tetapi biaya
+        per token O(w·D + Dh²) alih-alih O(T²).
+        """
+        B, T = idx_t.shape
+        if T != 1:
+            raise ValueError("forward_step hanya menerima satu token per panggilan")
+        pos = cache["pos"]
+        if pos >= self.cfg.max_seq_len:
+            raise ValueError("melebihi max_seq_len; reset cache atau perpanjang konteks")
+
+        h0 = self.embed(idx_t) * math.sqrt(self.cfg.d_model)
+        h = self.sem.step(h0, pos, cache["sem"]) if hasattr(self.sem, "step") else self.sem(h0)
+
+        aux_total = h.new_zeros(())
+        for blk, st in zip(self.blocks, cache["layers"]):
+            h, aux = blk.step(h, pos, st)
+            aux_total = aux_total + aux
+        self.last_aux_loss = aux_total / max(1, len(self.blocks))
+        cache["pos"] = pos + 1
+        return self.decoder(h, h0, self.embed.weight)
+
+    @torch.no_grad()
+    def generate_cached(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int = 32,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """Decode autoregresif memakai cache: prefill sekali, lalu 1 token/step."""
+        self.eval()
+        cache = self.init_cache(idx.shape[0], idx.device, self.embed.weight.dtype)
+        # prefill: proses prompt token demi token lewat cache (jalur yang sama
+        # dengan decode, supaya hasilnya identik dengan generate() tanpa cache)
+        logits = None
+        for t in range(idx.shape[1]):
+            logits = self.forward_step(idx[:, t : t + 1], cache)
+        for _ in range(max_new_tokens):
+            step_logits = logits[:, -1, :] / max(temperature, 1e-6)
+            if top_k is not None:
+                k = min(top_k, step_logits.size(-1))
+                thresh = torch.topk(step_logits, k, dim=-1).values[:, -1:]
+                step_logits = step_logits.masked_fill(step_logits < thresh, float("-inf"))
+            probs = F.softmax(step_logits, dim=-1)
+            nxt = torch.multinomial(probs, 1)
+            idx = torch.cat([idx, nxt], dim=1)
+            logits = self.forward_step(nxt, cache)
+        return idx
+
     # --------------------------------------------------------------- statistik
     def num_params(self, non_embedding: bool = False) -> int:
         n = sum(p.numel() for p in self.parameters())

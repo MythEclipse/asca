@@ -3,11 +3,12 @@
 Riset arsitektur LLM dari nol (*random init*, tanpa bobot pretrained) yang mengejar
 efisiensi komputasi dan memori melalui mekanisme adaptif dan sparse.
 
-> **Status: v0.2 — prototipe teruji kausalitasnya + optimasi kernel tahap pertama.**
+> **Status: v0.3 — decode inkremental (KV-cache + state rekuren) + fix bug normalisasi memori.**
 > Ringkasan jujur di [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md): kualitas **setara**
 > dense baseline (param-matched), throughput training naik **1.68×** setelah
-> grouped-GEMM MoE + chunk adaptif + `torch.compile`, tetapi **masih ~2.6–5× lebih
-> lambat** dan **~1.9× lebih boros VRAM** daripada dense. Belum ada klaim keunggulan.
+> grouped-GEMM MoE + chunk adaptif + `torch.compile`, memori cache decode **konstan**
+> (6.4 MB vs 24 MB dense pada konteks 2036), tetapi **masih ~5× lebih lambat** dalam
+> wall-clock dan **~1.9× lebih boros VRAM training**. Belum ada klaim keunggulan.
 
 ---
 
@@ -68,6 +69,7 @@ asca/
 │   ├── bench_flops.py          # FLOPs/token & throughput terukur
 │   ├── bench_vram.py           # Peak VRAM 512..4096 & latensi decode
 │   ├── profile_asca.py         # Profil per-komponen (cari hotspot)
+│   ├── bench_decode.py         # Latensi decode + memori cache (cached vs recompute)
 │   └── train_toy.py            # Training komparasi multi-seed (utama)
 └── tests/
     └── run_tests.py            # Uji kausalitas, referensi naif, shapes, MoE, dll.
@@ -133,11 +135,15 @@ Korpus nyata (perlu `datasets` di venv bersama untuk streaming HF):
 Sudah selesai (v0.2): grouped-GEMM MoE dispatch (1.7×), chunk adaptif (2.0× pada
 attention), jalur FlexAttention opsional, `torch.compile` opt-in (1.54×).
 
-1. **KV-cache + state rekuren** untuk decode (saat ini recompute penuh, 10.4 ms/tok).
-2. **Kapasitas blok MoE statis** agar `torch.compile` tidak graph-break dan padding
-   bisa dibatasi (sekarang 1.07×–1.65× tergantung keseimbangan routing).
-3. **Turunkan VRAM**: FlexAttention sebagai default pada T besar, dan ganti skor
+Sudah selesai (v0.3): KV-cache + state rekuren decode (identik dengan forward penuh),
+fix normalisasi `SegmentMemory`, cache decode berukuran tetap.
+
+1. **Kernel decode**: ~2.900 kernel/token → CUDA Graph atau kernel terfusi
+   (`torch.compile` di jalur `step` justru 40× lebih lambat). Target: < 2 ms/tok.
+2. **Prefill paralel**: `generate_cached` masih memproses prompt token-demi-token.
+3. **Kapasitas blok MoE statis** agar padding terbatas dan compile bersih.
+4. **Turunkan VRAM training**: FlexAttention sebagai default pada T besar, ganti skor
    memori O(S²LM) dengan pembacaan per-segmen.
-4. **Ablasi penuh A0–A6** pada ≥100M token (sekarang baru 300–600 step, 1 seed/3 seed).
-5. **Skala**: preset `small` (seq 1024) lalu Colab (A100/T4) untuk pretraining
+5. **Ablasi penuh A0–A6** pada ≥100M token (sekarang baru 300–600 step, 1 seed/3 seed).
+6. **Skala**: preset `small` (seq 1024) lalu Colab (A100/T4) untuk pretraining
    dengan checkpoint ke Drive/HF Hub + resume otomatis.

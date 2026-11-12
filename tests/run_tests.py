@@ -86,28 +86,25 @@ def naive_local(q, k, v, w):
     return out
 
 
-def naive_gated_linear(q, k, v, lam, chunk):
-    """Gated linear attention referensi, bentuk rekuren per token."""
+def naive_gated_linear(q, k, v, lam):
+    """Gated linear attention referensi: rekurensi per token.
+
+    ``lam`` berbentuk ``(B,H,T)`` = forget gate per token per head. Bentuk chunked
+    yang dipakai model harus mereproduksi ini persis.
+    """
     B, H, T, Dh = q.shape
-    C = chunk
-    S = (T + C - 1) // C
     qf, kf = F.elu(q) + 1.0, F.elu(k) + 1.0
     out = torch.zeros_like(q)
     state = torch.zeros(B, H, Dh, Dh, dtype=q.dtype)
     ksum = torch.zeros(B, H, Dh, dtype=q.dtype)
-    for s in range(S):
-        t0, t1 = s * C, min(T, (s + 1) * C)
-        part = torch.zeros_like(state)
-        kpart = torch.zeros_like(ksum)
-        for t in range(t0, t1):
-            # sertakan token saat ini (j <= i) sebelum menghitung keluaran
-            part = part + kf[:, :, t].unsqueeze(-1) * v[:, :, t].unsqueeze(-2)
-            kpart = kpart + kf[:, :, t]
-            num = (qf[:, :, t].unsqueeze(-2) @ (state + part)).squeeze(-2)
-            den = (qf[:, :, t] * (ksum + kpart)).sum(-1, keepdim=True)
-            out[:, :, t] = num / (den + 1e-6)
-        state = lam[..., s].view(B, H, 1, 1) * state + part
-        ksum = lam[..., s].view(B, H, 1) * ksum + kpart
+    for t in range(T):
+        state = lam[:, :, t].view(B, H, 1, 1) * state + kf[:, :, t].unsqueeze(
+            -1
+        ) * v[:, :, t].unsqueeze(-2)
+        ksum = lam[:, :, t].view(B, H, 1) * ksum + kf[:, :, t]
+        num = (qf[:, :, t].unsqueeze(-2) @ state).squeeze(-2)
+        den = (qf[:, :, t] * ksum).sum(-1, keepdim=True)
+        out[:, :, t] = num / (den + 1e-6)
     return out
 
 
@@ -159,26 +156,33 @@ def test_local_attention_matches_reference():
 
 @test
 def test_global_linear_matches_reference():
+    """Bentuk chunked harus identik dengan rekurensi per token (2 mode decay)."""
     torch.manual_seed(2)
     for T in (16, 20):  # 20 bukan kelipatan chunk -> menguji jalur padding
-        cfg = small_cfg()
-        attn = AdaptiveHybridAttention(cfg).eval()
-        B = 2
-        C = attn.effective_chunk(T)
-        lam_val = torch.tensor([0.5, 0.8, 0.95, 0.2])
-        with torch.no_grad():
-            attn.decay.weight.zero_()
-            attn.decay.bias.copy_(torch.log(lam_val / (1 - lam_val)))
-        q = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
-        k = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
-        v = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
-        x = torch.randn(B, T, cfg.d_model)
-        got = attn._global(x, q, k, v, T)
-        S = (T + C - 1) // C
-        lam = lam_val.view(1, cfg.n_heads, 1).expand(B, cfg.n_heads, S).contiguous()
-        ref = naive_gated_linear(q, k, v, lam, C)
-        err = (got - ref).abs().max().item()
-        assert torch.allclose(got, ref, atol=1e-4), f"T={T}: gated linear beda, max err {err:.3e}"
+        for mode in ("konstan", "per-token"):
+            cfg = small_cfg()
+            attn = AdaptiveHybridAttention(cfg).eval()
+            B = 2
+            lam_val = torch.tensor([0.5, 0.8, 0.95, 0.2])
+            with torch.no_grad():
+                if mode == "konstan":
+                    attn.decay.weight.zero_()
+                    attn.decay.bias.copy_(torch.log(lam_val / (1 - lam_val)))
+                else:
+                    attn.decay.weight.normal_(0, 0.5)
+                    attn.decay.bias.copy_(torch.log(lam_val / (1 - lam_val)) * 0.1)
+            q = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
+            k = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
+            v = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
+            x = torch.randn(B, T, cfg.d_model)
+            with torch.no_grad():
+                got = attn._global(q, k, v, attn._log_decay(x), T)
+                lam = torch.sigmoid(attn.decay(x)).transpose(1, 2)  # (B,H,T)
+                ref = naive_gated_linear(q, k, v, lam)
+            err = (got - ref).abs().max().item()
+            assert torch.allclose(got, ref, atol=1e-4), (
+                f"T={T} mode={mode}: gated linear beda dari referensi, max err {err:.3e}"
+            )
 
 
 @test
@@ -336,6 +340,23 @@ def test_forward_backward_finite():
 
 
 @test
+def test_incremental_matches_full_forward():
+    """Decode inkremental (KV lokal + state linear + memori) harus identik dengan forward penuh."""
+    torch.manual_seed(11)
+    cfg = small_cfg()
+    model = ASCAModel(cfg).eval()
+    B, T = 2, 40  # 40 > 2*16 -> melintasi beberapa segmen memori
+    x = torch.randint(0, cfg.vocab_size, (B, T))
+    with torch.no_grad():
+        full, _ = model(x)
+        cache = model.init_cache(B, x.device, model.embed.weight.dtype)
+        steps = torch.cat([model.forward_step(x[:, t : t + 1], cache) for t in range(T)], dim=1)
+    diff = (full - steps).abs().max().item()
+    assert diff < 2e-5, f"decode inkremental beda dari forward penuh: max diff {diff:.3e}"
+    assert cache["pos"] == T, "posisi cache harus maju satu per token"
+
+
+@test
 def test_generate_runs():
     torch.manual_seed(8)
     cfg = small_cfg()
@@ -344,6 +365,9 @@ def test_generate_runs():
     out = model.generate(x, max_new_tokens=5, temperature=0.8, top_k=10)
     assert out.shape == (1, 13)
     assert out[:, :8].equal(x), "generate tidak boleh mengubah prompt"
+    out2 = model.generate_cached(x, max_new_tokens=5, temperature=0.8, top_k=10)
+    assert out2.shape == (1, 13)
+    assert out2[:, :8].equal(x), "generate_cached tidak boleh mengubah prompt"
 
 
 @test

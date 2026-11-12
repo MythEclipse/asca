@@ -25,6 +25,9 @@ test:
 bench:
 	$(PY) benchmarks/bench_flops.py --preset $(PRESET) --out $(OUT)
 
+decode:
+	$(PY) benchmarks/bench_decode.py --preset $(PRESET) --contexts 512,1024,2048
+
 vram:
 	$(PY) benchmarks/bench_vram.py --preset $(PRESET) --out $(OUT)
 
@@ -36,7 +39,7 @@ ablations:
 	$(PY) benchmarks/train_toy.py --preset $(PRESET) --steps $(STEPS) --batch $(BATCH) \
 		--seq-len $(SEQ) --models asca,A1,A2,A3,A4,A5,A6 --seeds 0 --out $(OUT)
 
-all: test bench vram train
+all: test bench decode vram train
 
 clean:
 	rm -rf data/cache __pycache__ */__pycache__ .pytest_cache

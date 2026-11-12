@@ -63,7 +63,10 @@ class AdaptiveSparseMoE(nn.Module):
         weights, top_idx = self.router.route(logits)
         aux = self.router.aux_loss(logits, top_idx)
 
-        if self.impl == "grouped":
+        # Dispatch: pada decode (token sangat sedikit) jalur grouped GEMM justru
+        # didominasi overhead argsort/bincount/padding. Ambang kecil -> pakai loop.
+        use_grouped = self.impl == "grouped" and flat.shape[0] * self.top_k > 64
+        if use_grouped:
             out = self._routed_grouped(flat, weights, top_idx)
         else:
             out = self._routed_loop(flat, weights, top_idx)

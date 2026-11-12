@@ -300,7 +300,9 @@ Hasil ditulis ke `docs/EXPERIMENTS.md` oleh `benchmarks/train_toy.py`
 
 ## 7. Batasan yang Diakui (v0.2)
 
-1. Gating decay pada attention linear masih per-chunk, bukan per-token.
+1. ~~Gating decay per-chunk~~ **selesai (v0.3)**: decay sekarang per token
+   ($\lambda_t = \sigma(W_\lambda x_t)$), sehingga bentuk chunked saat training dan
+   bentuk rekuren saat decode identik secara matematis.
 2. SegmentMemory memakai ringkasan statis per segmen (tidak ada update rekuren
    antar-forward pada versi training paralel).
 3. Attention lokal default memakai mask eksplisit (cocok untuk $T \le 4096$); jalur
@@ -310,12 +312,17 @@ Hasil ditulis ke `docs/EXPERIMENTS.md` oleh `benchmarks/train_toy.py`
    gate); ini asumsi desain yang perlu diuji.
 5. Grouped GEMM MoE membayar padding yang bergantung keseimbangan routing
    (1.07×–1.65× terukur). Belum ada dispatch dengan kapasitas terbatas per blok.
-6. Belum ada KV-cache / state rekuren untuk decode; `generate()` masih recompute
-   penuh sehingga latensi decode belum representatif.
+6. ~~Belum ada KV-cache~~ **selesai (v0.3)**: `init_cache`/`forward_step`/`generate_cached`
+   untuk ASCA *dan* baseline. Diverifikasi identik dengan forward penuh (galat ~1e-7).
+   Yang belum: latensi per token masih ~4.7× lebih lambat dari dense karena ~2.900
+   kernel/token; perlu CUDA Graph atau kernel terfusi (bukan `torch.compile`, yang
+   justru 40× lebih lambat di jalur ini). Prefill juga masih token-demi-token.
 7. `torch.compile` memecah graph pada `int(counts.max().item())` di dispatch MoE
    (graph break, bukan error). Menghapusnya butuh kapasitas blok statis.
 8. Belum ada hasil benchmark pada skala bermakna (≥100M token). **Tidak ada klaim
    keunggulan.**
+9. Seluruh hasil v0.1–v0.2 memakai `SegmentMemory` dengan normalisasi softmax yang
+   salah (lintas posisi query). Sudah diperbaiki di v0.3; angka lama tidak dipakai.
 
 ---
 
@@ -330,6 +337,8 @@ Detail lengkap + cara reproduksi: `docs/EXPERIMENTS.md`.
 | MoE grouped GEMM (2 `bmm`, bukan 3·E kernel) | MoE 3.78 → 2.22 ms (1.7×) |
 | `torch.compile` (opt-in `--compile`) | model penuh 66.3 → 42.9 ms (1.54×) |
 | Total end-to-end training (nano, 3 seed) | 63.0k → **106.1k tok/s (1.68×)** |
+| KV-cache + state rekuren decode | latensi datar terhadap konteks: 9.3 → 10.3 ms/tok (512 → 2036), cache **6.4 MB konstan** vs dense 24 MB |
+| Fix normalisasi `SegmentMemory` | val loss ASCA 0.4159 ± 0.0020 vs dense 0.4210 ± 0.0145 (setara) |
 
 Status jujur: kualitas setara dense param-matched (0.4165 vs 0.4167 val loss pada
 1.23M token), FLOPs/token +7% pada active params setara (preset tiny), tetapi

@@ -49,3 +49,23 @@ class ASCABlock(nn.Module):
         else:
             x = x + self.mlp(self.norm_mlp(x))
         return x, aux
+
+    # ------------------------------------------------------------------ step
+    def init_state(self, batch: int, device, dtype) -> dict:
+        st = {"attn": self.attn.init_state(batch, device, dtype)}
+        if self.use_memory:
+            st["mem"] = self.mem.init_state(batch, device, dtype)
+        return st
+
+    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """Satu token (decode inkremental)."""
+        x = x_t + self.attn.step(self.norm_attn(x_t), pos, state["attn"])
+        if self.use_memory:
+            x = x + self.mem.step(self.norm_mem(x), pos, state["mem"])
+        aux = x.new_zeros(())
+        if self.use_moe:
+            h, aux = self.mlp(self.norm_mlp(x))
+            x = x + h
+        else:
+            x = x + self.mlp(self.norm_mlp(x))
+        return x, aux

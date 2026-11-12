@@ -19,6 +19,7 @@ class SemanticEncoder(nn.Module):
     def __init__(self, cfg: ASCAConfig) -> None:
         super().__init__()
         d = cfg.d_model
+        self.d = d
         self.kernel = cfg.sem_conv_kernel
         self.norm = RMSNorm(d)
         self.conv = nn.Conv1d(d, d, kernel_size=self.kernel, groups=d, bias=False)
@@ -33,3 +34,16 @@ class SemanticEncoder(nn.Module):
         c = F.pad(u.transpose(1, 2), (self.kernel - 1, 0))
         c = self.conv(c).transpose(1, 2)
         return x + self.w2(self.act(self.w1(c)))
+
+    # ------------------------------------------------------------------ step
+    def init_state(self, batch: int, device, dtype) -> dict:
+        """Buffer ``kernel-1`` input ternormalisasi terakhir (konvolusi kausal)."""
+        return {"buf": torch.zeros(batch, self.kernel - 1, self.d, device=device, dtype=dtype)}
+
+    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> torch.Tensor:
+        u = self.norm(x_t)  # (B,1,D)
+        buf = torch.cat([state["buf"], u], dim=1)[:, -(self.kernel) :]  # (B,K,D)
+        state["buf"] = buf[:, -(self.kernel - 1) :]
+        # out[d] = sum_j w[d,0,j] * buf[j]  (sama dengan konvolusi kausal di forward)
+        c = (buf * self.conv.weight[:, 0, :].transpose(0, 1)).sum(dim=1, keepdim=True)
+        return x_t + self.w2(self.act(self.w1(c)))

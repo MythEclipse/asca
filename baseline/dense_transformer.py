@@ -54,6 +54,7 @@ class CausalSelfAttention(nn.Module):
         self.h = cfg.n_heads
         self.dh = cfg.head_dim
         self.dropout = cfg.dropout
+        self.cfg_theta = cfg.rope_theta
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.bias)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
 
@@ -67,6 +68,25 @@ class CausalSelfAttention(nn.Module):
             q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0
         )
         return self.proj(out.transpose(1, 2).reshape(B, T, D))
+
+    # --- decode inkremental (KV-cache penuh, O(T) memori) ---
+    def init_state(self, batch: int, device, dtype) -> dict:
+        return {"k": None, "v": None}
+
+    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> torch.Tensor:
+        B, _, D = x_t.shape
+        q, k, v = self.qkv(x_t).split(D, dim=-1)
+        q = q.view(B, 1, self.h, self.dh).transpose(1, 2)
+        k = k.view(B, 1, self.h, self.dh).transpose(1, 2)
+        v = v.view(B, 1, self.h, self.dh).transpose(1, 2)
+        cos, sin = rope_cache(pos + 1, self.dh, self.cfg_theta, x_t.device, x_t.dtype)
+        cos, sin = cos[pos : pos + 1], sin[pos : pos + 1]
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+        state["k"] = k if state["k"] is None else torch.cat([state["k"], k], dim=2)
+        state["v"] = v if state["v"] is None else torch.cat([state["v"], v], dim=2)
+        out = F.scaled_dot_product_attention(q, state["k"], state["v"])
+        return self.proj(out.transpose(1, 2).reshape(B, 1, D))
 
 
 class SwiGLU(nn.Module):
@@ -90,6 +110,13 @@ class DenseBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.norm_attn(x), cos, sin)
+        return x + self.mlp(self.norm_mlp(x))
+
+    def init_state(self, batch: int, device, dtype) -> dict:
+        return self.attn.init_state(batch, device, dtype)
+
+    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> torch.Tensor:
+        x = x_t + self.attn.step(self.norm_attn(x_t), pos, state)
         return x + self.mlp(self.norm_mlp(x))
 
 
@@ -159,6 +186,51 @@ class DenseTransformer(nn.Module):
                 thresh = torch.topk(logits, k, dim=-1).values[:, -1:]
                 logits = logits.masked_fill(logits < thresh, float("-inf"))
             idx = torch.cat([idx, torch.multinomial(F.softmax(logits, -1), 1)], dim=1)
+        return idx
+
+    # --------------------------------------------------------------- decode
+    def init_cache(self, batch: int = 1, device=None, dtype=None) -> dict:
+        p = next(self.parameters())
+        return {
+            "pos": 0,
+            "layers": [b.init_state(batch, device or p.device, dtype or p.dtype) for b in self.blocks],
+        }
+
+    def forward_step(self, idx_t: torch.Tensor, cache: dict) -> torch.Tensor:
+        if idx_t.shape[1] != 1:
+            raise ValueError("forward_step hanya menerima satu token per panggilan")
+        pos = cache["pos"]
+        if pos >= self.cfg.max_seq_len:
+            raise ValueError("melebihi max_seq_len; reset cache")
+        x = self.embed(idx_t)
+        for block, st in zip(self.blocks, cache["layers"]):
+            x = block.step(x, pos, st)
+        x = self.norm_f(x)
+        cache["pos"] = pos + 1
+        return F.linear(x, self.embed.weight) if self.tied else self.head(x)
+
+    @torch.no_grad()
+    def generate_cached(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int = 32,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        self.eval()
+        cache = self.init_cache(idx.shape[0], idx.device, self.embed.weight.dtype)
+        logits = None
+        for t in range(idx.shape[1]):
+            logits = self.forward_step(idx[:, t : t + 1], cache)
+        for _ in range(max_new_tokens):
+            step_logits = logits[:, -1, :] / max(temperature, 1e-6)
+            if top_k is not None:
+                k = min(top_k, step_logits.size(-1))
+                thresh = torch.topk(step_logits, k, dim=-1).values[:, -1:]
+                step_logits = step_logits.masked_fill(step_logits < thresh, float("-inf"))
+            nxt = torch.multinomial(F.softmax(step_logits, -1), 1)
+            idx = torch.cat([idx, nxt], dim=1)
+            logits = self.forward_step(nxt, cache)
         return idx
 
     def num_params(self, non_embedding: bool = False) -> int:

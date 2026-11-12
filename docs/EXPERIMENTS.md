@@ -18,45 +18,39 @@ Hasil benchmark otomatis. Setiap entri menyertakan konfigurasi lengkap.
   **Selisih < ~0.08 val loss pada budget ini tidak bermakna**; jangan menafsirkan
   satu seed sebagai bukti.
 
-## Status ringkas v0.2 (setelah optimasi kernel, nano, 1.23M token, 3 seed)
+## Status ringkas v0.3 (KV-cache + fix normalisasi memori, nano, 1.23M token, 3 seed)
 
-| Aspek | Sebelum | Sesudah | Kesimpulan |
-|---|---|---|---|
-| Throughput ASCA | 63.0k tok/s | **106.1k ± 1.5k tok/s** | **1.68×** lebih cepat (grouped GEMM + chunk adaptif + `torch.compile`) |
-| Throughput dense-matched | 344k tok/s | 534k ± 24k tok/s | 1.55× (compile juga membantu baseline — jarak tetap ~5×) |
-| val loss | 0.4144 ± 0.0034 vs 0.4093 ± 0.0018 | **0.4165 ± 0.0020 vs 0.4167 ± 0.0063** | **setara** dengan dense param-matched (dalam noise) |
-| FLOPs/token (param-matched) | 2.61M vs 2.97M | 3.65M vs 2.97M | +23% lebih boros; sebagian dari padding grouped GEMM |
-| VRAM training (nano) | 175 MB vs 124 MB | 185 MB vs 99 MB | masih **1.9× lebih besar** |
+| Aspek | Hasil | Kesimpulan |
+|---|---|---|
+| Kualitas (val loss) | ASCA **0.4159 ± 0.0020** vs dense-matched 0.4210 ± 0.0145 | **setara** (dalam noise; ASCA variansnya lebih kecil) |
+| Throughput training | ASCA **103.9k ± 5.3k** tok/s vs dense 557k ± 32k tok/s | masih **5.4× lebih lambat** (occupancy kernel, bukan FLOPs) |
+| FLOPs/token (active params setara) | 3.52M vs 2.97M | **+19%** (termasuk padding grouped GEMM) |
+| VRAM training | 190 MB vs 99 MB | **1.9× lebih besar** |
+| Memori cache decode (konteks 2036) | ASCA **6.4 MB (konstan)** vs dense 24.0 MB | **3.8× lebih kecil dan tidak tumbuh** dengan konteks |
+| Latensi decode (konteks 2036) | ASCA 10.3 ms/tok vs dense 2.2 ms/tok | **4.7× lebih lambat**, tapi 3.8× lebih cepat dari jalur recompute ASCA sendiri |
+| Prefill (token demi token lewat cache) | ASCA ~103 tok/s vs dense ~490 tok/s | jalur prefill ASCA belum memakai forward paralel |
 
-Perubahan yang diukur (profil per-komponen, `benchmarks/profile_asca.py`, tiny T=512):
+**Bug yang ditemukan lewat uji incremental:** softmax pada `SegmentMemory` dulu
+menormalisasi lintas **posisi query** (sumbu `l` ikut masuk sumbu softmax), bukan per
+token. Semua angka v0.1/v0.2 memakai implementasi yang salah itu (tetap kausal, jadi
+uji kausalitas lolos). Sudah diperbaiki; angka v0.3 di atas adalah yang benar.
 
-| Komponen | Sebelum | Sesudah | Perubahan |
-|---|---|---|---|
-| Attention (lokal + linear) | 8.24 ms | 4.09 ms | **2.0×** (chunk 64→128 efektif) |
-| MoE | 3.78 ms | 2.22 ms | **1.7×** (grouped GEMM: 2 `bmm` total, bukan 3·E kernel) |
-| Model penuh (eager) | 71.7 ms | 61.8 ms | 1.16× |
-| Model penuh (+`torch.compile`) | — | 42.9 ms | **1.54×** tambahan |
+**Yang masih gagal (jujur):**
 
-**Yang masih menjadi masalah (jujur):**
+1. **Wall-clock training** masih 5.4× lebih lambat dari dense pada `d_model` kecil.
+   Profil menunjukkan ini overhead kernel/occupancy: ASCA menjalankan 4 sublayer per
+   blok dengan matmul kecil, sedangkan baseline satu jalur GEMM besar.
+2. **VRAM training** belum turun (1.9× lebih besar).
+3. **Latensi decode per token** masih 4.7× lebih lambat dari dense (9–10 ms/tok).
+   Profiler: ~2.900 kernel per token (81 kernel unik). `torch.compile` di jalur `step`
+   justru 40× lebih lambat (guards + recompiles), jadi perlu CUDA Graph / kernel terfusi,
+   bukan compile.
+4. **Prefill lewat cache** masih token-demi-token (belum memakai forward chunked paralel).
+5. **Padding grouped GEMM** bergantung keseimbangan routing (1.07×–1.65×).
 
-1. **VRAM belum turun** — mask window eksplisit T×T dan skor memori O(S²LM) masih material,
-   dan `torch.compile` menambah buffer kerja. Jalur FlexAttention sudah tersedia
-   (`local_attn_impl="flex"`) tapi baru menang saat dikompilasi dan T besar.
-2. **Gap wall-clock vs dense masih ~2.6–5×** pada d_model kecil: ASCA menjalankan 4 sublayer
-   per blok dengan matmul kecil, sementara baseline adalah GEMM besar. Ini masalah
-   *kernel/occupancy*, bukan masalah FLOPs (FLOPs/token hanya +7% pada active params setara
-   di preset tiny).
-3. **Grouped GEMM membayar padding** yang bergantung keseimbangan routing:
-   terukur 1.07× (init seimbang) sampai ~1.65× (routing miring). `moe_pad_factor`
-   dilaporkan di `bench_flops.py`; `moe_impl="loop"` tersedia sebagai jalur yang
-   FLOPs-nya persis sebanding token.
-4. **Belum ada KV-cache**: decode masih recompute penuh (10.4 ms/tok).
-
-**Belum ada klaim keunggulan.** Yang sudah terbukti: mekanisme ASCA benar secara
-matematis (kausal + cocok dengan referensi naif) dan kualitasnya setara baseline pada
-budget ini. Yang belum: efisiensi wall-clock, VRAM, dan latensi decode.
-
-
+**Yang sudah terbukti:** mekanisme benar (kausal + cocok referensi naif + decode
+inkremental identik dengan forward penuh sampai 1e-7), kualitas setara baseline pada
+budget ini, dan memori cache decode konstan terhadap panjang konteks.
 
 ## Training komparasi (nano, 150 step)
 
@@ -409,4 +403,71 @@ _2026-11-12 19:26:39 · seed 0 · device cuda · torch 2.11.0+cu128_
 | B0-dense (default) | 5795072 | 4746496 | 14729216 | 203770.4 | 365.9 | None |
 | B0-dense (param-matched) | 8264960 | 7216384 | 19668992 | 151673.4 | 457.6 | None |
 | ASCA-full | 11779639 | 7192119 | 21110144 | 57724.3 | 760.8 | 1.07 |
+
+
+## Training komparasi (nano, 600 step — setelah fix normalisasi memori + KV-cache)
+
+_2026-11-12 19:54:57 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "synthetic",
+  "tokens_in_corpus": 2000014,
+  "vocab": 120,
+  "steps": 600,
+  "batch": 8,
+  "seq_len": 256,
+  "train_tokens": 1228800,
+  "lr": 0.003,
+  "warmup": 10,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 120,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 256,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 8,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "dense-matched",
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| B0-dense-matched | 1224832 | 1209472 | 2971648 | 1228800 | 0.4210 ± 0.0145 | 1.524 ± 0.022 | 557458 ± 31812 | 99 ± 0 | 3 |
+| A0-asca | 1818389 | 1213205 | 3520512 | 1228800 | 0.4159 ± 0.0020 | 1.516 ± 0.003 | 103871 ± 5261 | 190 ± 3 | 3 |
 
