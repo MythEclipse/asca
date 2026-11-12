@@ -20,6 +20,42 @@ from .config import ASCAConfig
 from .norm import apply_rope, rope_cache
 
 _WINDOW_MASK_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+_FLEX_BLOCK_MASK_CACHE: dict[tuple[int, int, str], object] = {}
+_FLEX_COMPILED = None
+
+
+def _flex_available() -> bool:
+    try:
+        from torch.nn.attention.flex_attention import flex_attention  # noqa: F401
+
+        return True
+    except Exception:  # pragma: no cover - versi torch lama
+        return False
+
+
+def _get_flex_compiled():
+    """Compile ``flex_attention`` sekali per proses (eager-nya sangat lambat)."""
+    global _FLEX_COMPILED
+    if _FLEX_COMPILED is None:
+        from torch.nn.attention.flex_attention import flex_attention
+
+        _FLEX_COMPILED = torch.compile(flex_attention, dynamic=False)
+    return _FLEX_COMPILED
+
+
+def flex_block_mask(t: int, w: int, device: torch.device):
+    """BlockMask kausal berjendela ``w``, di-cache per (T, w, device)."""
+    key = (t, w, str(device))
+    cached = _FLEX_BLOCK_MASK_CACHE.get(key)
+    if cached is None:
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        def mask_mod(b, h, qi, ki):
+            return (ki <= qi) & (ki > qi - w)
+
+        cached = create_block_mask(mask_mod, B=None, H=None, Q_LEN=t, KV_LEN=t, device=device)
+        _FLEX_BLOCK_MASK_CACHE[key] = cached
+    return cached
 
 
 def window_mask(t: int, w: int, device: torch.device) -> torch.Tensor:
@@ -91,12 +127,28 @@ class AdaptiveHybridAttention(nn.Module):
 
     # ------------------------------------------------------------------ lokal
     def _local(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, T: int) -> torch.Tensor:
-        mask = window_mask(T, min(self.window, T), q.device)
+        w = min(self.window, T)
         drop = self.dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=drop)
-        return out
+        impl = self.cfg.local_attn_impl
+        if w >= T:
+            # jendela penuh == kausal biasa: pakai jalur cepat SDPA
+            return F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=drop)
+        if impl == "flex" and _flex_available():
+            bm = flex_block_mask(T, w, q.device)
+            return _get_flex_compiled()(q, k, v, block_mask=bm)
+        mask = window_mask(T, w, q.device)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=drop)
 
     # ----------------------------------------------------------------- global
+    def effective_chunk(self, T: int) -> int:
+        """Ukuran chunk efektif.
+
+        ``linear_chunk`` besar = lebih sedikit iterasi loop (lebih cepat di GPU),
+        tetapi biaya intra-chunk tumbuh O(T·C) dan VRAM naik O(C²). Karena itu
+        chunk dibatasi ``T/4`` agar sifat sub-kuadratik tidak hilang pada T kecil.
+        """
+        return max(8, min(self.chunk, max(8, T // 4)))
+
     def _global(
         self,
         x: torch.Tensor,
@@ -107,7 +159,7 @@ class AdaptiveHybridAttention(nn.Module):
     ) -> torch.Tensor:
         """Gated linear attention bentuk chunked (loop hanya sebanyak T/C chunk)."""
         B, H, _, Dh = q.shape
-        C = min(self.chunk, T)
+        C = self.effective_chunk(T)
         pad = (-T) % C
         if pad:
             q = F.pad(q, (0, 0, 0, pad))

@@ -31,6 +31,7 @@ from common import (  # noqa: E402
     count_params,
     dense_matched_to,
     get_device,
+    maybe_compile,
     md_table,
     set_seed,
 )
@@ -66,11 +67,18 @@ def measure_throughput(model, vocab, seq_len, batch, device, iters=8, warmup=3) 
 
 
 def describe(model, vocab, seq_len, batch, device, label, iters=8) -> dict:
-    total, per_tok = count_flops_per_token(model, seq_len, vocab)
+    # unwrap torch.compile: FlopCounterMode tidak melihat ke dalam graph Inductor
+    raw = getattr(model, "_orig_mod", model)
+    total, per_tok = count_flops_per_token(raw, seq_len, vocab)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     tps = measure_throughput(model, vocab, seq_len, batch, device, iters=iters)
     peak = torch.cuda.max_memory_allocated(device) / 1e6 if device.type == "cuda" else 0.0
+    pad = None
+    for m in (raw.modules() if hasattr(raw, "modules") else []):
+        if hasattr(m, "padding_factor"):
+            pad = getattr(m, "padding_factor", None)
+            break
     row = {
         "model": label,
         "params": count_params(model),
@@ -78,6 +86,7 @@ def describe(model, vocab, seq_len, batch, device, label, iters=8) -> dict:
         "flops_per_token": per_tok,
         "train_tokens_per_sec": round(tps, 1),
         "peak_vram_mb": round(peak, 1),
+        "moe_pad_factor": None if pad is None else round(pad, 2),
     }
     print(
         f"  {label:28s} params={row['params']:>10,} active={row['active_params']:>10,} "
@@ -96,6 +105,7 @@ def main() -> int:
     ap.add_argument("--iters", type=int, default=8)
     ap.add_argument("--ablation", default=None, help="A1..A6 (default: ASCA penuh)")
     ap.add_argument("--out", default=None, help="tulis hasil ke docs/EXPERIMENTS.md")
+    ap.add_argument("--compile", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -116,6 +126,9 @@ def main() -> int:
     asca = ASCAModel(cfg).to(device)
     dense = build_dense(args.preset, args.vocab, seq_len).to(device)
     matched = dense_matched_to(asca, args.preset, seq_len).to(device)
+    asca = maybe_compile(asca, args.compile)
+    dense = maybe_compile(dense, args.compile)
+    matched = maybe_compile(matched, args.compile)
 
     rows = [
         describe(dense, args.vocab, seq_len, args.batch, device, "B0-dense (default)"),

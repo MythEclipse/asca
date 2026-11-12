@@ -32,6 +32,7 @@ from common import (  # noqa: E402
     build_dense,
     dense_matched_to,
     get_device,
+    maybe_compile,
     md_table,
     set_seed,
     train_model,
@@ -66,6 +67,7 @@ def main() -> int:
     ap.add_argument("--out", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--seeds", default=None, help="mis. 0,1,2 — agregasi mean±std (protokol: minimal 3 seed)")
+    ap.add_argument("--compile", action="store_true", help="torch.compile model (lebih cepat, +10-15s di awal)")
     ap.add_argument("--tag", default="")
     args = ap.parse_args()
 
@@ -125,6 +127,7 @@ def main() -> int:
                 f"  === {label} seed {seed} (params {sum(p.numel() for p in model.parameters()):,}) ===",
                 flush=True,
             )
+            model = maybe_compile(model, args.compile)
             stats = train_model(model, dataset, tcfg, device, f"{label}/s{seed}", vocab)
             raw.setdefault(label, []).append(stats.as_row())
             print(
@@ -159,6 +162,7 @@ def main() -> int:
                 "torch": torch.__version__,
                 "asca_config": base_cfg.to_dict(),
                 "models": wanted,
+                "compile": bool(args.compile),
             },
         )
         print(f"Hasil ditambahkan ke {args.out}")

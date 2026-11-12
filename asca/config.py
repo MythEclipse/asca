@@ -32,7 +32,8 @@ class ASCAConfig:
     # --- 3.2 Adaptive Hybrid Attention ---
     use_hybrid_attention: bool = True
     local_window: int = 128  # >= max_seq_len berarti attention kausal penuh
-    linear_chunk: int = 64
+    linear_chunk: int = 128  # 128 terukur ~1.75x lebih cepat dari 64 (RTX 4050)
+    local_attn_impl: str = "sdpa"  # "sdpa" | "flex" (flex butuh torch.compile, ~3x lebih cepat)
     rope_theta: float = 10000.0
 
     # --- 3.3 Adaptive Sparse MoE ---
@@ -42,6 +43,7 @@ class ASCAConfig:
     n_shared_experts: int = 1
     expert_ff: Optional[int] = None
     shared_ff: Optional[int] = None
+    moe_impl: str = "grouped"  # "grouped" (grouped GEMM) | "loop" (referensi)
     router_threshold: float = 0.0  # 0 = adaptive skip dimatikan
     aux_loss_coef: float = 0.01
     z_loss_coef: float = 0.001

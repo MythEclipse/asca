@@ -111,8 +111,15 @@ o^{\text{inter}} = \varphi(Q_c)\, S_{c-1},\quad
 S_c = \lambda_c S_{c-1} + \varphi(K_c)^\top V_c
 $$
 
-Jumlah iterasi chunk = $T/C$ (mis. 16 untuk $T{=}1024, C{=}64$) — bukan loop per token.
+Jumlah iterasi chunk = $T/C$ (mis. 8 untuk $T{=}1024, C{=}128$) — bukan loop per token.
 Biaya $O(T C D_h + T D_h^2)$, jadi total sub-kuadratik.
+
+**Chunk adaptif.** Biaya intra-chunk tumbuh $O(TC)$ dan VRAM $O(C^2)$, sementara
+loop yang lebih sedikit lebih cepat di GPU. Karena itu implementasi memakai
+$C_{\text{eff}} = \max(8, \min(C, \max(8, T/4)))$ supaya sifat sub-kuadratik tidak
+hilang pada $T$ kecil. Terukur (preset tiny, batch 4, bf16, fwd+bwd):
+$T{=}512$: $C{=}64 \to 4.35$ ms vs $C{=}128 \to 2.57$ ms; $T{=}256$: $C{=}128$
+justru lebih boros FLOPs sehingga dibatasi menjadi 64.
 
 **Gate penggabung** (per token, per kanal):
 
@@ -174,6 +181,18 @@ $$
 
 Biaya aktif per token: $O(D\,d_e \cdot k + D\,d^{\text{sh}})$ — sublinear terhadap $E$,
 sehingga menambah expert menambah kapasitas tanpa menambah FLOPs/token.
+
+**Implementasi dispatch.** Dua jalur di `ASCAConfig.moe_impl`:
+
+* `"grouped"` (default) — token diurutkan per expert dan di-pad menjadi blok
+  $(E, M, D)$, lalu seluruh expert dijalankan dengan **dua** `bmm` (satu untuk
+  $W_1/W_3$ gabungan, satu untuk $W_2$). Kernel launch turun dari $3E$ menjadi 2;
+  terukur **1.7×** lebih cepat. Biayanya *padding*: FLOPs routed yang dibayar
+  sebesar $E\cdot M / (N k) \ge 1$, bergantung keseimbangan routing
+  (terukur 1.07× pada routing seimbang, hingga ~1.65× saat routing miring).
+  Nilai ini diekspos sebagai `moe.padding_factor`.
+* `"loop"` — gather/scatter per expert; FLOPs persis sebanding token, dipakai
+  sebagai referensi kebenaran dan pembanding FLOPs yang adil.
 
 ### 3.4 Efficient Memory (SegmentMemory)
 
@@ -279,13 +298,41 @@ Hasil ditulis ke `docs/EXPERIMENTS.md` oleh `benchmarks/train_toy.py`
 
 ---
 
-## 7. Batasan yang Diakui (v0.1)
+## 7. Batasan yang Diakui (v0.2)
 
 1. Gating decay pada attention linear masih per-chunk, bukan per-token.
 2. SegmentMemory memakai ringkasan statis per segmen (tidak ada update rekuren
    antar-forward pada versi training paralel).
-3. Attention lokal memakai mask eksplisit (cocok untuk $T \le 4096$); untuk skala
-   besar perlu FlexAttention/FlashAttention dengan window native.
+3. Attention lokal default memakai mask eksplisit (cocok untuk $T \le 4096$); jalur
+   FlexAttention tersedia (`local_attn_impl="flex"`) tetapi baru menang saat
+   dikompilasi dan pada $T$ besar, jadi belum menjadi default.
 4. Belum ada positional encoding pada jalur linear (recency ditangani oleh forget
    gate); ini asumsi desain yang perlu diuji.
-5. Belum ada hasil benchmark apa pun. **Tidak ada klaim keunggulan.**
+5. Grouped GEMM MoE membayar padding yang bergantung keseimbangan routing
+   (1.07×–1.65× terukur). Belum ada dispatch dengan kapasitas terbatas per blok.
+6. Belum ada KV-cache / state rekuren untuk decode; `generate()` masih recompute
+   penuh sehingga latensi decode belum representatif.
+7. `torch.compile` memecah graph pada `int(counts.max().item())` di dispatch MoE
+   (graph break, bukan error). Menghapusnya butuh kapasitas blok statis.
+8. Belum ada hasil benchmark pada skala bermakna (≥100M token). **Tidak ada klaim
+   keunggulan.**
+
+---
+
+## 8. Catatan Implementasi & Hasil Optimasi Terukur
+
+Semua angka: RTX 4050 Laptop 6 GB, torch 2.11.0+cu128, bf16 autocast.
+Detail lengkap + cara reproduksi: `docs/EXPERIMENTS.md`.
+
+| Perubahan | Efek terukur |
+|---|---|
+| `linear_chunk` 64 → 128 (dengan batas $T/4$) | attention 8.24 → 4.09 ms (2.0×) |
+| MoE grouped GEMM (2 `bmm`, bukan 3·E kernel) | MoE 3.78 → 2.22 ms (1.7×) |
+| `torch.compile` (opt-in `--compile`) | model penuh 66.3 → 42.9 ms (1.54×) |
+| Total end-to-end training (nano, 3 seed) | 63.0k → **106.1k tok/s (1.68×)** |
+
+Status jujur: kualitas setara dense param-matched (0.4165 vs 0.4167 val loss pada
+1.23M token), FLOPs/token +7% pada active params setara (preset tiny), tetapi
+**wall-clock masih ~2.6–5× lebih lambat** dan **VRAM ~1.9× lebih besar**. Penyebab
+utamanya adalah occupancy kernel pada `d_model` kecil, bukan FLOPs.
+

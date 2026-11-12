@@ -18,24 +18,44 @@ Hasil benchmark otomatis. Setiap entri menyertakan konfigurasi lengkap.
   **Selisih < ~0.08 val loss pada budget ini tidak bermakna**; jangan menafsirkan
   satu seed sebagai bukti.
 
-## Status ringkas v0.1 (run pertama, nano, 1.23M token, 3 seed)
+## Status ringkas v0.2 (setelah optimasi kernel, nano, 1.23M token, 3 seed)
 
-| Aspek | Hasil | Kesimpulan |
-|---|---|---|
-| Kualitas (val loss) | ASCA `0.4144 ± 0.0034` vs dense-matched `0.4093 ± 0.0018` | Setara dalam noise; dense sedikit unggul. **Belum ada bukti keunggulan.** |
-| Throughput training | ASCA ~63k tok/s vs dense ~344k tok/s | ASCA **5.5× lebih lambat** (overhead kernel: loop chunk, gather/scatter MoE, einsum memori). |
-| VRAM training T=4096 | ASCA 783 MB vs dense-matched 456 MB | **Belum ada keunggulan memori**: mask window eksplisit T×T dan skor memori O(S²LM) masih material. |
-| Latensi decode | ASCA 10.4 ms/tok vs dense 1.4 ms/tok | ASCA belum punya KV-cache → recompute penuh. Ini batas atas, bukan hasil akhir. |
+| Aspek | Sebelum | Sesudah | Kesimpulan |
+|---|---|---|---|
+| Throughput ASCA | 63.0k tok/s | **106.1k ± 1.5k tok/s** | **1.68×** lebih cepat (grouped GEMM + chunk adaptif + `torch.compile`) |
+| Throughput dense-matched | 344k tok/s | 534k ± 24k tok/s | 1.55× (compile juga membantu baseline — jarak tetap ~5×) |
+| val loss | 0.4144 ± 0.0034 vs 0.4093 ± 0.0018 | **0.4165 ± 0.0020 vs 0.4167 ± 0.0063** | **setara** dengan dense param-matched (dalam noise) |
+| FLOPs/token (param-matched) | 2.61M vs 2.97M | 3.65M vs 2.97M | +23% lebih boros; sebagian dari padding grouped GEMM |
+| VRAM training (nano) | 175 MB vs 124 MB | 185 MB vs 99 MB | masih **1.9× lebih besar** |
 
-**Interpretasi:** mekanisme ASCA sudah benar secara matematis (lulus uji kausalitas
-dan uji kesesuaian dengan referensi naif), tetapi **implementasi belum efisien**.
-Klaim efisiensi belum bisa dibuat dan tidak akan dibuat sampai:
+Perubahan yang diukur (profil per-komponen, `benchmarks/profile_asca.py`, tiny T=512):
 
-1. Attention lokal memakai FlexAttention/FlashAttention dengan window native
-   (menghapus mask T×T dan alokasi skor penuh).
-2. Attention linear tidak lagi loop per chunk (fused kernel / `torch.compile`).
-3. MoE memakai dispatch ter-fusi, bukan loop per expert.
-4. Decode memakai state rekuren (bukan recompute penuh) + KV-cache untuk jalur lokal.
+| Komponen | Sebelum | Sesudah | Perubahan |
+|---|---|---|---|
+| Attention (lokal + linear) | 8.24 ms | 4.09 ms | **2.0×** (chunk 64→128 efektif) |
+| MoE | 3.78 ms | 2.22 ms | **1.7×** (grouped GEMM: 2 `bmm` total, bukan 3·E kernel) |
+| Model penuh (eager) | 71.7 ms | 61.8 ms | 1.16× |
+| Model penuh (+`torch.compile`) | — | 42.9 ms | **1.54×** tambahan |
+
+**Yang masih menjadi masalah (jujur):**
+
+1. **VRAM belum turun** — mask window eksplisit T×T dan skor memori O(S²LM) masih material,
+   dan `torch.compile` menambah buffer kerja. Jalur FlexAttention sudah tersedia
+   (`local_attn_impl="flex"`) tapi baru menang saat dikompilasi dan T besar.
+2. **Gap wall-clock vs dense masih ~2.6–5×** pada d_model kecil: ASCA menjalankan 4 sublayer
+   per blok dengan matmul kecil, sementara baseline adalah GEMM besar. Ini masalah
+   *kernel/occupancy*, bukan masalah FLOPs (FLOPs/token hanya +7% pada active params setara
+   di preset tiny).
+3. **Grouped GEMM membayar padding** yang bergantung keseimbangan routing:
+   terukur 1.07× (init seimbang) sampai ~1.65× (routing miring). `moe_pad_factor`
+   dilaporkan di `bench_flops.py`; `moe_impl="loop"` tersedia sebagai jalur yang
+   FLOPs-nya persis sebanding token.
+4. **Belum ada KV-cache**: decode masih recompute penuh (10.4 ms/tok).
+
+**Belum ada klaim keunggulan.** Yang sudah terbukti: mekanisme ASCA benar secara
+matematis (kausal + cocok dengan referensi naif) dan kualitasnya setara baseline pada
+budget ini. Yang belum: efisiensi wall-clock, VRAM, dan latensi decode.
+
 
 
 ## Training komparasi (nano, 150 step)
@@ -266,4 +286,127 @@ _2026-11-12 18:31:51 · seed 0 · device cuda · torch 2.11.0+cu128_
 | ASCA-A4 | 1539345 | 934161 | 2613312 | 614400 | 0.5177 ± 0.0000 | 1.678 ± 0.000 | 63792 ± 0 | 174 ± 0 | 1 |
 | ASCA-A5 | 1425173 | 819989 | 1826880 | 614400 | 0.8930 ± 0.0000 | 2.442 ± 0.000 | 66406 ± 0 | 147 ± 0 | 1 |
 | ASCA-A6 | 1818389 | 1213205 | 2613312 | 614400 | 0.6380 ± 0.0000 | 1.893 ± 0.000 | 63114 ± 0 | 175 ± 0 | 1 |
+
+## Training komparasi (nano, 600 step — kernel opt (chunk adaptif + grouped GEMM + compile))
+
+_2026-11-12 19:25:23 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "synthetic",
+  "tokens_in_corpus": 2000014,
+  "vocab": 120,
+  "steps": 600,
+  "batch": 8,
+  "seq_len": 256,
+  "train_tokens": 1228800,
+  "lr": 0.003,
+  "warmup": 10,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 120,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 256,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 8,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "dense-matched",
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| B0-dense-matched | 1224832 | 1209472 | 2971648 | 1228800 | 0.4167 ± 0.0063 | 1.517 ± 0.009 | 534077 ± 23887 | 99 ± 0 | 3 |
+| A0-asca | 1818389 | 1213205 | 3651648 | 1228800 | 0.4165 ± 0.0020 | 1.517 ± 0.003 | 106060 ± 1545 | 185 ± 0 | 3 |
+
+
+## FLOPs & throughput (tiny, seq 512)
+
+_2026-11-12 19:26:39 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "tiny",
+  "seq_len": 512,
+  "batch": 4,
+  "vocab": 4096,
+  "seed": 0,
+  "device": "cuda",
+  "ablation": null,
+  "asca_config": {
+    "vocab_size": 4096,
+    "d_model": 256,
+    "n_layers": 6,
+    "n_heads": 8,
+    "head_dim": 32,
+    "max_seq_len": 512,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 8,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 128,
+    "shared_ff": 512,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 688,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  }
+}
+```
+
+| model | params | active_params | flops_per_token | train_tokens_per_sec | peak_vram_mb | moe_pad_factor |
+|---|---|---|---|---|---|---|
+| B0-dense (default) | 5795072 | 4746496 | 14729216 | 203770.4 | 365.9 | None |
+| B0-dense (param-matched) | 8264960 | 7216384 | 19668992 | 151673.4 | 457.6 | None |
+| ASCA-full | 11779639 | 7192119 | 21110144 | 57724.3 | 760.8 | 1.07 |
 

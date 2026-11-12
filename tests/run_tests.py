@@ -163,7 +163,8 @@ def test_global_linear_matches_reference():
     for T in (16, 20):  # 20 bukan kelipatan chunk -> menguji jalur padding
         cfg = small_cfg()
         attn = AdaptiveHybridAttention(cfg).eval()
-        B, C = 2, cfg.linear_chunk
+        B = 2
+        C = attn.effective_chunk(T)
         lam_val = torch.tensor([0.5, 0.8, 0.95, 0.2])
         with torch.no_grad():
             attn.decay.weight.zero_()
@@ -233,6 +234,57 @@ def test_moe_aux_loss_and_gradients():
     assert x.grad is not None and torch.isfinite(x.grad).all()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in moe.experts.parameters()), (
         "tidak ada expert yang menerima gradien"
+    )
+
+
+@test
+def test_moe_grouped_matches_loop():
+    """Implementasi grouped GEMM harus identik dengan referensi loop."""
+    torch.manual_seed(9)
+    cfg_loop = small_cfg(moe_impl="loop")
+    cfg_grp = small_cfg(moe_impl="grouped")
+    moe_loop = AdaptiveSparseMoE(cfg_loop).eval()
+    moe_grp = AdaptiveSparseMoE(cfg_grp).eval()
+    moe_grp.load_state_dict(moe_loop.state_dict())
+    x = torch.randn(3, 16, cfg_loop.d_model)
+    with torch.no_grad():
+        a, aux_a = moe_loop(x)
+        b, aux_b = moe_grp(x)
+    assert torch.allclose(a, b, atol=1e-5), f"grouped beda dari loop: {(a - b).abs().max():.3e}"
+    assert torch.allclose(aux_a, aux_b), "aux loss harus sama"
+    # gradien harus mengalir ke SEMUA expert lewat jalur grouped
+    moe_grp.train()
+    xg = x.clone().requires_grad_(True)
+    out, aux = moe_grp(xg)
+    (out.pow(2).mean() + aux).backward()
+    n_with_grad = sum(
+        1 for p in moe_grp.experts.parameters() if p.grad is not None and p.grad.abs().sum() > 0
+    )
+    assert n_with_grad > 0, "tidak ada parameter expert yang menerima gradien di jalur grouped"
+    assert xg.grad is not None and torch.isfinite(xg.grad).all()
+
+
+@test
+def test_flex_local_matches_sdpa():
+    """Jalur FlexAttention harus menghasilkan nilai yang sama dengan SDPA+mask."""
+    from asca.attention import _flex_available
+
+    if not _flex_available():
+        print("      (dilewati: flex_attention tidak tersedia di torch ini)")
+        return
+    torch.manual_seed(10)
+    cfg = small_cfg(local_attn_impl="sdpa")
+    attn = AdaptiveHybridAttention(cfg).eval()
+    B, T = 2, 32
+    q = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
+    k = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
+    v = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
+    with torch.no_grad():
+        ref = attn._local(q, k, v, T)
+        cfg.local_attn_impl = "flex"
+        got = attn._local(q, k, v, T)
+    assert torch.allclose(got, ref, atol=1e-5), (
+        f"flex beda dari SDPA: {(got - ref).abs().max():.3e}"
     )
 
 

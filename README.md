@@ -3,10 +3,11 @@
 Riset arsitektur LLM dari nol (*random init*, tanpa bobot pretrained) yang mengejar
 efisiensi komputasi dan memori melalui mekanisme adaptif dan sparse.
 
-> **Status: v0.1 — prototipe lengkap & teruji kausalitasnya. Belum ada klaim keunggulan.**
-> Ringkasan hasil jujur ada di [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md):
-> pada run pertama ASCA **setara** dengan dense baseline dalam kualitas, tetapi
-> **lebih lambat dan lebih boros VRAM** karena implementasi kernel belum dioptimasi.
+> **Status: v0.2 — prototipe teruji kausalitasnya + optimasi kernel tahap pertama.**
+> Ringkasan jujur di [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md): kualitas **setara**
+> dense baseline (param-matched), throughput training naik **1.68×** setelah
+> grouped-GEMM MoE + chunk adaptif + `torch.compile`, tetapi **masih ~2.6–5× lebih
+> lambat** dan **~1.9× lebih boros VRAM** daripada dense. Belum ada klaim keunggulan.
 
 ---
 
@@ -66,6 +67,7 @@ asca/
 │   ├── common.py               # Preset, param matching, FLOP counter, loop training
 │   ├── bench_flops.py          # FLOPs/token & throughput terukur
 │   ├── bench_vram.py           # Peak VRAM 512..4096 & latensi decode
+│   ├── profile_asca.py         # Profil per-komponen (cari hotspot)
 │   └── train_toy.py            # Training komparasi multi-seed (utama)
 └── tests/
     └── run_tests.py            # Uji kausalitas, referensi naif, shapes, MoE, dll.
@@ -98,12 +100,18 @@ VRAM & latensi decode:
 env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_vram.py --preset nano --out docs/EXPERIMENTS.md
 ```
 
-Training komparasi (utama):
+Profil hotspot per komponen:
+
+```bash
+env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/profile_asca.py --preset tiny --seq-len 512
+```
+
+Training komparasi (utama) — `--compile` memberi ~1.5× tambahan:
 
 ```bash
 env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/train_toy.py \
     --preset nano --steps 600 --batch 8 --seq-len 256 \
-    --models dense-matched,asca --seeds 0,1,2 --out docs/EXPERIMENTS.md
+    --models dense-matched,asca --seeds 0,1,2 --compile --out docs/EXPERIMENTS.md
 ```
 
 Korpus nyata (perlu `datasets` di venv bersama untuk streaming HF):
@@ -122,10 +130,14 @@ Korpus nyata (perlu `datasets` di venv bersama untuk streaming HF):
 
 ## 7. Roadmap Terdekat
 
-1. **Optimasi kernel** (prasyarat semua klaim efisiensi): FlexAttention untuk window
-   lokal, hilangkan loop chunk pada attention linear (`torch.compile`/fused kernel),
-   dispatch MoE ter-fusi, KV-cache + state rekuren untuk decode.
-2. **Ablasi penuh A0–A6** pada ≥100M token untuk mengukur kontribusi tiap komponen.
-3. **Skala**: naik ke preset `small` (seq 1024) lalu ke Colab (A100/T4) untuk
-   pretraining dengan checkpoint ke Drive/HF Hub + resume otomatis.
-4. **Long-context**: uji SegmentMemory pada 8k–32k token vs dense + sliding window.
+Sudah selesai (v0.2): grouped-GEMM MoE dispatch (1.7×), chunk adaptif (2.0× pada
+attention), jalur FlexAttention opsional, `torch.compile` opt-in (1.54×).
+
+1. **KV-cache + state rekuren** untuk decode (saat ini recompute penuh, 10.4 ms/tok).
+2. **Kapasitas blok MoE statis** agar `torch.compile` tidak graph-break dan padding
+   bisa dibatasi (sekarang 1.07×–1.65× tergantung keseimbangan routing).
+3. **Turunkan VRAM**: FlexAttention sebagai default pada T besar, dan ganti skor
+   memori O(S²LM) dengan pembacaan per-segmen.
+4. **Ablasi penuh A0–A6** pada ≥100M token (sekarang baru 300–600 step, 1 seed/3 seed).
+5. **Skala**: preset `small` (seq 1024) lalu Colab (A100/T4) untuk pretraining
+   dengan checkpoint ke Drive/HF Hub + resume otomatis.
