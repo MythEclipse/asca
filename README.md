@@ -3,13 +3,28 @@
 Riset arsitektur LLM dari nol (*random init*, tanpa bobot pretrained) yang mengejar
 efisiensi komputasi dan memori melalui mekanisme adaptif dan sparse.
 
-> **Status: v0.6 — ablation 20M token selesai. Hasilnya: tidak ada klaim keunggulan kualitas; ASCA ramping (A8) 1.56× lebih cepat tanpa kehilangan kualitas.**
-> Ringkasan jujur di [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md): kualitas **setara**
-> dense baseline (param-matched), throughput training naik **1.68×** setelah
-> grouped-GEMM MoE + chunk adaptif + `torch.compile`, **prefill paralel 48.955 tok/s**
-> (1.32× lebih lambat dari dense) dan **decode 1.60 ms/token** dengan CUDA Graph
-> (cache 3.8 MB konstan vs 24 MB dense). **Training masih ~5× lebih lambat** dan
-> **~1.9× lebih boros VRAM**. Belum ada klaim keunggulan.
+> **Status: v0.7 — hasil NEGATIF pada teks nyata.**
+>
+> Pada TinyStories (byte-level, 24M token, seq 1024, **5 seed**):
+>
+> | | val loss | throughput | VRAM |
+> |---|---|---|---|
+> | dense-matched (kontrol) | **0.8065 ± 0.0105** | **769k tok/s** | **286 MB** |
+> | ASCA penuh | 0.8282 ± 0.0069 | 224k tok/s | 709 MB |
+>
+> Paired t = 2.95, df = 4, **p = 0.042** — kelima seed lebih buruk. ASCA 3.4× lebih
+> lambat dan 2.5× lebih boros VRAM. **Tidak ada klaim keunggulan.**
+>
+> **Pelajaran metodologis:** semua eksperimen awal memakai korpus sintetis, dan di
+> sana ASCA tampak setara bahkan sedikit lebih baik (Δ −0.002…−0.009). Kesimpulan
+> itu **tidak bertahan** pada teks nyata — arah tandanya berbalik, dan varian yang
+> tampak "sama saja" di sintetis jadi +0.09 lebih buruk. **Ablasi sintetis tidak
+> dipakai lagi untuk keputusan arsitektur.**
+>
+> Yang sudah terukur dan bertahan: **prefill paralel 48.955 tok/s** (1.32× lebih
+> lambat dari dense) dan **decode 1.60 ms/token** dengan CUDA Graph, dengan **cache
+> decode 3.8 MB konstan vs 24 MB** milik dense. Semua detail di
+> [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
 ---
 
@@ -140,12 +155,15 @@ Sudah selesai (v0.5): KV-cache + state rekuren, fix normalisasi `SegmentMemory`,
 CUDA Graph decode, dan **prefill paralel** (state cache diturunkan dari lintasan
 chunked; 611 → 48.955 tok/s).
 
-1. **Validasi ulang ablation memori** dengan `seq_len ≥ 1024` (sekarang tidak valid
-   karena `seq_len == mem_segment_len`).
-2. **Uji mekanisme yang dilepas (semantic encoder, cabang linear) pada konteks
-   panjang** — mungkin baru berguna di sana; saat ini murni biaya.
-3. **Skala**: 20M token & d=128 masih rezim mainan. Perlu ≥100M token dan preset
+1. **Diagnosis defisit**: apakah ASCA kalah karena kapasitas efektif lebih kecil
+   (active params 0.9M tersebar di 4 sublayer vs satu MLP lebar), karena optimisasi
+   (LR/warmup belum di-tuning per arsitektur), atau karena skalanya terlalu kecil?
+   Kandidat eksperimen: samakan **total** params (bukan active), sweep LR, dan
+   kurva loss vs token (apakah ASCA menyusul dengan training lebih lama).
+2. **Skala**: 24M token & d=128 masih rezim mainan. Perlu ≥100M token dan preset
    `small` sebelum ada klaim apa pun.
+3. **Pertahankan yang sudah menang**: cache decode konstan (3.8 MB vs 24 MB) dan
+   prefill paralel — tapi itu belum cukup untuk membenarkan arsitekturnya.
 4. **Turunkan VRAM training**: FlexAttention sebagai default pada T besar, ganti skor
    memori O(S²LM) dengan pembacaan per-segmen.
 5. **Ablasi penuh A0–A6** pada ≥100M token (sekarang baru 300–600 step, 1 seed/3 seed).

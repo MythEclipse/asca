@@ -326,11 +326,13 @@ Hasil ditulis ke `docs/EXPERIMENTS.md` oleh `benchmarks/train_toy.py`
    keunggulan.**
 9. Seluruh hasil v0.1–v0.2 memakai `SegmentMemory` dengan normalisasi softmax yang
    salah (lintas posisi query). Sudah diperbaiki di v0.3; angka lama tidak dipakai.
-10. **Ablation 20M token (3 seed) tidak menemukan efek kualitas yang melebihi noise
-   floor ±0.005** untuk komponen mana pun, termasuk keseluruhan arsitektur vs dense.
-   Yang terukur hanya biaya: melepas semantic encoder + cabang linear attention +
-   shared expert (config `A8`) memberi 1.56× throughput dan 1.5× VRAM lebih baik
-   dengan kualitas setara. Ablasi memori belum valid karena `seq_len == L_s`.
+10. **Pada teks nyata ASCA kalah dari dense-matched**: TinyStories, 24M token,
+   seq 1024, 5 seed → 0.8282 ± 0.0069 vs 0.8065 ± 0.0105 (paired t=2.95, df=4,
+   p=0.042), 3.4× lebih lambat, 2.5× VRAM lebih besar.
+11. **Ablasi pada korpus sintetis tidak terprediksi.** Di sintetis ASCA tampak
+   setara/lebih baik (Δ −0.002…−0.009) dan komponen terberat tampak "beban mati";
+   di teks nyata tanda berbalik dan varian ramping jadi +0.09 lebih buruk. Semua
+   kesimpulan arsitektural di dokumen ini harus berasal dari korpus nyata.
 
 ---
 
