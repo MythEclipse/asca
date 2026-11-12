@@ -52,20 +52,34 @@ class GraphDecoder:
     # ------------------------------------------------------------------ setup
     def reset(self) -> None:
         """Mulai konteks baru: cache bersih, lalu (re)capture graph."""
-        self._cache = self.model.init_cache(self.batch, self.device, self.dtype)
         self.idx_buf.zero_()
         self._steps = 0
-        self._capture()
+        self._capture(self.model.init_cache(self.batch, self.device, self.dtype))
 
-    def _capture(self) -> None:
+    def prefill(self, idx: torch.Tensor) -> torch.Tensor:
+        """Proses prompt secara paralel, lalu capture graph di atas cache hasilnya.
+
+        Prefill tidak lagi token-demi-token: prompt lewat forward chunked, dan
+        state cache diturunkan dari lintasan paralel (lihat ``ASCAModel.prefill``).
+        Capture sendiri tidak mengeksekusi kernel (stream capture), jadi cache
+        hasil prefill tetap utuh sampai replay pertama.
+        """
+        logits, cache = self.model.prefill(idx)
+        self._steps = 0
+        self._capture(cache)
+        return logits
+
+    def _capture(self, cache: dict) -> None:
         torch.cuda.synchronize()
-        # warmup di luar graph: alokasi, autotune kernel, isi cache awal.
-        # cache di-reset lagi setelah warmup supaya graph mulai dari posisi 0.
+        # Warmup di atas cache sekali-pakai: memicu alokasi + autotune kernel tanpa
+        # mengotori cache yang akan dipakai graph.
+        warm = self.model.init_cache(self.batch, self.device, self.dtype)
         with torch.no_grad():
             for _ in range(3):
-                self.model.forward_step(self.idx_buf, self._cache)
+                self.model.forward_step(self.idx_buf, warm)
         torch.cuda.synchronize()
-        self._cache = self.model.init_cache(self.batch, self.device, self.dtype)
+        del warm
+        self._cache = cache
 
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):

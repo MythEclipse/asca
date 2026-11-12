@@ -404,6 +404,64 @@ def test_cuda_graph_decode_matches_eager():
 
 
 @test
+def test_prefill_matches_step_loop():
+    """Prefill paralel harus identik dengan memanggil forward_step T kali."""
+    torch.manual_seed(17)
+    cfg = small_cfg()
+    model = ASCAModel(cfg).eval()
+    B, T, N = 2, 40, 6
+    x = torch.randint(0, cfg.vocab_size, (B, T + N))
+    with torch.no_grad():
+        # (a) logits prefill harus sama dengan forward penuh
+        logits_pf, cache = model.prefill(x[:, :T])
+        full, _ = model(x[:, :T])
+        d_pf = (logits_pf - full).abs().max().item()
+        assert d_pf < 2e-5, f"logits prefill beda dari forward penuh: {d_pf:.3e}"
+        assert cache["n"] == T and int(cache["pos"]) == T, "posisi cache prefill salah"
+
+        # (b) lanjutan decode dari cache prefill == decode dari cache kosong
+        cont_pf = torch.cat(
+            [model.forward_step(x[:, T + i : T + i + 1], cache) for i in range(N)], dim=1
+        )
+        cache2 = model.init_cache(B, x.device, model.embed.weight.dtype)
+        for i in range(T):
+            model.forward_step(x[:, i : i + 1], cache2)
+        cont_steps = torch.cat(
+            [model.forward_step(x[:, T + i : T + i + 1], cache2) for i in range(N)], dim=1
+        )
+        d_cont = (cont_pf - cont_steps).abs().max().item()
+        assert d_cont < 2e-5, f"lanjutan dari cache prefill beda: {d_cont:.3e}"
+
+
+@test
+def test_dense_prefill_matches_step_loop():
+    """Prefill baseline dense juga harus konsisten dengan jalur step."""
+    from baseline.dense_transformer import DenseConfig, DenseTransformer
+
+    torch.manual_seed(18)
+    dcfg = DenseConfig(
+        vocab_size=64, d_model=64, n_layers=2, n_heads=4, d_ff=128, max_seq_len=64
+    )
+    model = DenseTransformer(dcfg).eval()
+    B, T, N = 2, 32, 5
+    x = torch.randint(0, dcfg.vocab_size, (B, T + N))
+    with torch.no_grad():
+        logits_pf, cache = model.prefill(x[:, :T])
+        full, _ = model(x[:, :T])
+        assert (logits_pf - full).abs().max().item() < 2e-5
+        cont_pf = torch.cat(
+            [model.forward_step(x[:, T + i : T + i + 1], cache) for i in range(N)], dim=1
+        )
+        cache2 = model.init_cache(B, x.device, model.embed.weight.dtype)
+        for i in range(T):
+            model.forward_step(x[:, i : i + 1], cache2)
+        cont_steps = torch.cat(
+            [model.forward_step(x[:, T + i : T + i + 1], cache2) for i in range(N)], dim=1
+        )
+        assert (cont_pf - cont_steps).abs().max().item() < 2e-5
+
+
+@test
 def test_generate_runs():
     torch.manual_seed(8)
     cfg = small_cfg()

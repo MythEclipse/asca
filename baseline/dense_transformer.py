@@ -211,6 +211,39 @@ class DenseTransformer(nn.Module):
             "layers": [b.init_state(batch, device, dtype) for b in self.blocks],
         }
 
+    @torch.no_grad()
+    def prefill(self, idx: torch.Tensor):
+        """Prompt paralel + KV-cache penuh yang sudah terisi (pos = T)."""
+        self.eval()
+        B, T = idx.shape
+        logits, _ = self(idx)
+        device = idx.device
+        dtype = self.embed.weight.dtype
+        cos_all, sin_all = rope_cache(self.cfg.max_seq_len, self.cfg.head_dim, self.cfg.rope_theta, device, dtype)
+        cos, sin = cos_all[:T], sin_all[:T]
+        x = self.embed(idx)
+        layers = []
+        for blk in self.blocks:
+            u = blk.norm_attn(x)
+            q, k, v = blk.attn.qkv(u).split(self.cfg.d_model, dim=-1)
+            k = apply_rope(k.view(B, T, self.cfg.n_heads, self.cfg.head_dim).transpose(1, 2), cos, sin)
+            v = v.view(B, T, self.cfg.n_heads, self.cfg.head_dim).transpose(1, 2)
+            st = {
+                "k": torch.zeros(B, self.cfg.n_heads, self.cfg.max_seq_len, self.cfg.head_dim, device=device, dtype=dtype),
+                "v": torch.zeros(B, self.cfg.n_heads, self.cfg.max_seq_len, self.cfg.head_dim, device=device, dtype=dtype),
+            }
+            st["k"][:, :, :T] = k
+            st["v"][:, :, :T] = v
+            layers.append(st)
+            x = x + blk.attn(u, cos, sin)
+            x = x + blk.mlp(blk.norm_mlp(x))
+        return logits, {
+            "pos": torch.tensor(T, dtype=torch.long, device=device),
+            "n": T,
+            "rope": (cos_all, sin_all),
+            "layers": layers,
+        }
+
     def forward_step(self, idx_t: torch.Tensor, cache: dict) -> torch.Tensor:
         if idx_t.shape[1] != 1:
             raise ValueError("forward_step hanya menerima satu token per panggilan")

@@ -35,6 +35,20 @@ class SemanticEncoder(nn.Module):
         c = self.conv(c).transpose(1, 2)
         return x + self.w2(self.act(self.w1(c)))
 
+    # ------------------------------------------------------------- prefill
+    def forward_with_state(self, x: torch.Tensor):
+        """Seperti ``forward`` tetapi juga mengembalikan buffer konvolusi decode."""
+        u = self.norm(x)
+        c = F.pad(u.transpose(1, 2), (self.kernel - 1, 0))
+        c = self.conv(c).transpose(1, 2)
+        B, T, _ = x.shape
+        k = self.kernel
+        buf = torch.zeros(B, k, self.d, device=x.device, dtype=x.dtype)
+        n_fill = min(T, k)
+        positions = torch.arange(T - n_fill, T, device=x.device)
+        buf[:, positions % k] = u[:, -n_fill:]
+        return x + self.w2(self.act(self.w1(c))), {"buf": buf}
+
     # ------------------------------------------------------------------ step
     def init_state(self, batch: int, device, dtype) -> dict:
         """Ring buffer ``kernel`` input ternormalisasi terakhir (graph-safe)."""

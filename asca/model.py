@@ -162,6 +162,44 @@ class ASCAModel(nn.Module):
         return self.decoder(h, h0, self.embed.weight)
 
     @torch.no_grad()
+    def prefill(self, idx: torch.Tensor):
+        """Proses prompt secara PARALEL lalu kembalikan ``(logits, cache)``.
+
+        Ini menghindari prefill token-demi-token: seluruh prompt lewat forward
+        chunked, dan state cache (ring buffer window, state linear, ringkasan
+        segmen, buffer konvolusi) diturunkan dari lintasan paralel yang sama.
+        Hasilnya identik dengan memanggil ``forward_step`` T kali (diuji di
+        ``tests/run_tests.py``).
+        """
+        self.eval()
+        B, T = idx.shape
+        if T > self.cfg.max_seq_len:
+            raise ValueError("prompt melebihi max_seq_len")
+        device = idx.device
+        dtype = self.embed.weight.dtype
+        cos_all, sin_all = rope_cache(self.cfg.max_seq_len, self.cfg.head_dim, self.cfg.rope_theta, device, dtype)
+        cos, sin = cos_all[:T], sin_all[:T]
+
+        h0 = self.embed(idx) * math.sqrt(self.cfg.d_model)
+        if hasattr(self.sem, "forward_with_state"):
+            h, sem_state = self.sem.forward_with_state(h0)
+        else:
+            h, sem_state = self.sem(h0), {}
+        layers = []
+        for blk in self.blocks:
+            h, _, st = blk.forward_with_state(h, cos, sin)
+            layers.append(st)
+        logits = self.decoder(h, h0, self.embed.weight)
+        cache = {
+            "pos": torch.tensor(T, dtype=torch.long, device=device),
+            "n": T,
+            "rope": (cos_all, sin_all),
+            "sem": sem_state,
+            "layers": layers,
+        }
+        return logits, cache
+
+    @torch.no_grad()
     def generate_cached(
         self,
         idx: torch.Tensor,
@@ -171,10 +209,7 @@ class ASCAModel(nn.Module):
     ) -> torch.Tensor:
         """Decode autoregresif memakai cache (satu token per langkah)."""
         self.eval()
-        cache = self.init_cache(idx.shape[0], idx.device, self.embed.weight.dtype)
-        logits = None
-        for t in range(idx.shape[1]):
-            logits = self.forward_step(idx[:, t : t + 1], cache)
+        logits, cache = self.prefill(idx)
         for _ in range(max_new_tokens):
             step_logits = logits[:, -1, :] / max(temperature, 1e-6)
             if top_k is not None:

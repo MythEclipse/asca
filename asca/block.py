@@ -50,6 +50,27 @@ class ASCABlock(nn.Module):
             x = x + self.mlp(self.norm_mlp(x))
         return x, aux
 
+    # ------------------------------------------------------------- prefill
+    def forward_with_state(self, x: torch.Tensor, cos=None, sin=None):
+        """Seperti ``forward`` tetapi juga mengembalikan state cache decode."""
+        if hasattr(self.attn, "forward_with_state"):
+            a, attn_state = self.attn.forward_with_state(self.norm_attn(x), cos, sin)
+        else:
+            a, attn_state = self.attn(self.norm_attn(x), cos, sin), None
+        x = x + a
+        state = {"attn": attn_state}
+        if self.use_memory:
+            m, mem_state = self.mem.forward_with_state(self.norm_mem(x))
+            x = x + m
+            state["mem"] = mem_state
+        aux = x.new_zeros(())
+        if self.use_moe:
+            h, aux = self.mlp(self.norm_mlp(x))
+            x = x + h
+        else:
+            x = x + self.mlp(self.norm_mlp(x))
+        return x, aux, state
+
     # ------------------------------------------------------------------ step
     def init_state(self, batch: int, device, dtype) -> dict:
         st = {"attn": self.attn.init_state(batch, device, dtype)}

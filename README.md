@@ -3,12 +3,13 @@
 Riset arsitektur LLM dari nol (*random init*, tanpa bobot pretrained) yang mengejar
 efisiensi komputasi dan memori melalui mekanisme adaptif dan sparse.
 
-> **Status: v0.4 — decode dengan CUDA Graph: 1.64 ms/token (5× lebih cepat, datar terhadap konteks).**
+> **Status: v0.5 — prefill paralel (48.955 tok/s) + decode CUDA Graph (1.60 ms/token).**
 > Ringkasan jujur di [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md): kualitas **setara**
 > dense baseline (param-matched), throughput training naik **1.68×** setelah
-> grouped-GEMM MoE + chunk adaptif + `torch.compile`, decode **1.64 ms/token** dengan
-> CUDA Graph (cache 3.8 MB konstan vs 24 MB dense), tetapi **training masih ~5× lebih
-> lambat** dan **~1.9× lebih boros VRAM**. Belum ada klaim keunggulan.
+> grouped-GEMM MoE + chunk adaptif + `torch.compile`, **prefill paralel 48.955 tok/s**
+> (1.32× lebih lambat dari dense) dan **decode 1.60 ms/token** dengan CUDA Graph
+> (cache 3.8 MB konstan vs 24 MB dense). **Training masih ~5× lebih lambat** dan
+> **~1.9× lebih boros VRAM**. Belum ada klaim keunggulan.
 
 ---
 
@@ -135,13 +136,14 @@ Korpus nyata (perlu `datasets` di venv bersama untuk streaming HF):
 Sudah selesai (v0.2): grouped-GEMM MoE dispatch (1.7×), chunk adaptif (2.0× pada
 attention), jalur FlexAttention opsional, `torch.compile` opt-in (1.54×).
 
-Sudah selesai (v0.4): KV-cache + state rekuren decode, fix normalisasi `SegmentMemory`,
-dan **CUDA Graph decode** (8.18 → 1.64 ms/token, target < 2 ms tercapai).
+Sudah selesai (v0.5): KV-cache + state rekuren, fix normalisasi `SegmentMemory`,
+CUDA Graph decode, dan **prefill paralel** (state cache diturunkan dari lintasan
+chunked; 611 → 48.955 tok/s).
 
-1. **Prefill paralel**: prompt masih diproses token-demi-token (611 tok/s vs 1543
-   dense). Perlu memakai forward chunked untuk prompt lalu menurunkan state cache.
-2. **Kernel decode**: sisa gap 2.6× vs dense karena GPU-side work (4 sublayer/blok).
-3. **Kapasitas blok MoE statis** agar padding terbatas dan compile bersih.
+1. **Throughput training** (5.4× lebih lambat dari dense) — bottleneck terbesar.
+   Kandidat: kapasitas blok MoE statis, kernel terfusi untuk d_model kecil.
+2. **Decode 2.5×** dan **prefill 1.32×** lebih lambat; keduanya GPU-bound sekarang.
+3. **VRAM training** 1.9× lebih besar dari dense.
 4. **Turunkan VRAM training**: FlexAttention sebagai default pada T besar, ganti skor
    memori O(S²LM) dengan pembacaan per-segmen.
 5. **Ablasi penuh A0–A6** pada ≥100M token (sekarang baru 300–600 step, 1 seed/3 seed).

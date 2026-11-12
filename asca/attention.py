@@ -170,6 +170,17 @@ class AdaptiveHybridAttention(nn.Module):
         loglam: torch.Tensor,
         T: int,
     ) -> torch.Tensor:
+        return self._global_impl(q, k, v, loglam, T)[0]
+
+    def _global_impl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        loglam: torch.Tensor,
+        T: int,
+    ):
+        """Kembalikan ``(out, S_akhir, ksum_akhir)`` — state dipakai untuk prefill."""
         """Gated linear attention bentuk chunked (loop hanya sebanyak T/C chunk).
 
         Bentuk rekuren yang diemulasi (per token, per head):
@@ -227,7 +238,45 @@ class AdaptiveHybridAttention(nn.Module):
 
         out = (o_intra + o_inter) / (denom_intra + denom_inter + 1e-6)
         out = out.reshape(B, H, Tp, Dh)[:, :, :T]
-        return out
+        return out, state, ksum
+
+    # ------------------------------------------------------------- prefill
+    def forward_with_state(self, x: torch.Tensor, cos=None, sin=None):
+        """Seperti ``forward`` tetapi juga mengembalikan state cache decode."""
+        B, T, D = x.shape
+        q, k, v = self.qkv(x).split(D, dim=-1)
+        q = q.view(B, T, self.h, self.dh).transpose(1, 2)
+        k = k.view(B, T, self.h, self.dh).transpose(1, 2)
+        v = v.view(B, T, self.h, self.dh).transpose(1, 2)
+        if cos is None or sin is None:
+            cos, sin = rope_cache(T, self.dh, self.cfg.rope_theta, x.device, x.dtype)
+        q_loc = apply_rope(q, cos, sin)
+        k_loc = apply_rope(k, cos, sin)
+        o_loc = self._local(q_loc, k_loc, v, T)
+
+        w = self.window
+        # ring buffer: posisi T-w..T-1 pada slot (pos % w)
+        state = {
+            "k": torch.zeros(B, self.h, w, self.dh, device=x.device, dtype=x.dtype),
+            "v": torch.zeros(B, self.h, w, self.dh, device=x.device, dtype=x.dtype),
+        }
+        n_fill = min(T, w)
+        positions = torch.arange(T - n_fill, T, device=x.device)
+        slots = positions % w
+        state["k"][:, :, slots] = k_loc[:, :, -n_fill:]
+        state["v"][:, :, slots] = v[:, :, -n_fill:]
+
+        if self.use_global:
+            loglam = self._log_decay(x)
+            o_glb, S_final, ksum_final = self._global_impl(q, k, v, loglam, T)
+            state["S"] = S_final
+            state["ksum"] = ksum_final
+            g = torch.sigmoid(self.gate(x)).view(B, T, self.h, self.dh).transpose(1, 2)
+            out = g * o_loc + (1.0 - g) * o_glb
+        else:
+            out = o_loc
+        out = out.transpose(1, 2).reshape(B, T, D)
+        return self.proj(out), state
 
     # ------------------------------------------------------------------ step
     def init_state(self, batch: int, device, dtype) -> dict:

@@ -18,38 +18,39 @@ Hasil benchmark otomatis. Setiap entri menyertakan konfigurasi lengkap.
   **Selisih < ~0.08 val loss pada budget ini tidak bermakna**; jangan menafsirkan
   satu seed sebagai bukti.
 
-## Status ringkas v0.4 (CUDA Graph decode, tiny)
+## Status ringkas v0.5 (prefill paralel + CUDA Graph, tiny)
 
-| Aspek | ASCA | dense-matched | Kesimpulan |
+| Aspek | ASCA | dense-matched | Rasio |
 |---|---|---|---|
-| Decode eager (ms/tok, konteks 2036) | 8.18 | 2.05 | ASCA 4.0× lebih lambat |
-| **Decode CUDA Graph** | **1.64 (datar)** | **0.64 (datar)** | ASCA **2.6×** lebih lambat, gap menyempit dari 4.0× |
-| Speedup graph vs eager | **5.0×** | 3.2× | launch overhead memang bottleneck-nya |
-| Prefill lewat cache (graph) | **611 tok/s** | 1543 tok/s | dari 103 tok/s (6×) |
-| Memori cache decode | **3.82 MB konstan** | 24.25 MB (prealloc `max_seq_len`) | ASCA **6.3×** lebih kecil, O(1) terhadap konteks |
-| val loss (nano, 3 seed) | 0.4159 ± 0.0020 | 0.4210 ± 0.0145 | setara (tidak berubah oleh optimasi decode) |
-| Throughput training (nano) | 103.9k tok/s | 557k tok/s | tidak berubah: jalur training tak disentuh |
+| **Prefill paralel** (tok/s, konteks 2036) | **48.955** | 64.690 | **1.32× lebih lambat** |
+| Prefill token-demi-token (v0.4) | 611 | 1.543 | 2.5× lebih lambat |
+| Decode CUDA Graph (ms/tok) | **1.60** | 0.65 | 2.5× lebih lambat |
+| Decode eager (ms/tok) | 8.58 | 2.20 | 3.9× |
+| Memori cache decode | **3.82 MB konstan** | 24.25 MB | 6.3× lebih kecil |
+| val loss (nano, 3 seed) | 0.4159 ± 0.0020 | 0.4210 ± 0.0145 | setara |
+| Throughput training (nano) | 103.9k tok/s | 557k tok/s | 5.4× lebih lambat |
 
-**Cara mencapainya (dan mengapa `torch.compile` tidak dipakai):** jalur `step` dibuat
-*bebas cabang* — posisi/window memakai `scatter_`/`index_select` dengan indeks dari
-tensor, ringkasan segmen memakai online softmax, MoE memakai dispatch terpilih
-(`index_select`, tanpa `nonzero`/`.item()`), dan **semua update state in-place**.
-Dengan itu satu CUDA graph bisa dipakai untuk semua posisi. `torch.compile` di jalur
-yang sama justru 40× lebih lambat (guards + recompiles).
+**Prefill paralel.** `ASCAModel.prefill(idx)` memproses prompt lewat forward chunked
+sekaligus, lalu **menurunkan state cache decode dari lintasan paralel yang sama**:
+ring buffer window (posisi `T-w..T-1` pada slot `pos % w`), state linear akhir dari
+loop chunk, ringkasan segmen yang sudah selesai (`T // L_s`), akumulator online-softmax
+untuk segmen aktif, dan buffer konvolusi encoder. Tidak ada token yang diproses dua
+kali dan tidak ada panggilan `forward_step` per token.
 
-**Jebakan yang ditemukan:** kalau sebuah buffer state di-*rebind* ke tensor baru saat
-capture, memori lama dilepas di tengah capture dan graph bisa menulis ke blok yang
-masih dipakai tensor lain → data rusak dan `device-side assert` di `index_select`.
-Gejalanya menyesatkan (muncul saat replay, bukan saat capture).
+Diuji identik dengan loop `forward_step` T kali (galat ~1e-7) di
+`test_prefill_matches_step_loop` dan `test_dense_prefill_matches_step_loop`.
 
 **Yang masih gagal (jujur):**
 
-1. **Latensi decode masih 2.6× lebih lambat** dari dense (1.64 vs 0.64 ms/tok).
-   GPU-side work ASCA memang lebih banyak (4 sublayer/blok + state O(Dh²) per head).
-2. **Prefill masih token-demi-token** (611 tok/s vs dense 1543). Belum memakai
-   forward chunked paralel untuk prompt.
-3. **Throughput training & VRAM training tidak berubah** (5.4× lebih lambat, 1.9× VRAM).
-4. **Belum ada benchmark skala besar** (≥100M token). **Tidak ada klaim keunggulan.**
+1. **Decode masih 2.5× lebih lambat** dari dense (1.60 vs 0.65 ms/tok). GPU-side
+   work ASCA memang lebih banyak: 4 sublayer per blok + state linear O(Dh²) per head.
+2. **Prefill 1.32× lebih lambat** pada konteks panjang (dan 2.7× pada konteks 512,
+   karena overhead lebih dominan di sana). Ini pertama kalinya ASCA mendekati
+   parity di salah satu metrik — tapi belum menang.
+3. **Throughput & VRAM training tidak berubah**: 5.4× lebih lambat, 1.9× VRAM.
+   Itu bottleneck terbesar yang tersisa.
+4. **Belum ada benchmark skala besar** (≥100M token), semua angka di sini dari
+   nano/tiny dan 1.23M token. **Tidak ada klaim keunggulan.**
 
 ## Training komparasi (nano, 150 step)
 

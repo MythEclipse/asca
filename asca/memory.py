@@ -35,6 +35,14 @@ class SegmentMemory(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.forward_with_state(x)[0]
+
+    def forward_with_state(self, x: torch.Tensor):
+        """Seperti ``forward`` tetapi juga mengembalikan state cache decode.
+
+        State yang dikembalikan: ringkasan segmen yang SUDAH selesai
+        (``n_seg = T // L_s``) plus akumulator online-softmax untuk segmen aktif.
+        """
         B, T, D = x.shape
         L = min(self.seg, T)
         pad = (-T) % L
@@ -44,7 +52,7 @@ class SegmentMemory(nn.Module):
         S = Tp // L
         if S < 2:
             # hanya satu segmen: tidak ada masa lalu yang bisa dibaca
-            return torch.zeros_like(x[:, :T])
+            return torch.zeros_like(x[:, :T]), self._state_from_prefix(x, T)
 
         xr = x.view(B, S, L, D)
         k = self.k_proj(xr)  # (B,S,L,D)
@@ -72,7 +80,38 @@ class SegmentMemory(nn.Module):
         out = torch.einsum("bsltm,btmd->bsld", w, summ)
         out = out * (seg_idx > 0).view(1, S, 1, 1)
         out = out.reshape(B, Tp, D)[:, :T]
-        return torch.sigmoid(self.gate) * self.o_proj(out)
+        return torch.sigmoid(self.gate) * self.o_proj(out), self._state_from_prefix(x[:, :T], T, summ)
+
+    def _state_from_prefix(self, x: torch.Tensor, T: int, summ: torch.Tensor | None = None) -> dict:
+        """Bangun state decode dari lintasan paralel untuk prefiks sepanjang ``T``."""
+        B, _, D = x.shape
+        max_seg = self.max_seq // self.seg + 1
+        n_seg = min(T // self.seg, max_seg - 1)
+        n_cur = T - n_seg * self.seg
+
+        state = {
+            "summ": torch.zeros(B, max_seg, self.n_slots, D, device=x.device, dtype=x.dtype),
+            "acc": torch.zeros(B, self.n_slots, D, device=x.device, dtype=x.dtype),
+            "l": torch.zeros(B, self.n_slots, device=x.device, dtype=x.dtype),
+            "m": torch.full((B, self.n_slots), float("-inf"), device=x.device, dtype=x.dtype),
+            "n_seg": torch.tensor(n_seg, dtype=torch.long, device=x.device),
+            "n_cur": torch.tensor(n_cur, dtype=torch.long, device=x.device),
+        }
+        if summ is not None and n_seg > 0:
+            state["summ"][:, :n_seg] = summ[:, :n_seg]
+
+        if n_cur > 0:
+            # akumulator online-softmax untuk token segmen aktif yang belum selesai
+            part = x[:, n_seg * self.seg :]
+            k = self.k_proj(part)  # (B,n_cur,D)
+            v = self.v_proj(part)
+            sc = (self.q_mem.view(1, self.n_slots, D) @ k.transpose(-1, -2)) * self.scale  # (B,M,n_cur)
+            m = sc.max(dim=-1).values
+            p = torch.exp(sc - m.unsqueeze(-1))
+            state["acc"] = p @ v
+            state["l"] = p.sum(dim=-1)
+            state["m"] = m
+        return state
 
     # ------------------------------------------------------------------ step
     def init_state(self, batch: int, device, dtype) -> dict:

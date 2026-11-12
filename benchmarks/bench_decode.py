@@ -85,18 +85,36 @@ def time_cached_decode(model, prompt_len: int, n_new: int, device) -> tuple[floa
     return prefill, per_tok, size
 
 
+def time_parallel_prefill(model, prompt_len: int, device, iters: int = 5) -> float:
+    """Throughput prefill PARALEL (prompt diproses sekaligus, bukan per token)."""
+    idx = torch.randint(0, model.cfg.vocab_size, (1, prompt_len), device=device)
+    model.eval()
+    with torch.no_grad():
+        model.prefill(idx)  # warmup
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        best = float("inf")
+        for _ in range(iters):
+            t0 = time.perf_counter()
+            model.prefill(idx)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            best = min(best, time.perf_counter() - t0)
+    return prompt_len / best
+
+
 def time_graph_decode(model, prompt_len: int, n_new: int, device) -> tuple[float, float]:
-    """(prefill_tok_per_s, decode_ms_per_token) memakai CUDA graph."""
+    """(prefill_paralel_tok_per_s, decode_ms_per_token) memakai CUDA graph."""
     from asca.graph_decode import GraphDecoder
 
-    dec = GraphDecoder(model, batch=1)
-    dec.reset()
     idx = torch.randint(0, model.cfg.vocab_size, (1, prompt_len), device=device)
+    dec = GraphDecoder(model, batch=1)
     with torch.no_grad():
+        # prefill paralel + capture graph di atas cache hasil prefill
         t0 = time.perf_counter()
-        for t in range(prompt_len):
-            logits = dec.step(idx[:, t : t + 1])
-        torch.cuda.synchronize()
+        logits = dec.prefill(idx)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         prefill = prompt_len / (time.perf_counter() - t0)
 
         nxt = logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -104,7 +122,8 @@ def time_graph_decode(model, prompt_len: int, n_new: int, device) -> tuple[float
         for _ in range(n_new):
             logits = dec.step(nxt)
             nxt = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         per_tok = (time.perf_counter() - t0) / n_new * 1000.0
     return prefill, per_tok
 
@@ -160,8 +179,11 @@ def main() -> int:
             rec = time_recompute_decode(model, ctx, args.new_tokens, device)
             prefill, cached, size = time_cached_decode(model, ctx, args.new_tokens, device)
             g_prefill, g_cached = (None, None)
-            if device.type == "cuda" and not args.no_graph:
-                g_prefill, g_cached = time_graph_decode(model, ctx, args.new_tokens, device)
+            par_prefill = None
+            if device.type == "cuda":
+                par_prefill = time_parallel_prefill(model, ctx, device)
+                if not args.no_graph:
+                    g_prefill, g_cached = time_graph_decode(model, ctx, args.new_tokens, device)
             rows.append(
                 {
                     "model": name,
@@ -171,6 +193,7 @@ def main() -> int:
                     "graph_ms_tok": None if g_cached is None else round(g_cached, 2),
                     "graph_vs_eager": None if g_cached is None else round(cached / g_cached, 2),
                     "graph_prefill_tok_s": None if g_prefill is None else round(g_prefill),
+                    "par_prefill_tok_s": None if par_prefill is None else round(par_prefill),
                     "cache_mb": round(size / 1024 / 1024, 2),
                 }
             )

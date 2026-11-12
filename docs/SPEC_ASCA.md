@@ -315,9 +315,11 @@ Hasil ditulis ke `docs/EXPERIMENTS.md` oleh `benchmarks/train_toy.py`
 6. ~~Belum ada KV-cache~~ **selesai (v0.3)** dan ~~latensi decode~~ **selesai (v0.4)**:
    `init_cache`/`forward_step`/`generate_cached` untuk ASCA *dan* baseline, plus
    `asca.graph_decode.GraphDecoder` (satu replay CUDA graph = satu token).
-   Decode 8.18 → **1.64 ms/token** (5× lebih cepat), datar terhadap konteks.
-   Sisa gap: masih 2.6× lebih lambat dari dense (1.64 vs 0.64 ms/tok) karena
-   GPU-side work ASCA memang lebih banyak. Prefill masih token-demi-token.
+   Decode 8.18 → **1.60 ms/token** (5× lebih cepat), datar terhadap konteks.
+   ~~Prefill token-demi-token~~ **selesai (v0.5)**: `ASCAModel.prefill` memproses
+   prompt lewat forward chunked lalu menurunkan state cache dari lintasan paralel
+   (611 → **48.955 tok/s**, 80×; dense 64.690). Sisa gap: decode 2.5× dan prefill
+   1.32× lebih lambat dari dense.
 7. `torch.compile` memecah graph pada `int(counts.max().item())` di dispatch MoE
    (graph break, bukan error). Menghapusnya butuh kapasitas blok statis.
 8. Belum ada hasil benchmark pada skala bermakna (≥100M token). **Tidak ada klaim
@@ -339,8 +341,23 @@ Detail lengkap + cara reproduksi: `docs/EXPERIMENTS.md`.
 | `torch.compile` (opt-in `--compile`) | model penuh 66.3 → 42.9 ms (1.54×) |
 | Total end-to-end training (nano, 3 seed) | 63.0k → **106.1k tok/s (1.68×)** |
 | KV-cache + state rekuren decode | latensi datar terhadap konteks: 9.3 → 10.3 ms/tok (512 → 2036), cache **3.8 MB konstan** vs dense 24 MB |
-| CUDA Graph decode (`asca.graph_decode`) | 8.18 → **1.64 ms/token (5.0×)**, prefill 103 → **611 tok/s** |
+| CUDA Graph decode (`asca.graph_decode`) | 8.18 → **1.64 ms/token (5.0×)** |
+| Prefill paralel (`ASCAModel.prefill`) | 611 → **48.955 tok/s (80×)**; dense 64.690 (1.32×) |
 | Fix normalisasi `SegmentMemory` | val loss ASCA 0.4159 ± 0.0020 vs dense 0.4210 ± 0.0145 (setara) |
+
+### 8.0 Prefill paralel: menurunkan state cache dari lintasan chunked
+
+`prefill` tidak memanggil `forward_step` per token. Setelah forward paralel, state
+cache diturunkan dari lintasan yang sama:
+
+| Komponen | State yang diturunkan |
+|---|---|
+| attention lokal | ring buffer: posisi `T-w..T-1` ditulis ke slot `pos % w` |
+| attention linear | `S`, `ksum` akhir dari loop chunk (dikembalikan `_global_impl`) |
+| memori | ringkasan `T // L_s` segmen selesai + akumulator online-softmax segmen aktif |
+| encoder | buffer `kernel` input ternormalisasi terakhir |
+
+Konsistensi diuji: `prefill` lalu decode == loop `forward_step` T kali (galat ~1e-7).
 
 ### 8.1 Syarat agar jalur decode bisa di-CUDA-graph
 
