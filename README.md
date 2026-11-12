@@ -1,130 +1,142 @@
 # ASCA — Adaptive Sparse Cognitive Architecture
 
-Riset arsitektur LLM dari nol (*random init*, tanpa bobot pretrained) yang mengejar
-efisiensi komputasi dan memori melalui mekanisme adaptif dan sparse.
+From-scratch LLM architecture research (*random init*, no pretrained weights) targeting
+compute and memory efficiency through adaptive and sparse mechanisms.
 
-> **Status: v0.7 — hasil NEGATIF pada teks nyata.**
+> **Status: v0.7 — NEGATIVE result on real text.**
 >
-> Pada TinyStories (byte-level, 24M token, seq 1024, **5 seed**):
+> On TinyStories (byte-level, 24M tokens, seq 1024, **5 seeds**):
 >
 > | | val loss | throughput | VRAM |
 > |---|---|---|---|
-> | dense-matched (kontrol) | **0.8065 ± 0.0105** | **769k tok/s** | **286 MB** |
-> | ASCA penuh | 0.8282 ± 0.0069 | 224k tok/s | 709 MB |
+> | dense-matched (control) | **0.8065 ± 0.0105** | **769k tok/s** | **286 MB** |
+> | full ASCA | 0.8282 ± 0.0069 | 224k tok/s | 709 MB |
 >
-> Paired t = 2.95, df = 4, **p = 0.042** — kelima seed lebih buruk. ASCA 3.4× lebih
-> lambat dan 2.5× lebih boros VRAM. **Tidak ada klaim keunggulan.**
+> Paired t = 2.95, df = 4, **p = 0.042** — all five seeds are worse. ASCA is 3.4×
+> slower and uses 2.5× more VRAM. **No advantage is claimed.**
 >
-> **Pelajaran metodologis:** semua eksperimen awal memakai korpus sintetis, dan di
-> sana ASCA tampak setara bahkan sedikit lebih baik (Δ −0.002…−0.009). Kesimpulan
-> itu **tidak bertahan** pada teks nyata — arah tandanya berbalik, dan varian yang
-> tampak "sama saja" di sintetis jadi +0.09 lebih buruk. **Ablasi sintetis tidak
-> dipakai lagi untuk keputusan arsitektur.**
+> **Methodological lesson:** every early experiment used a synthetic corpus, and there
+> ASCA looked equal or even slightly better (Δ −0.002…−0.009). That conclusion **did
+> not survive** real text — the sign flipped, and the variant that looked "just as
+> good" on synthetic data turned out to be +0.09 worse. **Synthetic-corpus ablations
+> are no longer used for architecture decisions.**
 >
-> Yang sudah terukur dan bertahan: **prefill paralel 48.955 tok/s** (1.32× lebih
-> lambat dari dense) dan **decode 1.60 ms/token** dengan CUDA Graph, dengan **cache
-> decode 3.8 MB konstan vs 24 MB** milik dense. Semua detail di
+> What still holds up: **parallel prefill at 48,955 tok/s** (1.32× slower than dense)
+> and **1.60 ms/token decode** with CUDA Graphs, with a **constant 3.8 MB decode
+> cache vs 24 MB** for dense. Full details in
 > [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
 
 ---
 
-## 1. Visi Utama
+## 1. Vision
 
-Foundation model general-purpose dengan prioritas:
-- **Language & Semantic Primacy** — makna dan relasi bahasa sebagai fondasi.
+A general-purpose foundation model with these priorities:
+
+- **Language & Semantic Primacy** — meaning and linguistic relations as the foundation.
 - **Reasoning & Logic**, **Algorithms & Code**, **Mathematics & Science**.
-- **Long-Context Efficiency** — skalabilitas konteks tanpa ledakan memori $O(N^2)$.
-- **High-Throughput Inference** — latensi decode rendah pada GPU konsumen (target: 6 GB).
+- **Long-Context Efficiency** — context scaling without the $O(N^2)$ memory blow-up.
+- **High-Throughput Inference** — low decode latency on consumer GPUs (target: 6 GB).
 
-## 2. Prinsip Pengembangan
+## 2. Development Principles
 
-1. **Dari Nol**: semua bobot inisialisasi acak, tanpa pretrained checkpoint.
-2. **Mekanisme Mandiri**: operator internal dirumuskan sendiri, bukan sekadar ubah config Transformer.
-3. **Efisiensi sebagai Metrik Utama**: kualitas diukur relatif terhadap FLOPs, waktu, dan VRAM — bukan jumlah parameter.
-4. **Validasi Berbasis Kontrol**: setiap klaim wajib head-to-head vs Dense Transformer dan MoE standar pada budget token/FLOPs identik.
-5. **Kausalitas Non-Negotiable**: setiap mekanisme wajib lulus uji kebocoran token masa depan sebelum masuk training.
+1. **From Scratch**: all weights randomly initialized, no pretrained checkpoint.
+2. **Self-Contained Mechanisms**: internal operators are formulated from first
+   principles, not just Transformer config tweaks.
+3. **Efficiency as the Primary Metric**: quality is measured relative to FLOPs, wall
+   time, and VRAM — not parameter count.
+4. **Control-Based Validation**: every claim must be a head-to-head comparison against
+   a dense Transformer and a standard MoE at identical token/FLOP budgets.
+5. **Non-Negotiable Causality**: every mechanism must pass a future-token-leakage test
+   before it is allowed into training.
 
-## 3. Komponen Inti
+## 3. Core Components
 
-| Komponen | Mekanisme (lihat spesifikasi) |
+| Component | Mechanism (see the spec) |
 |---|---|
-| **Semantic Encoder** | Konvolusi kausal depthwise + bottleneck MLP sekali di input (§3.1) |
-| **Adaptive Attention** | Sliding-window causal attention ⊕ gated linear attention, digabung gate data-dependent (§3.2) |
+| **Semantic Encoder** | Depthwise causal convolution + bottleneck MLP, applied once at the input (§3.1) |
+| **Adaptive Attention** | Sliding-window causal attention ⊕ gated linear attention, combined by a data-dependent gate (§3.2) |
 | **Adaptive Router** | Top-$k$ routing + threshold skip (adaptive compute) + switch/z-loss (§3.3) |
-| **Sparse Experts** | Shared expert selalu aktif + routed SwiGLU experts, dispatch per-expert (§3.3) |
-| **Efficient Memory** | SegmentMemory: ringkasan segmen dengan $M$ slot, dibaca kausal antar-segmen (§3.4) |
-| **Shared Decoder** | RMSNorm + gated semantic skip + proyeksi tertaut embedding (§3.5) |
+| **Sparse Experts** | Always-on shared expert + routed SwiGLU experts, per-expert dispatch (§3.3) |
+| **Efficient Memory** | SegmentMemory: per-segment summaries with $M$ slots, read causally across segments (§3.4) |
+| **Shared Decoder** | RMSNorm + gated semantic skip + embedding-tied projection (§3.5) |
 
-Spesifikasi matematis lengkap (notasi, dataflow tensor, anggaran FLOPs, matriks ablasi):
-[`docs/SPEC_ASCA.md`](docs/SPEC_ASCA.md).
+Full mathematical specification (notation, tensor dataflow, FLOP budget, ablation
+matrix): [`docs/SPEC_ASCA.md`](docs/SPEC_ASCA.md).
 
-## 4. Struktur Repositori
+## 4. Repository Layout
 
 ```
 asca/
 ├── docs/
-│   ├── SPEC_ASCA.md            # Formulasi matematis + matriks ablasi
-│   └── EXPERIMENTS.md          # Log hasil benchmark (append otomatis)
-├── asca/                       # Implementasi arsitektur
-│   ├── config.py               # ASCAConfig + definisi ablasi A0..A6
+│   ├── SPEC_ASCA.md            # Mathematical formulation + ablation matrix
+│   └── EXPERIMENTS.md          # Benchmark log (auto-appended)
+├── asca/                       # Architecture implementation
+│   ├── config.py               # ASCAConfig + ablation definitions A0..A9
 │   ├── norm.py                 # RMSNorm, RoPE
 │   ├── encoder.py              # Semantic Encoder
-│   ├── attention.py            # Adaptive Hybrid Attention (lokal + linear chunked)
+│   ├── attention.py            # Adaptive Hybrid Attention (local + chunked linear)
 │   ├── router.py               # Adaptive Router + aux loss
 │   ├── experts.py              # Shared + routed sparse experts (MoE)
 │   ├── memory.py               # SegmentMemory
 │   ├── block.py                # Pre-norm residual block
-│   └── model.py                # ASCAModel + SharedDecoder + generate
+│   ├── graph_decode.py         # CUDA-graph decode wrapper
+│   └── model.py                # ASCAModel + SharedDecoder + prefill/generate
 ├── baseline/
-│   └── dense_transformer.py    # Kontrol: Llama/GPT-style dense causal transformer
+│   └── dense_transformer.py    # Control: Llama/GPT-style dense causal transformer
 ├── data/
-│   ├── tokenizer.py            # BPE (tokenizers) + fallback byte-level
-│   └── dataloader.py           # Korpus sintetis / file / HF + TokenDataset
+│   ├── tokenizer.py            # BPE (tokenizers) + byte-level fallback
+│   └── dataloader.py           # Synthetic / file / HF corpus + TokenDataset
 ├── benchmarks/
-│   ├── common.py               # Preset, param matching, FLOP counter, loop training
-│   ├── bench_flops.py          # FLOPs/token & throughput terukur
-│   ├── bench_vram.py           # Peak VRAM 512..4096 & latensi decode
-│   ├── profile_asca.py         # Profil per-komponen (cari hotspot)
-│   ├── bench_decode.py         # Latensi decode + memori cache (recompute/eager/graph)
-│   └── train_toy.py            # Training komparasi multi-seed (utama)
+│   ├── common.py               # Presets, param matching, FLOP counter, training loop
+│   ├── bench_flops.py          # Measured FLOPs/token & throughput
+│   ├── bench_vram.py           # Peak VRAM 512..4096 & decode latency
+│   ├── profile_asca.py         # Per-component profiling (hotspot hunting)
+│   ├── bench_decode.py         # Decode latency + cache memory (recompute/eager/graph)
+│   └── train_toy.py            # Multi-seed comparative training (primary entry point)
 └── tests/
-    └── run_tests.py            # Uji kausalitas, referensi naif, shapes, MoE, dll.
+    └── run_tests.py            # Causality, naive-reference, shape, MoE, decode parity
 ```
 
-## 5. Cara Menjalankan
+## 5. Running It
 
-Environment (wajib memakai venv bersama, **bukan** `.venv` per proyek):
+Environment (must use the shared venv, **not** a project-local `.venv`):
 
 ```bash
 source ~/.venvs/ml-activate        # torch 2.11.0+cu128, RTX 4050 sm_89
 ```
 
-Test (12 test, ~2 detik di GPU):
+Tests (20 tests, ~6 s on GPU):
 
 ```bash
 env -u PYTHONPATH ~/.venvs/ml/bin/python tests/run_tests.py
 ```
 
-Benchmark FLOPs & throughput:
+FLOPs & throughput benchmark:
 
 ```bash
 env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_flops.py --preset tiny --out docs/EXPERIMENTS.md
-env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_flops.py --ablation A3     # ablasi
+env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_flops.py --ablation A3     # ablation
 ```
 
-VRAM & latensi decode:
+VRAM & decode latency:
 
 ```bash
 env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_vram.py --preset nano --out docs/EXPERIMENTS.md
 ```
 
-Profil hotspot per komponen:
+Decode benchmark (recompute vs eager cache vs CUDA graph, plus parallel prefill):
+
+```bash
+env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_decode.py --preset tiny --contexts 512,1024,2048 --new-tokens 12
+```
+
+Per-component hotspot profiling:
 
 ```bash
 env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/profile_asca.py --preset tiny --seq-len 512
 ```
 
-Training komparasi (utama) — `--compile` memberi ~1.5× tambahan:
+Comparative training (primary) — `--compile` adds ~1.5×:
 
 ```bash
 env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/train_toy.py \
@@ -132,40 +144,47 @@ env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/train_toy.py \
     --models dense-matched,asca --seeds 0,1,2 --compile --out docs/EXPERIMENTS.md
 ```
 
-Korpus nyata (perlu `datasets` di venv bersama untuk streaming HF):
+Real corpus (a local file works without extra dependencies; `--corpus hf` needs
+`datasets` in the shared venv):
 
 ```bash
+... --corpus file --path /path/to/TinyStories-valid.txt --max-chars 19000000
 ... --corpus hf --hf-repo HuggingFaceFW/fineweb --max-chars 50000000
 ```
 
-## 6. Protokol Evaluasi
+## 6. Evaluation Protocol
 
-- **Language**: validation loss & perplexity pada korpus uji yang sama.
-- **Efficiency**: active FLOPs/token (terukur), tokens/sec training, ms/token decode.
-- **Memory**: peak VRAM pada $T \in \{512, 1024, 2048, 4096\}$.
-- **Reasoning/Code/Math**: GSM8K, HumanEval, MBPP — hanya setelah skala memadai.
-- **Statistik**: minimal 3 seed, dilaporkan mean ± std. Satu run tidak diklaim.
+- **Language**: validation loss & perplexity on the same held-out corpus.
+- **Efficiency**: active FLOPs/token (measured), training tokens/sec, decode ms/token.
+- **Memory**: peak VRAM at $T \in \{512, 1024, 2048, 4096\}$.
+- **Reasoning/Code/Math**: GSM8K, HumanEval, MBPP — only once the scale justifies it.
+- **Statistics**: at least 3 seeds, reported as mean ± std. A single run is not a
+  claim. The noise floor must be measured, not assumed, and it depends on the corpus
+  (~±0.0006 seed std on synthetic data vs ~±0.015 on real text).
 
-## 7. Roadmap Terdekat
+## 7. Roadmap
 
-Sudah selesai (v0.2): grouped-GEMM MoE dispatch (1.7×), chunk adaptif (2.0× pada
-attention), jalur FlexAttention opsional, `torch.compile` opt-in (1.54×).
+Done (v0.2): grouped-GEMM MoE dispatch (1.7×), adaptive chunking (2.0× on attention),
+optional FlexAttention path, opt-in `torch.compile` (1.54×).
 
-Sudah selesai (v0.5): KV-cache + state rekuren, fix normalisasi `SegmentMemory`,
-CUDA Graph decode, dan **prefill paralel** (state cache diturunkan dari lintasan
-chunked; 611 → 48.955 tok/s).
+Done (v0.5): KV-cache + recurrent decode state, `SegmentMemory` normalization fix,
+CUDA-graph decode, and **parallel prefill** (decode cache derived from the chunked
+forward pass; 611 → 48,955 tok/s).
 
-1. **Diagnosis defisit**: apakah ASCA kalah karena kapasitas efektif lebih kecil
-   (active params 0.9M tersebar di 4 sublayer vs satu MLP lebar), karena optimisasi
-   (LR/warmup belum di-tuning per arsitektur), atau karena skalanya terlalu kecil?
-   Kandidat eksperimen: samakan **total** params (bukan active), sweep LR, dan
-   kurva loss vs token (apakah ASCA menyusul dengan training lebih lama).
-2. **Skala**: 24M token & d=128 masih rezim mainan. Perlu ≥100M token dan preset
-   `small` sebelum ada klaim apa pun.
-3. **Pertahankan yang sudah menang**: cache decode konstan (3.8 MB vs 24 MB) dan
-   prefill paralel — tapi itu belum cukup untuk membenarkan arsitekturnya.
-4. **Turunkan VRAM training**: FlexAttention sebagai default pada T besar, ganti skor
-   memori O(S²LM) dengan pembacaan per-segmen.
-5. **Ablasi penuh A0–A6** pada ≥100M token (sekarang baru 300–600 step, 1 seed/3 seed).
-6. **Skala**: preset `small` (seq 1024) lalu Colab (A100/T4) untuk pretraining
-   dengan checkpoint ke Drive/HF Hub + resume otomatis.
+Open, in priority order:
+
+1. **Diagnose the deficit**: is ASCA losing because effective capacity is smaller
+   (0.9M active params spread over 4 sublayers vs one wide MLP), because of
+   optimization (LR/warmup were never tuned per architecture), or because the scale is
+   simply too small? Candidate experiments: match **total** params (not active), sweep
+   LR, and plot loss vs tokens (does ASCA catch up with longer training?).
+2. **Scale**: 24M tokens at d=128 is a toy regime. ≥100M tokens and the `small`
+   preset are required before any claim.
+3. **Keep what already wins**: constant decode cache (3.8 MB vs 24 MB) and parallel
+   prefill — but that is not yet enough to justify the architecture.
+4. **Cut training VRAM**: make FlexAttention the default at large $T$, and replace the
+   $O(S^2LM)$ memory score with per-segment reads.
+5. **Full A0–A9 ablation** at ≥100M tokens on a real corpus (current runs are 12–24M
+   tokens, nano preset only).
+6. **Scale up**: `small` preset (seq 1024), then Colab (A100/T4) for pretraining with
+   checkpointing to Drive/HF Hub and automatic resume.
