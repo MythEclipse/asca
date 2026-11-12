@@ -85,6 +85,30 @@ def time_cached_decode(model, prompt_len: int, n_new: int, device) -> tuple[floa
     return prefill, per_tok, size
 
 
+def time_graph_decode(model, prompt_len: int, n_new: int, device) -> tuple[float, float]:
+    """(prefill_tok_per_s, decode_ms_per_token) memakai CUDA graph."""
+    from asca.graph_decode import GraphDecoder
+
+    dec = GraphDecoder(model, batch=1)
+    dec.reset()
+    idx = torch.randint(0, model.cfg.vocab_size, (1, prompt_len), device=device)
+    with torch.no_grad():
+        t0 = time.perf_counter()
+        for t in range(prompt_len):
+            logits = dec.step(idx[:, t : t + 1])
+        torch.cuda.synchronize()
+        prefill = prompt_len / (time.perf_counter() - t0)
+
+        nxt = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        t0 = time.perf_counter()
+        for _ in range(n_new):
+            logits = dec.step(nxt)
+            nxt = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        torch.cuda.synchronize()
+        per_tok = (time.perf_counter() - t0) / n_new * 1000.0
+    return prefill, per_tok
+
+
 def time_recompute_decode(model, prompt_len: int, n_new: int, device) -> float:
     """Latensi per token untuk generate() tanpa cache (recompute penuh)."""
     idx = torch.randint(0, model.cfg.vocab_size, (1, prompt_len), device=device)
@@ -111,6 +135,7 @@ def main() -> int:
     ap.add_argument("--contexts", default="512,1024,2048")
     ap.add_argument("--new-tokens", type=int, default=16)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-graph", action="store_true", help="lewati pengukuran CUDA graph")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -134,14 +159,18 @@ def main() -> int:
                 continue
             rec = time_recompute_decode(model, ctx, args.new_tokens, device)
             prefill, cached, size = time_cached_decode(model, ctx, args.new_tokens, device)
+            g_prefill, g_cached = (None, None)
+            if device.type == "cuda" and not args.no_graph:
+                g_prefill, g_cached = time_graph_decode(model, ctx, args.new_tokens, device)
             rows.append(
                 {
                     "model": name,
                     "context": ctx,
                     "recompute_ms_tok": round(rec, 2),
                     "cached_ms_tok": round(cached, 2),
-                    "speedup": round(rec / cached, 2) if cached > 0 else None,
-                    "prefill_tok_s": round(prefill),
+                    "graph_ms_tok": None if g_cached is None else round(g_cached, 2),
+                    "graph_vs_eager": None if g_cached is None else round(cached / g_cached, 2),
+                    "graph_prefill_tok_s": None if g_prefill is None else round(g_prefill),
                     "cache_mb": round(size / 1024 / 1024, 2),
                 }
             )

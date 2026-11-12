@@ -64,9 +64,12 @@ class AdaptiveSparseMoE(nn.Module):
         aux = self.router.aux_loss(logits, top_idx)
 
         # Dispatch: pada decode (token sangat sedikit) jalur grouped GEMM justru
-        # didominasi overhead argsort/bincount/padding. Ambang kecil -> pakai loop.
-        use_grouped = self.impl == "grouped" and flat.shape[0] * self.top_k > 64
-        if use_grouped:
+        # didominasi overhead argsort/bincount/padding, dan `nonzero`/`.item()`
+        # membuat jalur ini tidak bisa di-CUDA-graph. Pakai dispatch terpilih.
+        n_pairs = flat.shape[0] * self.top_k
+        if n_pairs <= 64:
+            out = self._routed_selected(flat, weights, top_idx)
+        elif self.impl == "grouped":
             out = self._routed_grouped(flat, weights, top_idx)
         else:
             out = self._routed_loop(flat, weights, top_idx)
@@ -82,6 +85,35 @@ class AdaptiveSparseMoE(nn.Module):
         return out.view(B, T, D), aux
 
     # ------------------------------------------------------------- dispatch
+    def _routed_selected(
+        self, flat: torch.Tensor, weights: torch.Tensor, top_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Dispatch terpilih: hanya expert yang dipilih, lewat ``index_select``.
+
+        Bentuk tensor tidak bergantung data (tanpa ``nonzero``/``.item()``), jadi
+        jalur ini bisa di-CUDA-graph dan dipakai untuk decode. FLOPs tetap sparse:
+        hanya ``N * top_k`` pasangan expert-token yang dihitung.
+        """
+        N = flat.shape[0]
+        idx = top_idx.reshape(-1)  # (N*k,)
+        w13 = torch.cat(
+            [
+                torch.stack([e.w1.weight for e in self.experts]),
+                torch.stack([e.w3.weight for e in self.experts]),
+            ],
+            dim=1,
+        )  # (E, 2*dh, D)
+        w2 = torch.stack([e.w2.weight for e in self.experts])  # (E, D, dh)
+        w13_sel = w13.index_select(0, idx)  # (N*k, 2dh, D)
+        w2_sel = w2.index_select(0, idx)  # (N*k, D, dh)
+        xr = flat.repeat_interleave(self.top_k, dim=0)  # (N*k, D)
+        h = torch.bmm(w13_sel, xr.unsqueeze(-1)).squeeze(-1)  # (N*k, 2dh)
+        gate, up = h.chunk(2, dim=-1)
+        act = F.silu(gate) * up
+        o = torch.bmm(w2_sel, act.unsqueeze(-1)).squeeze(-1)  # (N*k, D)
+        o = o * weights.reshape(-1, 1)
+        return o.view(N, self.top_k, self.cfg.d_model).sum(dim=1)
+
     def _routed_loop(
         self, flat: torch.Tensor, weights: torch.Tensor, top_idx: torch.Tensor
     ) -> torch.Tensor:

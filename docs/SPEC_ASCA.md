@@ -312,11 +312,12 @@ Hasil ditulis ke `docs/EXPERIMENTS.md` oleh `benchmarks/train_toy.py`
    gate); ini asumsi desain yang perlu diuji.
 5. Grouped GEMM MoE membayar padding yang bergantung keseimbangan routing
    (1.07×–1.65× terukur). Belum ada dispatch dengan kapasitas terbatas per blok.
-6. ~~Belum ada KV-cache~~ **selesai (v0.3)**: `init_cache`/`forward_step`/`generate_cached`
-   untuk ASCA *dan* baseline. Diverifikasi identik dengan forward penuh (galat ~1e-7).
-   Yang belum: latensi per token masih ~4.7× lebih lambat dari dense karena ~2.900
-   kernel/token; perlu CUDA Graph atau kernel terfusi (bukan `torch.compile`, yang
-   justru 40× lebih lambat di jalur ini). Prefill juga masih token-demi-token.
+6. ~~Belum ada KV-cache~~ **selesai (v0.3)** dan ~~latensi decode~~ **selesai (v0.4)**:
+   `init_cache`/`forward_step`/`generate_cached` untuk ASCA *dan* baseline, plus
+   `asca.graph_decode.GraphDecoder` (satu replay CUDA graph = satu token).
+   Decode 8.18 → **1.64 ms/token** (5× lebih cepat), datar terhadap konteks.
+   Sisa gap: masih 2.6× lebih lambat dari dense (1.64 vs 0.64 ms/tok) karena
+   GPU-side work ASCA memang lebih banyak. Prefill masih token-demi-token.
 7. `torch.compile` memecah graph pada `int(counts.max().item())` di dispatch MoE
    (graph break, bukan error). Menghapusnya butuh kapasitas blok statis.
 8. Belum ada hasil benchmark pada skala bermakna (≥100M token). **Tidak ada klaim
@@ -337,8 +338,29 @@ Detail lengkap + cara reproduksi: `docs/EXPERIMENTS.md`.
 | MoE grouped GEMM (2 `bmm`, bukan 3·E kernel) | MoE 3.78 → 2.22 ms (1.7×) |
 | `torch.compile` (opt-in `--compile`) | model penuh 66.3 → 42.9 ms (1.54×) |
 | Total end-to-end training (nano, 3 seed) | 63.0k → **106.1k tok/s (1.68×)** |
-| KV-cache + state rekuren decode | latensi datar terhadap konteks: 9.3 → 10.3 ms/tok (512 → 2036), cache **6.4 MB konstan** vs dense 24 MB |
+| KV-cache + state rekuren decode | latensi datar terhadap konteks: 9.3 → 10.3 ms/tok (512 → 2036), cache **3.8 MB konstan** vs dense 24 MB |
+| CUDA Graph decode (`asca.graph_decode`) | 8.18 → **1.64 ms/token (5.0×)**, prefill 103 → **611 tok/s** |
 | Fix normalisasi `SegmentMemory` | val loss ASCA 0.4159 ± 0.0020 vs dense 0.4210 ± 0.0145 (setara) |
+
+### 8.1 Syarat agar jalur decode bisa di-CUDA-graph
+
+Supaya satu graph bisa dipakai ulang untuk semua posisi, jalur `step` harus
+**bebas cabang data-dependent**:
+
+1. Posisi/window memakai `scatter_`/`index_select` dengan indeks dari **tensor**
+   (`pos % w`), bukan `if`/irisan Python.
+2. Ringkasan segmen dihitung inkremental dengan online softmax
+   (`acc`, `l`, `m` berjalan) — bukan dihitung ulang tiap token.
+3. MoE memakai dispatch terpilih (`index_select` atas bobot expert), tanpa
+   `nonzero`/`.item()` yang membuat bentuk tensor bergantung data.
+4. **Semua update state in-place.** Kalau buffer di-rebind ke tensor baru saat
+   capture, memori lama dilepas di tengah capture dan graph bisa menulis ke blok
+   yang masih dipakai tensor lain (aliasing → `device-side assert` saat replay).
+5. Tidak ada `.item()`/sinkronisasi CPU–GPU di dalam langkah; penghitung posisi
+   disimpan sebagai tensor dan dinaikkan in-place.
+
+`torch.compile` **bukan** solusi untuk jalur ini: terukur 40× lebih lambat
+(guards + recompiles) dibanding CUDA graph.
 
 Status jujur: kualitas setara dense param-matched (0.4165 vs 0.4167 val loss pada
 1.23M token), FLOPs/token +7% pada active params setara (preset tiny), tetapi

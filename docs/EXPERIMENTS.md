@@ -18,39 +18,38 @@ Hasil benchmark otomatis. Setiap entri menyertakan konfigurasi lengkap.
   **Selisih < ~0.08 val loss pada budget ini tidak bermakna**; jangan menafsirkan
   satu seed sebagai bukti.
 
-## Status ringkas v0.3 (KV-cache + fix normalisasi memori, nano, 1.23M token, 3 seed)
+## Status ringkas v0.4 (CUDA Graph decode, tiny)
 
-| Aspek | Hasil | Kesimpulan |
-|---|---|---|
-| Kualitas (val loss) | ASCA **0.4159 ± 0.0020** vs dense-matched 0.4210 ± 0.0145 | **setara** (dalam noise; ASCA variansnya lebih kecil) |
-| Throughput training | ASCA **103.9k ± 5.3k** tok/s vs dense 557k ± 32k tok/s | masih **5.4× lebih lambat** (occupancy kernel, bukan FLOPs) |
-| FLOPs/token (active params setara) | 3.52M vs 2.97M | **+19%** (termasuk padding grouped GEMM) |
-| VRAM training | 190 MB vs 99 MB | **1.9× lebih besar** |
-| Memori cache decode (konteks 2036) | ASCA **6.4 MB (konstan)** vs dense 24.0 MB | **3.8× lebih kecil dan tidak tumbuh** dengan konteks |
-| Latensi decode (konteks 2036) | ASCA 10.3 ms/tok vs dense 2.2 ms/tok | **4.7× lebih lambat**, tapi 3.8× lebih cepat dari jalur recompute ASCA sendiri |
-| Prefill (token demi token lewat cache) | ASCA ~103 tok/s vs dense ~490 tok/s | jalur prefill ASCA belum memakai forward paralel |
+| Aspek | ASCA | dense-matched | Kesimpulan |
+|---|---|---|---|
+| Decode eager (ms/tok, konteks 2036) | 8.18 | 2.05 | ASCA 4.0× lebih lambat |
+| **Decode CUDA Graph** | **1.64 (datar)** | **0.64 (datar)** | ASCA **2.6×** lebih lambat, gap menyempit dari 4.0× |
+| Speedup graph vs eager | **5.0×** | 3.2× | launch overhead memang bottleneck-nya |
+| Prefill lewat cache (graph) | **611 tok/s** | 1543 tok/s | dari 103 tok/s (6×) |
+| Memori cache decode | **3.82 MB konstan** | 24.25 MB (prealloc `max_seq_len`) | ASCA **6.3×** lebih kecil, O(1) terhadap konteks |
+| val loss (nano, 3 seed) | 0.4159 ± 0.0020 | 0.4210 ± 0.0145 | setara (tidak berubah oleh optimasi decode) |
+| Throughput training (nano) | 103.9k tok/s | 557k tok/s | tidak berubah: jalur training tak disentuh |
 
-**Bug yang ditemukan lewat uji incremental:** softmax pada `SegmentMemory` dulu
-menormalisasi lintas **posisi query** (sumbu `l` ikut masuk sumbu softmax), bukan per
-token. Semua angka v0.1/v0.2 memakai implementasi yang salah itu (tetap kausal, jadi
-uji kausalitas lolos). Sudah diperbaiki; angka v0.3 di atas adalah yang benar.
+**Cara mencapainya (dan mengapa `torch.compile` tidak dipakai):** jalur `step` dibuat
+*bebas cabang* — posisi/window memakai `scatter_`/`index_select` dengan indeks dari
+tensor, ringkasan segmen memakai online softmax, MoE memakai dispatch terpilih
+(`index_select`, tanpa `nonzero`/`.item()`), dan **semua update state in-place**.
+Dengan itu satu CUDA graph bisa dipakai untuk semua posisi. `torch.compile` di jalur
+yang sama justru 40× lebih lambat (guards + recompiles).
+
+**Jebakan yang ditemukan:** kalau sebuah buffer state di-*rebind* ke tensor baru saat
+capture, memori lama dilepas di tengah capture dan graph bisa menulis ke blok yang
+masih dipakai tensor lain → data rusak dan `device-side assert` di `index_select`.
+Gejalanya menyesatkan (muncul saat replay, bukan saat capture).
 
 **Yang masih gagal (jujur):**
 
-1. **Wall-clock training** masih 5.4× lebih lambat dari dense pada `d_model` kecil.
-   Profil menunjukkan ini overhead kernel/occupancy: ASCA menjalankan 4 sublayer per
-   blok dengan matmul kecil, sedangkan baseline satu jalur GEMM besar.
-2. **VRAM training** belum turun (1.9× lebih besar).
-3. **Latensi decode per token** masih 4.7× lebih lambat dari dense (9–10 ms/tok).
-   Profiler: ~2.900 kernel per token (81 kernel unik). `torch.compile` di jalur `step`
-   justru 40× lebih lambat (guards + recompiles), jadi perlu CUDA Graph / kernel terfusi,
-   bukan compile.
-4. **Prefill lewat cache** masih token-demi-token (belum memakai forward chunked paralel).
-5. **Padding grouped GEMM** bergantung keseimbangan routing (1.07×–1.65×).
-
-**Yang sudah terbukti:** mekanisme benar (kausal + cocok referensi naif + decode
-inkremental identik dengan forward penuh sampai 1e-7), kualitas setara baseline pada
-budget ini, dan memori cache decode konstan terhadap panjang konteks.
+1. **Latensi decode masih 2.6× lebih lambat** dari dense (1.64 vs 0.64 ms/tok).
+   GPU-side work ASCA memang lebih banyak (4 sublayer/blok + state O(Dh²) per head).
+2. **Prefill masih token-demi-token** (611 tok/s vs dense 1543). Belum memakai
+   forward chunked paralel untuk prompt.
+3. **Throughput training & VRAM training tidak berubah** (5.4× lebih lambat, 1.9× VRAM).
+4. **Belum ada benchmark skala besar** (≥100M token). **Tidak ada klaim keunggulan.**
 
 ## Training komparasi (nano, 150 step)
 

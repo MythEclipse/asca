@@ -121,42 +121,44 @@ class ASCAModel(nn.Module):
 
     # --------------------------------------------------------------- decode
     def init_cache(self, batch: int = 1, device=None, dtype=None) -> dict:
-        """Inisialisasi cache decode inkremental (KV lokal + state linear + memori)."""
+        """Inisialisasi cache decode (semua tensor berukuran tetap, graph-safe)."""
         p = next(self.parameters())
         device = device or p.device
         dtype = dtype or p.dtype
-        cache = {
-            "pos": 0,
+        cos, sin = rope_cache(self.cfg.max_seq_len, self.cfg.head_dim, self.cfg.rope_theta, device, dtype)
+        return {
+            "pos": torch.zeros((), dtype=torch.long, device=device),
+            "n": 0,  # penghitung python (tanpa .item(), tidak sync)
+            "rope": (cos, sin),
             "sem": self.sem.init_state(batch, device, dtype)
             if hasattr(self.sem, "init_state")
             else {},
             "layers": [blk.init_state(batch, device, dtype) for blk in self.blocks],
         }
-        return cache
 
     def forward_step(self, idx_t: torch.Tensor, cache: dict) -> torch.Tensor:
         """Satu token dengan cache: ``idx_t`` berbentuk ``(B,1)`` -> logits ``(B,1,V)``.
 
-        Secara matematis identik dengan ``forward`` pada sekuens penuh (diverifikasi
-        ``tests/run_tests.py::test_incremental_matches_full_forward``), tetapi biaya
-        per token O(w·D + Dh²) alih-alih O(T²).
+        Identik secara matematis dengan ``forward`` pada sekuens penuh (diverifikasi
+        ``tests/run_tests.py``), tetapi biaya per token O(w·D + Dh²) dan tidak ada
+        cabang data-dependent sehingga bisa direkam ke CUDA graph.
         """
-        B, T = idx_t.shape
-        if T != 1:
+        if idx_t.shape[1] != 1:
             raise ValueError("forward_step hanya menerima satu token per panggilan")
-        pos = cache["pos"]
-        if pos >= self.cfg.max_seq_len:
-            raise ValueError("melebihi max_seq_len; reset cache atau perpanjang konteks")
+        if cache["n"] >= self.cfg.max_seq_len:
+            raise ValueError("melebihi max_seq_len; reset cache")
+        pos_t = cache["pos"]
+        rope = cache["rope"]
 
         h0 = self.embed(idx_t) * math.sqrt(self.cfg.d_model)
-        h = self.sem.step(h0, pos, cache["sem"]) if hasattr(self.sem, "step") else self.sem(h0)
-
+        h = self.sem.step(h0, pos_t, rope, cache["sem"]) if hasattr(self.sem, "step") else self.sem(h0)
         aux_total = h.new_zeros(())
         for blk, st in zip(self.blocks, cache["layers"]):
-            h, aux = blk.step(h, pos, st)
+            h, aux = blk.step(h, pos_t, rope, st)
             aux_total = aux_total + aux
         self.last_aux_loss = aux_total / max(1, len(self.blocks))
-        cache["pos"] = pos + 1
+        cache["pos"] += 1  # in-place: ikut terekam di dalam CUDA graph
+        cache["n"] += 1
         return self.decoder(h, h0, self.embed.weight)
 
     @torch.no_grad()
@@ -167,11 +169,9 @@ class ASCAModel(nn.Module):
         temperature: float = 1.0,
         top_k: int | None = None,
     ) -> torch.Tensor:
-        """Decode autoregresif memakai cache: prefill sekali, lalu 1 token/step."""
+        """Decode autoregresif memakai cache (satu token per langkah)."""
         self.eval()
         cache = self.init_cache(idx.shape[0], idx.device, self.embed.weight.dtype)
-        # prefill: proses prompt token demi token lewat cache (jalur yang sama
-        # dengan decode, supaya hasilnya identik dengan generate() tanpa cache)
         logits = None
         for t in range(idx.shape[1]):
             logits = self.forward_step(idx[:, t : t + 1], cache)

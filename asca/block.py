@@ -57,11 +57,11 @@ class ASCABlock(nn.Module):
             st["mem"] = self.mem.init_state(batch, device, dtype)
         return st
 
-    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    def step(self, x_t: torch.Tensor, pos_t: torch.Tensor, rope, state: dict):
         """Satu token (decode inkremental)."""
-        x = x_t + self.attn.step(self.norm_attn(x_t), pos, state["attn"])
+        x = x_t + self.attn.step(self.norm_attn(x_t), pos_t, rope, state["attn"])
         if self.use_memory:
-            x = x + self.mem.step(self.norm_mem(x), pos, state["mem"])
+            x = x + self.mem.step(self.norm_mem(x), pos_t, rope, state["mem"])
         aux = x.new_zeros(())
         if self.use_moe:
             h, aux = self.mlp(self.norm_mlp(x))

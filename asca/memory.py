@@ -76,51 +76,64 @@ class SegmentMemory(nn.Module):
 
     # ------------------------------------------------------------------ step
     def init_state(self, batch: int, device, dtype) -> dict:
-        """Cache decode berukuran TETAP.
+        """Cache decode berukuran TETAP dan bebas cabang (CUDA-graph friendly).
 
-        ``summ`` dialokasikan untuk ``max_seg = max_seq_len // seg + 1`` segmen
-        (bukan tumbuh per token), ``cur_*`` berukuran satu segmen penuh.
+        Ringkasan segmen aktif dihitung inkremental dengan online softmax
+        (flash-style): ``acc`` (pembilang), ``l`` (penyebut), ``m`` (maks berjalan).
+        Biaya per token jadi O(M·D), bukan O(M·L_s·D).
         """
         max_seg = self.max_seq // self.seg + 1
         return {
             "summ": torch.zeros(batch, max_seg, self.n_slots, self.d, device=device, dtype=dtype),
-            "cur_k": torch.zeros(batch, self.seg, self.d, device=device, dtype=dtype),
-            "cur_v": torch.zeros(batch, self.seg, self.d, device=device, dtype=dtype),
-            "n_seg": 0,
-            "n_cur": 0,
+            "acc": torch.zeros(batch, self.n_slots, self.d, device=device, dtype=dtype),
+            "l": torch.zeros(batch, self.n_slots, device=device, dtype=dtype),
+            "m": torch.full((batch, self.n_slots), float("-inf"), device=device, dtype=dtype),
+            "n_seg": torch.zeros((), dtype=torch.long, device=device),
+            "n_cur": torch.zeros((), dtype=torch.long, device=device),
         }
 
-    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> torch.Tensor:
+    def step(self, x_t: torch.Tensor, pos_t: torch.Tensor, rope, state: dict) -> torch.Tensor:
         """Satu token. Sama dengan ``forward`` pada sekuens penuh."""
         B, _, D = x_t.shape
         k_t = self.k_proj(x_t)  # (B,1,D)
         v_t = self.v_proj(x_t)
 
         # --- baca ringkasan segmen < segmen saat ini (belum termasuk token ini)
-        n_seg = state["n_seg"]
-        if n_seg == 0:
-            out = torch.zeros_like(x_t)
-        else:
-            flat = state["summ"].reshape(B, -1, D)  # (B,max_seg*M,D)
-            valid = torch.arange(flat.shape[1], device=x_t.device) < n_seg * self.n_slots
-            q = self.q_proj(x_t)  # (B,1,D)
-            scores = (q @ flat.transpose(-1, -2)) * self.scale  # (B,1,max_seg*M)
-            scores = scores.masked_fill(~valid.view(1, 1, -1), float("-inf"))
-            w = torch.softmax(scores, dim=-1)
-            out = w @ flat
+        flat = state["summ"].reshape(B, -1, D)  # (B,max_seg*M,D)
+        n_valid = state["n_seg"] * self.n_slots
+        valid = torch.arange(flat.shape[1], device=x_t.device) < n_valid
+        q = self.q_proj(x_t)  # (B,1,D)
+        scores = (q @ flat.transpose(-1, -2)) * self.scale  # (B,1,max_seg*M)
+        # -1e30 (bukan -inf) agar aman untuk CUDA graph. Kalau belum ada segmen,
+        # semua ter-mask -> bobot uniform, dan karena `summ` masih nol keluarannya
+        # tepat nol (sama dengan forward).
+        scores = scores.masked_fill(~valid.view(1, 1, -1), -1e30)
+        w = torch.softmax(scores, dim=-1)
+        out = w @ flat
 
-        # --- akumulasi segmen aktif; saat penuh, ringkas & geser ke masa lalu
-        p = state["n_cur"]
-        state["cur_k"][:, p] = k_t.squeeze(1)
-        state["cur_v"][:, p] = v_t.squeeze(1)
-        state["n_cur"] = p + 1
-        if state["n_cur"] == self.seg:
-            ck, cv = state["cur_k"], state["cur_v"]  # (B,L,D)
-            attn = torch.softmax(
-                (self.q_mem.view(1, self.n_slots, D) @ ck.transpose(-1, -2)) * self.scale, dim=-1
-            )  # (B,M,L)
-            state["summ"][:, n_seg] = attn @ cv
-            state["n_seg"] = n_seg + 1
-            state["n_cur"] = 0
+        # --- ringkasan segmen aktif secara inkremental (online softmax).
+        # SEMUA update state in-place: kalau buffer di-rebind ke tensor baru saat
+        # CUDA-graph capture, memori lama dilepas di tengah capture dan graph bisa
+        # menulis ke blok yang masih dipakai tensor lain (aliasing -> data rusak).
+        sc = (self.q_mem.view(1, self.n_slots, D) @ k_t.transpose(-1, -2)).squeeze(-1) * self.scale
+        m_new = torch.maximum(state["m"], sc)
+        alpha = torch.exp(state["m"] - m_new)  # m lama -inf -> 0
+        p = torch.exp(sc - m_new)
+        state["l"].mul_(alpha).add_(p)
+        state["acc"].mul_(alpha.unsqueeze(-1)).add_(p.unsqueeze(-1) * v_t)
+        state["m"].copy_(m_new)
+
+        # --- saat segmen penuh: tulis ringkasan ke `summ`, reset akumulator
+        n_seg = state["n_seg"].clamp(max=state["summ"].shape[1] - 1)
+        summary = state["acc"] / state["l"].clamp(min=1e-20).unsqueeze(-1)  # (B,M,D)
+        old = state["summ"].index_select(1, n_seg.view(1))  # (B,1,M,D)
+        is_full = (state["n_cur"] + 1) >= self.seg
+        new = torch.where(is_full, summary.unsqueeze(1), old)
+        state["summ"].scatter_(1, n_seg.view(1, 1, 1, 1).expand(B, 1, self.n_slots, D), new)
+        state["n_seg"].add_(is_full.long())
+        state["n_cur"].add_(1).masked_fill_(is_full, 0)
+        state["acc"].masked_fill_(is_full.unsqueeze(-1), 0.0)
+        state["l"].masked_fill_(is_full, 0.0)
+        state["m"].masked_fill_(is_full, float("-inf"))
 
         return torch.sigmoid(self.gate) * self.o_proj(out)

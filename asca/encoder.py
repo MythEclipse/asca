@@ -37,13 +37,22 @@ class SemanticEncoder(nn.Module):
 
     # ------------------------------------------------------------------ step
     def init_state(self, batch: int, device, dtype) -> dict:
-        """Buffer ``kernel-1`` input ternormalisasi terakhir (konvolusi kausal)."""
-        return {"buf": torch.zeros(batch, self.kernel - 1, self.d, device=device, dtype=dtype)}
+        """Ring buffer ``kernel`` input ternormalisasi terakhir (graph-safe)."""
+        return {
+            "buf": torch.zeros(batch, self.kernel, self.d, device=device, dtype=dtype),
+        }
 
-    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> torch.Tensor:
+    def step(self, x_t: torch.Tensor, pos_t: torch.Tensor, rope, state: dict) -> torch.Tensor:
+        B = x_t.shape[0]
         u = self.norm(x_t)  # (B,1,D)
-        buf = torch.cat([state["buf"], u], dim=1)[:, -(self.kernel) :]  # (B,K,D)
-        state["buf"] = buf[:, -(self.kernel - 1) :]
-        # out[d] = sum_j w[d,0,j] * buf[j]  (sama dengan konvolusi kausal di forward)
+        k = self.kernel
+        slot = (pos_t % k).view(1, 1, 1).expand(B, 1, self.d)
+        state["buf"].scatter_(1, slot, u)  # buf (B,K,D), index (B,1,D)
+        j = torch.arange(k, device=x_t.device)
+        absolute = pos_t + 1 - k + j
+        idx = absolute % k
+        buf = state["buf"].index_select(1, idx)  # (B,K,D) urut kronologis
+        # slot yang belum terisi diperlakukan sebagai nol (sama dengan zero padding)
+        buf = buf * (absolute >= 0).view(1, k, 1)
         c = (buf * self.conv.weight[:, 0, :].transpose(0, 1)).sum(dim=1, keepdim=True)
         return x_t + self.w2(self.act(self.w1(c)))

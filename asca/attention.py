@@ -231,10 +231,12 @@ class AdaptiveHybridAttention(nn.Module):
 
     # ------------------------------------------------------------------ step
     def init_state(self, batch: int, device, dtype) -> dict:
-        """Cache decode berukuran TETAP (ring buffer window + state linear).
+        """Cache decode berukuran TETAP dan bebas cabang (CUDA-graph friendly).
 
-        Ukuran tidak tumbuh mengikuti panjang konteks, sehingga (a) tidak ada
-        alokasi baru per token dan (b) bentuk tensor stabil untuk ``torch.compile``.
+        Window lokal disimpan sebagai ring buffer yang ditulis lewat ``scatter_``
+        dan dibaca lewat ``index_select`` dengan indeks dari tensor posisi — tidak
+        ada ``if``/alokasi per token, sehingga satu CUDA graph bisa dipakai ulang
+        untuk semua posisi.
         """
         w = self.window
         st = {
@@ -246,45 +248,46 @@ class AdaptiveHybridAttention(nn.Module):
             st["ksum"] = torch.zeros(batch, self.h, self.dh, device=device, dtype=dtype)
         return st
 
-    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> torch.Tensor:
-        """Satu token: ``x_t`` berbentuk ``(B, 1, D)``. Identik dengan ``forward``."""
+    def step(self, x_t: torch.Tensor, pos_t: torch.Tensor, rope, state: dict) -> torch.Tensor:
+        """Satu token. ``pos_t`` adalah tensor 0-dim (bukan int) agar graph-safe."""
         B, _, D = x_t.shape
         q, k, v = self.qkv(x_t).split(D, dim=-1)
         q = q.view(B, 1, self.h, self.dh).transpose(1, 2)
         k = k.view(B, 1, self.h, self.dh).transpose(1, 2)
         v = v.view(B, 1, self.h, self.dh).transpose(1, 2)
 
-        cos, sin = rope_cache(pos + 1, self.dh, self.cfg.rope_theta, x_t.device, x_t.dtype)
-        cos, sin = cos[pos : pos + 1], sin[pos : pos + 1]
+        cos_all, sin_all = rope
+        cos = cos_all.index_select(0, pos_t)
+        sin = sin_all.index_select(0, pos_t)
         q_loc = apply_rope(q, cos, sin)
         k_loc = apply_rope(k, cos, sin)
 
-        # --- lokal: tulis ke ring buffer pada slot pos % w, lalu baca berurutan
+        # --- lokal: ring buffer window, tanpa cabang
         w = self.window
-        state["k"][:, :, pos % w] = k_loc.squeeze(2)
-        state["v"][:, :, pos % w] = v.squeeze(2)
+        slot = (pos_t % w).view(1, 1, 1, 1).expand(B, self.h, 1, self.dh)
+        state["k"].scatter_(2, slot, k_loc)
+        state["v"].scatter_(2, slot, v)
         j = torch.arange(w, device=x_t.device)
-        absolute = pos + 1 - w + j  # posisi absolut tiap slot ring
+        absolute = pos_t + 1 - w + j  # posisi absolut untuk tiap slot ring
         idx = absolute % w
-        valid = absolute >= 0
         k_sel = state["k"].index_select(2, idx)
         v_sel = state["v"].index_select(2, idx)
+        valid = absolute >= 0
         scores = (q_loc @ k_sel.transpose(-1, -2)) / math.sqrt(self.dh)
-        scores = scores.masked_fill(~valid.view(1, 1, 1, w), float("-inf"))
+        # -1e30 (bukan -inf) supaya aman untuk graph & tidak pernah NaN
+        scores = scores.masked_fill(~valid.view(1, 1, 1, w), -1e30)
         o_loc = torch.softmax(scores, dim=-1) @ v_sel
 
         if not self.use_global:
             out = o_loc
         else:
-            loglam = self._log_decay(x_t)  # (B,H,1)
-            lam = loglam.exp()
+            lam = self._log_decay(x_t).exp()  # (B,H,1)
             qf = feature_map(q).squeeze(2)  # (B,H,Dh)
             kf = feature_map(k).squeeze(2)
             vv = v.squeeze(2)
-            state["S"] = lam.view(B, self.h, 1, 1) * state["S"] + kf.unsqueeze(
-                -1
-            ) @ vv.unsqueeze(-2)
-            state["ksum"] = lam.view(B, self.h, 1) * state["ksum"] + kf
+            # in-place: state tidak boleh di-rebind saat CUDA-graph capture
+            state["S"].mul_(lam.view(B, self.h, 1, 1)).add_(kf.unsqueeze(-1) @ vv.unsqueeze(-2))
+            state["ksum"].mul_(lam.view(B, self.h, 1)).add_(kf)
             num = (qf.unsqueeze(-2) @ state["S"]).squeeze(-2)  # (B,H,Dh)
             den = (qf * state["ksum"]).sum(-1, keepdim=True)  # (B,H,1)
             o_glb = (num / (den + 1e-6)).unsqueeze(2)  # (B,H,1,Dh)

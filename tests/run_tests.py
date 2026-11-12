@@ -269,6 +269,24 @@ def test_moe_grouped_matches_loop():
 
 
 @test
+def test_moe_selected_matches_loop():
+    """Dispatch terpilih (dipakai decode) harus identik dengan referensi loop."""
+    torch.manual_seed(12)
+    cfg = small_cfg()
+    moe = AdaptiveSparseMoE(cfg).eval()
+    x = torch.randn(1, 4, cfg.d_model)  # token sedikit -> jalur _routed_selected
+    flat = x.reshape(-1, cfg.d_model)
+    with torch.no_grad():
+        logits = moe.router(flat)
+        w, idx = moe.router.route(logits)
+        ref = moe._routed_loop(flat, w, idx)
+        got = moe._routed_selected(flat, w, idx)
+    assert torch.allclose(got, ref, atol=1e-5), (
+        f"dispatch terpilih beda dari loop: {(got - ref).abs().max():.3e}"
+    )
+
+
+@test
 def test_flex_local_matches_sdpa():
     """Jalur FlexAttention harus menghasilkan nilai yang sama dengan SDPA+mask."""
     from asca.attention import _flex_available
@@ -354,6 +372,35 @@ def test_incremental_matches_full_forward():
     diff = (full - steps).abs().max().item()
     assert diff < 2e-5, f"decode inkremental beda dari forward penuh: max diff {diff:.3e}"
     assert cache["pos"] == T, "posisi cache harus maju satu per token"
+
+
+@test
+def test_cuda_graph_decode_matches_eager():
+    """Decode lewat CUDA graph harus sama dengan decode eager dan forward penuh."""
+    if not torch.cuda.is_available():
+        print("      (dilewati: butuh CUDA)")
+        return
+    from asca.graph_decode import GraphDecoder
+
+    torch.manual_seed(13)
+    cfg = small_cfg()
+    model = ASCAModel(cfg).cuda().eval()
+    B, T = 1, 40
+    x = torch.randint(0, cfg.vocab_size, (B, T), device="cuda")
+    with torch.no_grad():
+        full, _ = model(x)
+        cache = model.init_cache(B, "cuda", model.embed.weight.dtype)
+        eager = torch.cat([model.forward_step(x[:, t : t + 1], cache) for t in range(T)], dim=1)
+
+        dec = GraphDecoder(model, batch=B)
+        dec.reset()
+        graphed = torch.cat([dec.step(x[:, t : t + 1]) for t in range(T)], dim=1)
+
+    d_eager = (full - eager).abs().max().item()
+    d_graph = (full - graphed).abs().max().item()
+    assert d_eager < 2e-5, f"eager vs forward penuh: {d_eager:.3e}"
+    assert d_graph < 2e-4, f"graph vs forward penuh: {d_graph:.3e}"
+    assert dec.n_steps == T
 
 
 @test

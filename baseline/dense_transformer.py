@@ -55,6 +55,7 @@ class CausalSelfAttention(nn.Module):
         self.dh = cfg.head_dim
         self.dropout = cfg.dropout
         self.cfg_theta = cfg.rope_theta
+        self.max_len = cfg.max_seq_len
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model, bias=cfg.bias)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.bias)
 
@@ -69,23 +70,32 @@ class CausalSelfAttention(nn.Module):
         )
         return self.proj(out.transpose(1, 2).reshape(B, T, D))
 
-    # --- decode inkremental (KV-cache penuh, O(T) memori) ---
+    # --- decode inkremental: KV-cache penuh, dialokasikan di awal (graph-safe) ---
     def init_state(self, batch: int, device, dtype) -> dict:
-        return {"k": None, "v": None}
+        return {
+            "k": torch.zeros(batch, self.h, self.max_len, self.dh, device=device, dtype=dtype),
+            "v": torch.zeros(batch, self.h, self.max_len, self.dh, device=device, dtype=dtype),
+        }
 
-    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> torch.Tensor:
+    def step(self, x_t: torch.Tensor, pos_t: torch.Tensor, rope, state: dict) -> torch.Tensor:
         B, _, D = x_t.shape
         q, k, v = self.qkv(x_t).split(D, dim=-1)
         q = q.view(B, 1, self.h, self.dh).transpose(1, 2)
         k = k.view(B, 1, self.h, self.dh).transpose(1, 2)
         v = v.view(B, 1, self.h, self.dh).transpose(1, 2)
-        cos, sin = rope_cache(pos + 1, self.dh, self.cfg_theta, x_t.device, x_t.dtype)
-        cos, sin = cos[pos : pos + 1], sin[pos : pos + 1]
+        cos_all, sin_all = rope
+        cos = cos_all.index_select(0, pos_t)
+        sin = sin_all.index_select(0, pos_t)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        state["k"] = k if state["k"] is None else torch.cat([state["k"], k], dim=2)
-        state["v"] = v if state["v"] is None else torch.cat([state["v"], v], dim=2)
-        out = F.scaled_dot_product_attention(q, state["k"], state["v"])
+        slot = pos_t.view(1, 1, 1, 1).expand(B, self.h, 1, self.dh)
+        state["k"].scatter_(2, slot, k)
+        state["v"].scatter_(2, slot, v)
+        j = torch.arange(self.max_len, device=x_t.device)
+        valid = j <= pos_t
+        scores = (q @ state["k"].transpose(-1, -2)) / math.sqrt(self.dh)
+        scores = scores.masked_fill(~valid.view(1, 1, 1, -1), -1e30)
+        out = torch.softmax(scores, dim=-1) @ state["v"]
         return self.proj(out.transpose(1, 2).reshape(B, 1, D))
 
 
@@ -115,8 +125,8 @@ class DenseBlock(nn.Module):
     def init_state(self, batch: int, device, dtype) -> dict:
         return self.attn.init_state(batch, device, dtype)
 
-    def step(self, x_t: torch.Tensor, pos: int, state: dict) -> torch.Tensor:
-        x = x_t + self.attn.step(self.norm_attn(x_t), pos, state)
+    def step(self, x_t: torch.Tensor, pos_t: torch.Tensor, rope, state: dict) -> torch.Tensor:
+        x = x_t + self.attn.step(self.norm_attn(x_t), pos_t, rope, state)
         return x + self.mlp(self.norm_mlp(x))
 
 
@@ -191,22 +201,28 @@ class DenseTransformer(nn.Module):
     # --------------------------------------------------------------- decode
     def init_cache(self, batch: int = 1, device=None, dtype=None) -> dict:
         p = next(self.parameters())
+        device = device or p.device
+        dtype = dtype or p.dtype
+        cos, sin = rope_cache(self.cfg.max_seq_len, self.cfg.head_dim, self.cfg.rope_theta, device, dtype)
         return {
-            "pos": 0,
-            "layers": [b.init_state(batch, device or p.device, dtype or p.dtype) for b in self.blocks],
+            "pos": torch.zeros((), dtype=torch.long, device=device),
+            "n": 0,
+            "rope": (cos, sin),
+            "layers": [b.init_state(batch, device, dtype) for b in self.blocks],
         }
 
     def forward_step(self, idx_t: torch.Tensor, cache: dict) -> torch.Tensor:
         if idx_t.shape[1] != 1:
             raise ValueError("forward_step hanya menerima satu token per panggilan")
-        pos = cache["pos"]
-        if pos >= self.cfg.max_seq_len:
+        if cache["n"] >= self.cfg.max_seq_len:
             raise ValueError("melebihi max_seq_len; reset cache")
+        pos_t = cache["pos"]
         x = self.embed(idx_t)
         for block, st in zip(self.blocks, cache["layers"]):
-            x = block.step(x, pos, st)
+            x = block.step(x, pos_t, cache["rope"], st)
         x = self.norm_f(x)
-        cache["pos"] = pos + 1
+        cache["pos"] += 1
+        cache["n"] += 1
         return F.linear(x, self.embed.weight) if self.tied else self.head(x)
 
     @torch.no_grad()
