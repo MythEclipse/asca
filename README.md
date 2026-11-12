@@ -3,7 +3,7 @@
 Riset arsitektur LLM dari nol (*random init*, tanpa bobot pretrained) yang mengejar
 efisiensi komputasi dan memori melalui mekanisme adaptif dan sparse.
 
-> **Status: v0.5 — prefill paralel (48.955 tok/s) + decode CUDA Graph (1.60 ms/token).**
+> **Status: v0.6 — ablation 20M token selesai. Hasilnya: tidak ada klaim keunggulan kualitas; ASCA ramping (A8) 1.56× lebih cepat tanpa kehilangan kualitas.**
 > Ringkasan jujur di [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md): kualitas **setara**
 > dense baseline (param-matched), throughput training naik **1.68×** setelah
 > grouped-GEMM MoE + chunk adaptif + `torch.compile`, **prefill paralel 48.955 tok/s**
@@ -140,10 +140,12 @@ Sudah selesai (v0.5): KV-cache + state rekuren, fix normalisasi `SegmentMemory`,
 CUDA Graph decode, dan **prefill paralel** (state cache diturunkan dari lintasan
 chunked; 611 → 48.955 tok/s).
 
-1. **Throughput training** (5.4× lebih lambat dari dense) — bottleneck terbesar.
-   Kandidat: kapasitas blok MoE statis, kernel terfusi untuk d_model kecil.
-2. **Decode 2.5×** dan **prefill 1.32×** lebih lambat; keduanya GPU-bound sekarang.
-3. **VRAM training** 1.9× lebih besar dari dense.
+1. **Validasi ulang ablation memori** dengan `seq_len ≥ 1024` (sekarang tidak valid
+   karena `seq_len == mem_segment_len`).
+2. **Uji mekanisme yang dilepas (semantic encoder, cabang linear) pada konteks
+   panjang** — mungkin baru berguna di sana; saat ini murni biaya.
+3. **Skala**: 20M token & d=128 masih rezim mainan. Perlu ≥100M token dan preset
+   `small` sebelum ada klaim apa pun.
 4. **Turunkan VRAM training**: FlexAttention sebagai default pada T besar, ganti skor
    memori O(S²LM) dengan pembacaan per-segmen.
 5. **Ablasi penuh A0–A6** pada ≥100M token (sekarang baru 300–600 step, 1 seed/3 seed).

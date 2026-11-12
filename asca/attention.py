@@ -93,15 +93,23 @@ class AdaptiveHybridAttention(nn.Module):
         self.use_global = cfg.use_hybrid_attention
         self.chunk = cfg.linear_chunk
 
-        self.qkv = nn.Linear(self.d, 3 * self.d, bias=cfg.bias)
+        # qkv + gate penggabung + forget gate difusikan jadi SATU GEMM: inputnya
+        # sama (x), dan pada d_model kecil jumlah launch/GEMM kecil lebih mahal
+        # daripada FLOPs-nya.
+        self.qkv_dim = 3 * self.d
+        self.extra_dim = (self.d + self.h) if self.use_global else 0
+        self.in_proj = nn.Linear(self.d, self.qkv_dim + self.extra_dim, bias=cfg.bias)
         self.proj = nn.Linear(self.d, self.d, bias=cfg.bias)
         self.dropout = cfg.dropout
 
-        if self.use_global:
-            # gate penggabung: g = sigmoid(W_g x)
-            self.gate = nn.Linear(self.d, self.d, bias=True)
-            # forget gate per token: lambda_t = sigmoid(W_lambda x_t)
-            self.decay = nn.Linear(self.d, self.h, bias=True)
+    def _split_in(self, y: torch.Tensor):
+        """Pisahkan hasil proyeksi gabungan -> (qkv, gate_logits, decay_logits)."""
+        qkv = y[..., : self.qkv_dim]
+        if not self.use_global:
+            return qkv, None, None
+        gate = y[..., self.qkv_dim : self.qkv_dim + self.d]
+        decay = y[..., self.qkv_dim + self.d :]
+        return qkv, gate, decay
 
     # --------------------------------------------------------------- forward
     def forward(
@@ -111,7 +119,9 @@ class AdaptiveHybridAttention(nn.Module):
         sin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, D = x.shape
-        q, k, v = self.qkv(x).split(D, dim=-1)
+        y = self.in_proj(x)
+        qkv, gate_logits, decay_logits = self._split_in(y)
+        q, k, v = qkv.split(D, dim=-1)
         q = q.view(B, T, self.h, self.dh).transpose(1, 2)
         k = k.view(B, T, self.h, self.dh).transpose(1, 2)
         v = v.view(B, T, self.h, self.dh).transpose(1, 2)
@@ -123,9 +133,9 @@ class AdaptiveHybridAttention(nn.Module):
 
         o_loc = self._local(q_loc, k_loc, v, T)
         if self.use_global:
-            loglam = self._log_decay(x)  # (B,H,T) <= 0
+            loglam = F.logsigmoid(decay_logits).transpose(1, 2)  # (B,H,T) <= 0
             o_glb = self._global(q, k, v, loglam, T)
-            g = torch.sigmoid(self.gate(x))  # (B,T,D)
+            g = torch.sigmoid(gate_logits)  # (B,T,D)
             g = g.view(B, T, self.h, self.dh).transpose(1, 2)
             out = g * o_loc + (1.0 - g) * o_glb
         else:
@@ -135,8 +145,9 @@ class AdaptiveHybridAttention(nn.Module):
         return self.proj(out)
 
     def _log_decay(self, x: torch.Tensor) -> torch.Tensor:
-        """log lambda_t per head, selalu <= 0."""
-        return F.logsigmoid(self.decay(x)).transpose(1, 2)  # (B,H,T)
+        """log lambda_t per head, selalu <= 0 (diambil dari proyeksi gabungan)."""
+        _, _, decay_logits = self._split_in(self.in_proj(x))
+        return F.logsigmoid(decay_logits).transpose(1, 2)  # (B,H,T)
 
     # ------------------------------------------------------------------ lokal
     def _local(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, T: int) -> torch.Tensor:
@@ -244,7 +255,9 @@ class AdaptiveHybridAttention(nn.Module):
     def forward_with_state(self, x: torch.Tensor, cos=None, sin=None):
         """Seperti ``forward`` tetapi juga mengembalikan state cache decode."""
         B, T, D = x.shape
-        q, k, v = self.qkv(x).split(D, dim=-1)
+        y = self.in_proj(x)
+        qkv, gate_logits, decay_logits = self._split_in(y)
+        q, k, v = qkv.split(D, dim=-1)
         q = q.view(B, T, self.h, self.dh).transpose(1, 2)
         k = k.view(B, T, self.h, self.dh).transpose(1, 2)
         v = v.view(B, T, self.h, self.dh).transpose(1, 2)
@@ -267,11 +280,11 @@ class AdaptiveHybridAttention(nn.Module):
         state["v"][:, :, slots] = v[:, :, -n_fill:]
 
         if self.use_global:
-            loglam = self._log_decay(x)
+            loglam = F.logsigmoid(decay_logits).transpose(1, 2)
             o_glb, S_final, ksum_final = self._global_impl(q, k, v, loglam, T)
             state["S"] = S_final
             state["ksum"] = ksum_final
-            g = torch.sigmoid(self.gate(x)).view(B, T, self.h, self.dh).transpose(1, 2)
+            g = torch.sigmoid(gate_logits).view(B, T, self.h, self.dh).transpose(1, 2)
             out = g * o_loc + (1.0 - g) * o_glb
         else:
             out = o_loc
@@ -300,7 +313,9 @@ class AdaptiveHybridAttention(nn.Module):
     def step(self, x_t: torch.Tensor, pos_t: torch.Tensor, rope, state: dict) -> torch.Tensor:
         """Satu token. ``pos_t`` adalah tensor 0-dim (bukan int) agar graph-safe."""
         B, _, D = x_t.shape
-        q, k, v = self.qkv(x_t).split(D, dim=-1)
+        y = self.in_proj(x_t)
+        qkv, gate_logits, decay_logits = self._split_in(y)
+        q, k, v = qkv.split(D, dim=-1)
         q = q.view(B, 1, self.h, self.dh).transpose(1, 2)
         k = k.view(B, 1, self.h, self.dh).transpose(1, 2)
         v = v.view(B, 1, self.h, self.dh).transpose(1, 2)
@@ -330,7 +345,7 @@ class AdaptiveHybridAttention(nn.Module):
         if not self.use_global:
             out = o_loc
         else:
-            lam = self._log_decay(x_t).exp()  # (B,H,1)
+            lam = F.logsigmoid(decay_logits).transpose(1, 2).exp()  # (B,H,1)
             qf = feature_map(q).squeeze(2)  # (B,H,Dh)
             kf = feature_map(k).squeeze(2)
             vv = v.squeeze(2)
@@ -340,7 +355,7 @@ class AdaptiveHybridAttention(nn.Module):
             num = (qf.unsqueeze(-2) @ state["S"]).squeeze(-2)  # (B,H,Dh)
             den = (qf * state["ksum"]).sum(-1, keepdim=True)  # (B,H,1)
             o_glb = (num / (den + 1e-6)).unsqueeze(2)  # (B,H,1,Dh)
-            g = torch.sigmoid(self.gate(x_t)).view(B, 1, self.h, self.dh).transpose(1, 2)
+            g = torch.sigmoid(gate_logits).view(B, 1, self.h, self.dh).transpose(1, 2)
             out = g * o_loc + (1.0 - g) * o_glb
 
         out = out.transpose(1, 2).reshape(B, 1, D)

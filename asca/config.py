@@ -43,6 +43,7 @@ class ASCAConfig:
     n_shared_experts: int = 1
     expert_ff: Optional[int] = None
     shared_ff: Optional[int] = None
+    moe_capacity_factor: float = 1.5  # kapasitas statis per expert = ceil(N*k/E * faktor)
     moe_impl: str = "grouped"  # "grouped" (grouped GEMM) | "loop" (referensi)
     router_threshold: float = 0.0  # 0 = adaptive skip dimatikan
     aux_loss_coef: float = 0.01
@@ -89,7 +90,21 @@ ABLATIONS: dict[str, dict] = {
     "A3": {"use_moe": False},
     "A4": {"use_memory": False},
     "A5": {"n_shared_experts": 0},
-    "A6": {"router_threshold": 0.0},
+    "A6": {"router_threshold": 0.0},  # identik dengan A0: dipakai mengukur noise floor
+    # gabungan komponen yang di ablation A1/A2 terbukti merugikan
+    "A7": {"use_semantic_encoder": False, "use_hybrid_attention": False},
+    "A8": {
+        "use_semantic_encoder": False,
+        "use_hybrid_attention": False,
+        "n_shared_experts": 0,
+    },
+    # A8 tanpa memory: apakah memori masih membayar biayanya di varian ramping?
+    "A9": {
+        "use_semantic_encoder": False,
+        "use_hybrid_attention": False,
+        "n_shared_experts": 0,
+        "use_memory": False,
+    },
 }
 
 

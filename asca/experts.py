@@ -16,6 +16,8 @@ Dua implementasi dispatch (dipilih lewat ``ASCAConfig.moe_impl``):
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -55,12 +57,14 @@ class AdaptiveSparseMoE(nn.Module):
         self.register_buffer("_expert_counts", torch.zeros(cfg.n_experts), persistent=False)
         self.register_buffer("_tokens_seen", torch.zeros((), dtype=torch.long), persistent=False)
         self._last_padding_factor = 1.0
+        self._last_dropped = 0.0
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         B, T, D = x.shape
         flat = x.reshape(-1, D)
         logits = self.router(flat)
         weights, top_idx = self.router.route(logits)
+        self._last_top_idx = top_idx.detach()
         aux = self.router.aux_loss(logits, top_idx)
 
         # Dispatch: pada decode (token sangat sedikit) jalur grouped GEMM justru
@@ -69,9 +73,11 @@ class AdaptiveSparseMoE(nn.Module):
         n_pairs = flat.shape[0] * self.top_k
         if n_pairs <= 64:
             out = self._routed_selected(flat, weights, top_idx)
-        elif self.impl == "grouped":
-            out = self._routed_grouped(flat, weights, top_idx)
-        else:
+        elif self.impl == "grouped":  # default: eksak (padding sesuai routing nyata)
+            out = self._routed_grouped_dynamic(flat, weights, top_idx)
+        elif self.impl == "grouped_static":  # kapasitas tetap: compile bersih, ada drop
+            out = self._routed_grouped_static(flat, weights, top_idx)
+        else:  # "loop": referensi kebenaran
             out = self._routed_loop(flat, weights, top_idx)
 
         if self.shared is not None:
@@ -127,7 +133,7 @@ class AdaptiveSparseMoE(nn.Module):
             out.index_add_(0, tok, h * weights[tok, slot].unsqueeze(-1))
         return out
 
-    def _routed_grouped(
+    def _routed_grouped_dynamic(
         self, flat: torch.Tensor, weights: torch.Tensor, top_idx: torch.Tensor
     ) -> torch.Tensor:
         """Grouped GEMM: urutkan token per expert, satu ``bmm`` untuk semua expert."""
@@ -179,6 +185,96 @@ class AdaptiveSparseMoE(nn.Module):
         out = torch.zeros(N, self.cfg.d_model, device=device, dtype=o.dtype)
         out.index_add_(0, block.reshape(-1), o.reshape(-1, self.cfg.d_model))
         return out
+
+    def _routed_grouped_static(
+        self, flat: torch.Tensor, weights: torch.Tensor, top_idx: torch.Tensor
+    ) -> torch.Tensor:
+        """Grouped GEMM dengan **kapasitas statis** per expert.
+
+        Kenapa statis: ``M = int(counts.max().item())`` membuat ``torch.compile``
+        graph-break (sinkronisasi CPU-GPU + bentuk tensor bergantung data), dan itu
+        menghabiskan ~11 ms/step di preset kecil. Di sini ``cap`` hanya bergantung
+        pada ``N``, ``top_k``, ``n_experts`` (semua statis), sehingga seluruh model
+        bisa dikompilasi utuh.
+
+        Konsekuensi: kalau routing sangat miring melebihi ``cap``, pasangan
+        token-expert yang meluap **tidak** dihitung (kontribusinya nol). Fraksinya
+        dilaporkan lewat :meth:`dropped_fraction`; dengan capacity factor 1.5 dan
+        auxiliary load-balancing loss, fraksi ini ~0 pada latihan normal.
+        """
+        N = flat.shape[0]
+        k = self.top_k
+        E = self.n_experts
+        D = self.cfg.d_model
+        device = flat.device
+        n_pairs = N * k
+        # statis: hanya bergantung pada bentuk input dan konstanta model
+        cap = max(1, int(math.ceil(n_pairs / E * self.capacity_factor)))
+
+        exp = top_idx.reshape(-1)
+        tok = torch.arange(N, device=device).repeat_interleave(k)
+        order = torch.argsort(exp, stable=True)
+        exp_s, tok_s = exp[order], tok[order]
+        wgt_s = weights.reshape(-1)[order]
+
+        counts = torch.bincount(exp_s, minlength=E)
+        offs = torch.cumsum(counts, 0) - counts
+        pos = torch.arange(n_pairs, device=device) - offs[exp_s]
+        keep = pos < cap  # True untuk pasangan yang masuk kapasitas
+        slot = exp_s * cap + pos.clamp(max=cap - 1)
+
+        # rakit blok (E*cap, D) dengan scatter (bentuk tetap)
+        xg = flat.new_zeros(E * cap, D)
+        xg.index_copy_(0, slot[keep], flat.index_select(0, tok_s[keep]))
+        wg = flat.new_zeros(E * cap)
+        wg.index_copy_(0, slot[keep], wgt_s[keep].to(flat.dtype))
+
+        w13 = torch.cat(
+            [
+                torch.stack([e.w1.weight for e in self.experts]),
+                torch.stack([e.w3.weight for e in self.experts]),
+            ],
+            dim=1,
+        )  # (E, 2*expert_ff, D)
+        w2 = torch.stack([e.w2.weight for e in self.experts])  # (E, D, expert_ff)
+
+        h = torch.bmm(xg.view(E, cap, D), w13.transpose(1, 2))
+        gate, up = h.chunk(2, dim=-1)
+        act = F.silu(gate) * up
+        o = torch.bmm(act, w2.transpose(1, 2))  # (E, cap, D)
+        o = o.reshape(E * cap, D) * wg.unsqueeze(-1)
+
+        out = flat.new_zeros(N, D)
+        out.index_add_(0, tok_s[keep], o.index_select(0, slot[keep]))
+
+        # diagnostik tanpa sinkronisasi: hanya angka statis
+        self._last_padding_factor = float(E * cap) / max(1, n_pairs)
+        return out
+
+    @torch.no_grad()
+    def route_stats(self, top_idx: torch.Tensor, n_tokens: int) -> dict:
+        """Statistik routing (memanggil ini menyinkronkan CPU-GPU; bukan hot path)."""
+        n_pairs = n_tokens * self.top_k
+        cap = max(1, int(math.ceil(n_pairs / self.n_experts * self.capacity_factor)))
+        counts = torch.bincount(top_idx.reshape(-1), minlength=self.n_experts)
+        dropped = float((counts - cap).clamp(min=0).sum()) / max(1, n_pairs)
+        self._last_dropped = dropped
+        return {
+            "capacity": cap,
+            "max_count": int(counts.max()),
+            "padding_factor": float(self.n_experts * cap) / max(1, n_pairs),
+            "dropped_fraction": dropped,
+            "counts": counts.tolist(),
+        }
+
+    @property
+    def capacity_factor(self) -> float:
+        return self.cfg.moe_capacity_factor
+
+    @property
+    def dropped_fraction(self) -> float:
+        """Fraksi pasangan token-expert yang meluap kapasitas (0 = tidak ada)."""
+        return self._last_dropped
 
     # ------------------------------------------------------------- statistik
     @property

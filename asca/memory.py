@@ -28,9 +28,8 @@ class SegmentMemory(nn.Module):
         self.scale = 1.0 / math.sqrt(cfg.d_model)
 
         self.q_mem = nn.Parameter(torch.randn(self.n_slots, self.d) * 0.02)
-        self.k_proj = nn.Linear(self.d, self.d, bias=False)
-        self.v_proj = nn.Linear(self.d, self.d, bias=False)
-        self.q_proj = nn.Linear(self.d, self.d, bias=False)
+        # q/k/v difusikan jadi satu GEMM (inputnya sama); o_proj terpisah
+        self.in_proj = nn.Linear(self.d, 3 * self.d, bias=False)
         self.o_proj = nn.Linear(self.d, self.d, bias=False)
         self.gate = nn.Parameter(torch.zeros(1))
 
@@ -55,15 +54,15 @@ class SegmentMemory(nn.Module):
             return torch.zeros_like(x[:, :T]), self._state_from_prefix(x, T)
 
         xr = x.view(B, S, L, D)
-        k = self.k_proj(xr)  # (B,S,L,D)
-        v = self.v_proj(xr)
+        qkv = self.in_proj(xr)  # (B,S,L,3D)
+        qk, k, v = qkv.split(D, dim=-1)
 
         # ringkasan segmen: (B,S,M,D)
         attn = torch.softmax(self.q_mem.view(1, 1, self.n_slots, D) @ k.transpose(-1, -2) * self.scale, dim=-1)
         summ = attn @ v
 
         # token di segmen s membaca ringkasan segmen < s
-        q = self.q_proj(xr)  # (B,S,L,D)
+        q = qk  # (B,S,L,D)
         scores = torch.einsum("bsld,btmd->bstlm", q, summ) * self.scale  # (B,S,S,L,M)
         seg_idx = torch.arange(S, device=x.device)
         allow = seg_idx[None, :] < seg_idx[:, None]  # (S,S) -> True jika t < s
@@ -103,8 +102,7 @@ class SegmentMemory(nn.Module):
         if n_cur > 0:
             # akumulator online-softmax untuk token segmen aktif yang belum selesai
             part = x[:, n_seg * self.seg :]
-            k = self.k_proj(part)  # (B,n_cur,D)
-            v = self.v_proj(part)
+            _, k, v = self.in_proj(part).split(D, dim=-1)  # (B,n_cur,D)
             sc = (self.q_mem.view(1, self.n_slots, D) @ k.transpose(-1, -2)) * self.scale  # (B,M,n_cur)
             m = sc.max(dim=-1).values
             p = torch.exp(sc - m.unsqueeze(-1))
@@ -134,15 +132,13 @@ class SegmentMemory(nn.Module):
     def step(self, x_t: torch.Tensor, pos_t: torch.Tensor, rope, state: dict) -> torch.Tensor:
         """Satu token. Sama dengan ``forward`` pada sekuens penuh."""
         B, _, D = x_t.shape
-        k_t = self.k_proj(x_t)  # (B,1,D)
-        v_t = self.v_proj(x_t)
+        q_t, k_t, v_t = self.in_proj(x_t).split(D, dim=-1)  # (B,1,D)
 
         # --- baca ringkasan segmen < segmen saat ini (belum termasuk token ini)
         flat = state["summ"].reshape(B, -1, D)  # (B,max_seg*M,D)
         n_valid = state["n_seg"] * self.n_slots
         valid = torch.arange(flat.shape[1], device=x_t.device) < n_valid
-        q = self.q_proj(x_t)  # (B,1,D)
-        scores = (q @ flat.transpose(-1, -2)) * self.scale  # (B,1,max_seg*M)
+        scores = (q_t @ flat.transpose(-1, -2)) * self.scale  # (B,1,max_seg*M)
         # -1e30 (bukan -inf) agar aman untuk CUDA graph. Kalau belum ada segmen,
         # semua ter-mask -> bobot uniform, dan karena `summ` masih nol keluarannya
         # tepat nol (sama dengan forward).

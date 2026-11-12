@@ -164,20 +164,27 @@ def test_global_linear_matches_reference():
             attn = AdaptiveHybridAttention(cfg).eval()
             B = 2
             lam_val = torch.tensor([0.5, 0.8, 0.95, 0.2])
+            # decay adalah potongan dari proyeksi gabungan: [3D qkv | D gate | H decay]
+            d0 = 3 * cfg.d_model + cfg.d_model
+            if attn.in_proj.bias is None:  # cfg.bias=False -> buat bias untuk uji ini
+                attn.in_proj.bias = torch.nn.Parameter(
+                    torch.zeros(attn.in_proj.out_features)
+                )
             with torch.no_grad():
                 if mode == "konstan":
-                    attn.decay.weight.zero_()
-                    attn.decay.bias.copy_(torch.log(lam_val / (1 - lam_val)))
+                    attn.in_proj.weight[d0:].zero_()
+                    attn.in_proj.bias[d0:].copy_(torch.log(lam_val / (1 - lam_val)))
                 else:
-                    attn.decay.weight.normal_(0, 0.5)
-                    attn.decay.bias.copy_(torch.log(lam_val / (1 - lam_val)) * 0.1)
+                    attn.in_proj.weight[d0:].normal_(0, 0.5)
+                    attn.in_proj.bias[d0:].copy_(torch.log(lam_val / (1 - lam_val)) * 0.1)
             q = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
             k = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
             v = torch.randn(B, cfg.n_heads, T, cfg.head_dim)
             x = torch.randn(B, T, cfg.d_model)
             with torch.no_grad():
                 got = attn._global(q, k, v, attn._log_decay(x), T)
-                lam = torch.sigmoid(attn.decay(x)).transpose(1, 2)  # (B,H,T)
+                _, _, decay_logits = attn._split_in(attn.in_proj(x))
+                lam = torch.sigmoid(decay_logits).transpose(1, 2)  # (B,H,T)
                 ref = naive_gated_linear(q, k, v, lam)
             err = (got - ref).abs().max().item()
             assert torch.allclose(got, ref, atol=1e-4), (
@@ -266,6 +273,34 @@ def test_moe_grouped_matches_loop():
     )
     assert n_with_grad > 0, "tidak ada parameter expert yang menerima gradien di jalur grouped"
     assert xg.grad is not None and torch.isfinite(xg.grad).all()
+
+
+@test
+def test_moe_grouped_static_matches_loop():
+    """Grouped statis (tanpa overflow) harus sama dengan loop; overflow tidak crash."""
+    torch.manual_seed(19)
+    cfg = small_cfg()
+    moe = AdaptiveSparseMoE(cfg).eval()
+    x = torch.randn(4, 16, cfg.d_model)
+    flat = x.reshape(-1, cfg.d_model)
+    with torch.no_grad():
+        logits = moe.router(flat)
+        w, idx = moe.router.route(logits)
+        ref = moe._routed_loop(flat, w, idx)
+        # kapasitas besar -> tidak ada drop, harus identik
+        moe.cfg.moe_capacity_factor = 4.0
+        got = moe._routed_grouped_static(flat, w, idx)
+        assert torch.allclose(got, ref, atol=1e-5), (
+            f"grouped statis beda dari loop: {(got - ref).abs().max():.3e}"
+        )
+        # kapasitas kecil -> sebagian drop, tapi bentuk & nilai tetap wajar
+        moe.cfg.moe_capacity_factor = 0.5
+        out = moe._routed_grouped_static(flat, w, idx)
+        assert out.shape == ref.shape
+        assert torch.isfinite(out).all()
+        st = moe.route_stats(idx, flat.shape[0])
+        assert st["dropped_fraction"] > 0, "routing kecil seharusnya memicu drop"
+        assert (out.abs().sum() <= ref.abs().sum() + 1e-4)
 
 
 @test

@@ -326,6 +326,11 @@ Hasil ditulis ke `docs/EXPERIMENTS.md` oleh `benchmarks/train_toy.py`
    keunggulan.**
 9. Seluruh hasil v0.1–v0.2 memakai `SegmentMemory` dengan normalisasi softmax yang
    salah (lintas posisi query). Sudah diperbaiki di v0.3; angka lama tidak dipakai.
+10. **Ablation 20M token (3 seed) tidak menemukan efek kualitas yang melebihi noise
+   floor ±0.005** untuk komponen mana pun, termasuk keseluruhan arsitektur vs dense.
+   Yang terukur hanya biaya: melepas semantic encoder + cabang linear attention +
+   shared expert (config `A8`) memberi 1.56× throughput dan 1.5× VRAM lebih baik
+   dengan kualitas setara. Ablasi memori belum valid karena `seq_len == L_s`.
 
 ---
 
