@@ -1,73 +1,131 @@
 # ASCA — Adaptive Sparse Cognitive Architecture
 
-Proyek penelitian dan pengembangan arsitektur neural network LLM eksperimental dari nol (scratch), dirancang untuk mencapai efisiensi komputasi, pemahaman semantik mendalam, dan footprint VRAM rendah melalui mekanisme adaptif dan sparse.
+Riset arsitektur LLM dari nol (*random init*, tanpa bobot pretrained) yang mengejar
+efisiensi komputasi dan memori melalui mekanisme adaptif dan sparse.
+
+> **Status: v0.1 — prototipe lengkap & teruji kausalitasnya. Belum ada klaim keunggulan.**
+> Ringkasan hasil jujur ada di [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md):
+> pada run pertama ASCA **setara** dengan dense baseline dalam kualitas, tetapi
+> **lebih lambat dan lebih boros VRAM** karena implementasi kernel belum dioptimasi.
 
 ---
 
 ## 1. Visi Utama
 
-Membangun foundation model general-purpose yang berfokus pada:
-- **Language & Semantic Primacy**: Pemahaman makna dan relasi bahasa sebagai prioritas utama.
-- **Reasoning & Logic**: Kemampuan berpikir deduktif dan logis.
-- **Algorithms & Code**: Pemahaman struktur logika pemrograman.
-- **Mathematics & Science**: Kemampuan komputasi simbolik dan saintifik.
-- **Long-Context Efficiency**: Skalabilitas konteks panjang tanpa ledakan memori O(N^2).
-- **High-Throughput Inference**: Latensi decode rendah dengan konsumsi VRAM minimal pada GPU skala konsumen.
-
----
+Foundation model general-purpose dengan prioritas:
+- **Language & Semantic Primacy** — makna dan relasi bahasa sebagai fondasi.
+- **Reasoning & Logic**, **Algorithms & Code**, **Mathematics & Science**.
+- **Long-Context Efficiency** — skalabilitas konteks tanpa ledakan memori $O(N^2)$.
+- **High-Throughput Inference** — latensi decode rendah pada GPU konsumen (target: 6 GB).
 
 ## 2. Prinsip Pengembangan
 
-1. **Dari Nol (Tabula Rasa)**: Semua bobot diinisialisasi secara acak (*random initialization*); tidak menggunakan checkpoint/bobot pretrained.
-2. **Mekanisme Mandiri**: Merumuskan arsitektur dan operator internal sendiri, bukan sekadar memodifikasi konfigurasi Transformer standar.
-3. **Efisiensi sebagai Metrik Utama**: Mengukur kualitas bukan dari jumlah parameter mentah, melainkan dari rasio performa terhadap FLOPs dan VRAM.
-4. **Validasi Berbasis Kontrol**: Setiap klaim keunggulan wajib diuji secara head-to-head terhadap baseline kontrol (Dense Transformer dan MoE standar) pada budget FLOPs/token yang sama.
+1. **Dari Nol**: semua bobot inisialisasi acak, tanpa pretrained checkpoint.
+2. **Mekanisme Mandiri**: operator internal dirumuskan sendiri, bukan sekadar ubah config Transformer.
+3. **Efisiensi sebagai Metrik Utama**: kualitas diukur relatif terhadap FLOPs, waktu, dan VRAM — bukan jumlah parameter.
+4. **Validasi Berbasis Kontrol**: setiap klaim wajib head-to-head vs Dense Transformer dan MoE standar pada budget token/FLOPs identik.
+5. **Kausalitas Non-Negotiable**: setiap mekanisme wajib lulus uji kebocoran token masa depan sebelum masuk training.
 
----
+## 3. Komponen Inti
 
-## 3. Komponen Inti ASCA
-
-| Komponen | Peran Fungsional |
+| Komponen | Mekanisme (lihat spesifikasi) |
 |---|---|
-| **Semantic Encoder** | Memahami makna dan relasi representasi bahasa awal secara kausal |
-| **Adaptive Router** | Memilih jalur komputasi secara dinamis sesuai kompleksitas token/task |
-| **Sparse Experts** | Memproses representasi tugas secara selektif (terinspirasi MoE) |
-| **Efficient Memory** | Mempertahankan dependensi konteks panjang dengan footprint VRAM terkontrol |
-| **Adaptive Attention** | Memangkas komputasi attention yang redundan secara terarah |
-| **Shared Decoder** | Merekonstruksi representasi laten menjadi distribusi token probabilitas |
+| **Semantic Encoder** | Konvolusi kausal depthwise + bottleneck MLP sekali di input (§3.1) |
+| **Adaptive Attention** | Sliding-window causal attention ⊕ gated linear attention, digabung gate data-dependent (§3.2) |
+| **Adaptive Router** | Top-$k$ routing + threshold skip (adaptive compute) + switch/z-loss (§3.3) |
+| **Sparse Experts** | Shared expert selalu aktif + routed SwiGLU experts, dispatch per-expert (§3.3) |
+| **Efficient Memory** | SegmentMemory: ringkasan segmen dengan $M$ slot, dibaca kausal antar-segmen (§3.4) |
+| **Shared Decoder** | RMSNorm + gated semantic skip + proyeksi tertaut embedding (§3.5) |
 
----
+Spesifikasi matematis lengkap (notasi, dataflow tensor, anggaran FLOPs, matriks ablasi):
+[`docs/SPEC_ASCA.md`](docs/SPEC_ASCA.md).
 
 ## 4. Struktur Repositori
 
 ```
 asca/
-├── docs/                      # Spesifikasi matematis, RFC, dan log eksperimen
-│   ├── SPEC_ASCA.md           # Notasi matematis formal dan dataflow tensor
-│   └── EXPERIMENTS.md         # Hasil pengujian empiris vs baseline
-├── asca/                      # Implementasi modul arsitektur ASCA
-│   ├── __init__.py
-│   ├── encoder.py
-│   ├── router.py
-│   ├── experts.py
-│   ├── attention.py
-│   ├── memory.py
-│   └── model.py
-├── baseline/                  # Model kontrol pembanding (Dense Causal Transformer)
-│   ├── __init__.py
-│   └── dense_transformer.py
-├── data/                      # Tokenizer dan streaming dataloader
-│   └── __init__.py
-└── benchmarks/                # Pengukuran FLOPs, VRAM, latency, dan toy training
-    └── __init__.py
+├── docs/
+│   ├── SPEC_ASCA.md            # Formulasi matematis + matriks ablasi
+│   └── EXPERIMENTS.md          # Log hasil benchmark (append otomatis)
+├── asca/                       # Implementasi arsitektur
+│   ├── config.py               # ASCAConfig + definisi ablasi A0..A6
+│   ├── norm.py                 # RMSNorm, RoPE
+│   ├── encoder.py              # Semantic Encoder
+│   ├── attention.py            # Adaptive Hybrid Attention (lokal + linear chunked)
+│   ├── router.py               # Adaptive Router + aux loss
+│   ├── experts.py              # Shared + routed sparse experts (MoE)
+│   ├── memory.py               # SegmentMemory
+│   ├── block.py                # Pre-norm residual block
+│   └── model.py                # ASCAModel + SharedDecoder + generate
+├── baseline/
+│   └── dense_transformer.py    # Kontrol: Llama/GPT-style dense causal transformer
+├── data/
+│   ├── tokenizer.py            # BPE (tokenizers) + fallback byte-level
+│   └── dataloader.py           # Korpus sintetis / file / HF + TokenDataset
+├── benchmarks/
+│   ├── common.py               # Preset, param matching, FLOP counter, loop training
+│   ├── bench_flops.py          # FLOPs/token & throughput terukur
+│   ├── bench_vram.py           # Peak VRAM 512..4096 & latensi decode
+│   └── train_toy.py            # Training komparasi multi-seed (utama)
+└── tests/
+    └── run_tests.py            # Uji kausalitas, referensi naif, shapes, MoE, dll.
 ```
 
----
+## 5. Cara Menjalankan
 
-## 5. Protokol Evaluasi
+Environment (wajib memakai venv bersama, **bukan** `.venv` per proyek):
 
-Semua perbandingan performa diukur menggunakan:
-- **Language**: Perplexity & Validation Loss pada korpus uji yang sama.
-- **Reasoning & Code**: Akurasi penalaran logis, GSM8K, dan benchmark coding (HumanEval/MBPP).
-- **Compute Efficiency**: Active FLOPs per token, throughput (tokens/sec), dan latensi decode (ms/tok).
-- **Memory Footprint**: Peak allocated VRAM pada berbagai sequence lengths (512, 1024, 2048, 4096).
+```bash
+source ~/.venvs/ml-activate        # torch 2.11.0+cu128, RTX 4050 sm_89
+```
+
+Test (12 test, ~2 detik di GPU):
+
+```bash
+env -u PYTHONPATH ~/.venvs/ml/bin/python tests/run_tests.py
+```
+
+Benchmark FLOPs & throughput:
+
+```bash
+env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_flops.py --preset tiny --out docs/EXPERIMENTS.md
+env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_flops.py --ablation A3     # ablasi
+```
+
+VRAM & latensi decode:
+
+```bash
+env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/bench_vram.py --preset nano --out docs/EXPERIMENTS.md
+```
+
+Training komparasi (utama):
+
+```bash
+env -u PYTHONPATH ~/.venvs/ml/bin/python benchmarks/train_toy.py \
+    --preset nano --steps 600 --batch 8 --seq-len 256 \
+    --models dense-matched,asca --seeds 0,1,2 --out docs/EXPERIMENTS.md
+```
+
+Korpus nyata (perlu `datasets` di venv bersama untuk streaming HF):
+
+```bash
+... --corpus hf --hf-repo HuggingFaceFW/fineweb --max-chars 50000000
+```
+
+## 6. Protokol Evaluasi
+
+- **Language**: validation loss & perplexity pada korpus uji yang sama.
+- **Efficiency**: active FLOPs/token (terukur), tokens/sec training, ms/token decode.
+- **Memory**: peak VRAM pada $T \in \{512, 1024, 2048, 4096\}$.
+- **Reasoning/Code/Math**: GSM8K, HumanEval, MBPP — hanya setelah skala memadai.
+- **Statistik**: minimal 3 seed, dilaporkan mean ± std. Satu run tidak diklaim.
+
+## 7. Roadmap Terdekat
+
+1. **Optimasi kernel** (prasyarat semua klaim efisiensi): FlexAttention untuk window
+   lokal, hilangkan loop chunk pada attention linear (`torch.compile`/fused kernel),
+   dispatch MoE ter-fusi, KV-cache + state rekuren untuk decode.
+2. **Ablasi penuh A0–A6** pada ≥100M token untuk mengukur kontribusi tiap komponen.
+3. **Skala**: naik ke preset `small` (seq 1024) lalu ke Colab (A100/T4) untuk
+   pretraining dengan checkpoint ke Drive/HF Hub + resume otomatis.
+4. **Long-context**: uji SegmentMemory pada 8k–32k token vs dense + sliding window.

@@ -39,6 +39,8 @@ wandb/
 # Data & Datasets
 data/raw/
 data/processed/
+data/cache/
+artifacts/
 *.parquet
 *.arrow
 *.jsonl

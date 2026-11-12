@@ -1,25 +1,291 @@
-# ASCA Specification: Mathematical Formulation & Tensor Flow
+# ASCA — Adaptive Sparse Cognitive Architecture
 
-Versi: 0.1-draft
-Status: Desain Awal
-
-Dokumen ini mendefinisikan formalisasi matematis untuk komponen Adaptive Sparse Cognitive Architecture (ASCA).
-
----
-
-## 1. Notasi Dasar
-
-- Dimensi Batch: $B$
-- Panjang Sekuens: $T$
-- Dimensi Model (Hidden Dim): $D$
-- Jumlah Expert: $E$, dengan top-$k$ routing: $k \ll E$
-- Vocabulary Size: $V$
+**Spesifikasi Matematis & Dataflow Tensor**
+Versi: `0.1-draft` · Status: desain awal, belum divalidasi empiris
+Aturan proyek: **tidak ada klaim keunggulan sebelum dibuktikan benchmark terhadap baseline kontrol.**
 
 ---
 
-## 2. Peta Alur Tensor (Causal Dataflow)
+## 1. Notasi
 
-Input Token: $X \in \mathbb{N}^{B 	imes T}$
-Embedding: $H_0 = 	ext{Embed}(X) \in \mathbb{R}^{B 	imes T 	imes D}$
+| Simbol | Arti |
+|---|---|
+| $B$ | batch size |
+| $T$ | panjang sekuens |
+| $D$ | dimensi model (`d_model`) |
+| $H$ | jumlah head, $D_h = D/H$ |
+| $V$ | ukuran vocabulary |
+| $L$ | jumlah blok (`n_layers`) |
+| $E$ | jumlah routed expert |
+| $k$ | top-$k$ routing, $k \ll E$ |
+| $w$ | lebar sliding window (attention lokal) |
+| $C$ | ukuran chunk (attention linear) |
+| $M$ | jumlah slot memori |
+| $L_s$ | panjang segmen memori |
 
-$$\dots 	ext{To be detailed} \dots$$
+Semua tensor aktivasi berbentuk `(B, T, D)` kecuali dinyatakan lain.
+Indeks posisi $t = 1..T$, head $h = 1..H$.
+
+**Aturan kausalitas (non-negotiable):** untuk setiap komponen, keluaran di posisi $t$
+hanya boleh bergantung pada $x_{1..t}$. Ini diverifikasi otomatis oleh
+`tests/run_tests.py::test_causality_*` (perturbasi token masa depan tidak boleh
+mengubah logit masa lalu). Setiap mekanisme baru wajib lulus tes ini sebelum masuk
+ke training.
+
+---
+
+## 2. Pipeline
+
+```
+token ids  X ∈ ℕ^{B×T}
+   │
+   ├─ Embedding  H⁰ = E[X] · √D                    (B,T,D)
+   │
+   ├─ SemanticEncoder (sekali, murah, kausal)      → H⁰'
+   │
+   ├─ for l in 1..L:  ASCABlock_l
+   │      ├─ AdaptiveHybridAttention  (lokal window w  ⊕  linear global)
+   │      ├─ SegmentMemory            (baca ringkasan segmen masa lalu, opsional)
+   │      └─ AdaptiveSparseMoE        (shared expert + top-k routed, threshold skip)
+   │
+   ├─ SharedDecoder:  RMSNorm → gated skip dari embedding → proyeksi tertaut (tied)
+   │
+   └─ logits ∈ ℝ^{B×T×V}
+```
+
+Setiap komponen punya flag di `ASCAConfig`. Dengan semua flag dimatikan, ASCA
+tereduksi menjadi Transformer dense kausal — sehingga ablasi bisa dilakukan
+murni lewat konfigurasi, tanpa mengubah kode.
+
+---
+
+## 3. Komponen
+
+### 3.1 Semantic Encoder (sekali di input)
+
+Motivasi: blok berat sebaiknya menerima token yang sudah terkontekstualisasi lokal,
+sehingga kedalaman jaringan dipakai untuk komputasi semantik tingkat tinggi, bukan
+untuk agregasi bigram/trigram.
+
+$$
+\begin{aligned}
+u &= \mathrm{RMSNorm}(H^0) \\
+c_t &= \sum_{j=0}^{K-1} W^{c}_{:,j} \odot u_{t-j} \quad (\text{konvolusi kausal, } K=4,\ \text{zero-pad di kiri}) \\
+s_t &= W_2\,\sigma\!\left(W_1 c_t\right), \quad W_1 \in \mathbb{R}^{(D/r)\times D},\; W_2 \in \mathbb{R}^{D\times (D/r)},\; r=4 \\
+H^{0\prime}_t &= H^0_t + s_t
+\end{aligned}
+$$
+
+Biaya: $O(T D^2 / r)$ — jauh di bawah satu blok attention penuh.
+Kausal: konvolusi hanya melihat $t-K+1..t$. ✓
+
+### 3.2 Adaptive Hybrid Attention
+
+Dua jalur paralel per head, digabung dengan gate data-dependent:
+
+**Jalur A — local causal attention (window $w$).** Dengan RoPE $\mathcal{R}_{\theta}$:
+
+$$
+A^{\text{loc}} = \mathrm{softmax}\!\left(\frac{\mathcal{R}q\,(\mathcal{R}k)^\top}{\sqrt{D_h}} + M^{\text{win}}\right) v,
+\qquad M^{\text{win}}_{ij} = \begin{cases}0 & i-w < j \le i\\ -\infty & \text{lainnya}\end{cases}
+$$
+
+Biaya $O(T\,w\,D)$.
+
+**Jalur B — gated linear attention (global, $O(T)$).** Feature map
+$\varphi(x) = \mathrm{elu}(x)+1 > 0$. State per head $S_t \in \mathbb{R}^{D_h \times D_h}$:
+
+$$
+S_t = \lambda_t \odot S_{t-1} + \varphi(k_t)\,v_t^\top, \qquad
+o^{\text{glb}}_t = \frac{\varphi(q_t)^\top S_t}{\varphi(q_t)^\top \sum_{j\le t}\varphi(k_j) + \epsilon}
+$$
+
+dengan forget gate per head $\lambda_t = \sigma\!\left(W_\lambda\, \bar{x}_{\text{chunk}(t)}\right) \in (0,1)$
+(konstan di dalam satu chunk — gating tingkat chunk, bukan token; penyempurnaan ke
+gating per token dicatat sebagai future work). Implementasi memakai bentuk chunked
+paralel: chunk $c$ berisi posisi $C(c-1)+1 .. Cc$:
+
+$$
+o^{\text{intra}} = \left(\varphi(Q_c)\varphi(K_c)^\top \odot \mathrm{tril}\right) V_c,\quad
+o^{\text{inter}} = \varphi(Q_c)\, S_{c-1},\quad
+S_c = \lambda_c S_{c-1} + \varphi(K_c)^\top V_c
+$$
+
+Jumlah iterasi chunk = $T/C$ (mis. 16 untuk $T{=}1024, C{=}64$) — bukan loop per token.
+Biaya $O(T C D_h + T D_h^2)$, jadi total sub-kuadratik.
+
+**Gate penggabung** (per token, per kanal):
+
+$$
+g = \sigma\!\left(W_g x\right) \in (0,1)^{D}, \qquad
+o = g \odot o^{\text{loc}} + (1-g) \odot o^{\text{glb}}
+$$
+
+Jalur lokal menangani sintaksis/jarak dekat, jalur linear membawa konteks jauh
+dengan memori $O(D_h^2)$ per head (bukan $O(T)$ KV-cache).
+Ini yang membuat decode panjang tidak meledak VRAM.
+
+### 3.3 Adaptive Sparse MoE + Router
+
+Router (per token $x_t \in \mathbb{R}^D$):
+
+$$
+\ell_t = W_r x_t \in \mathbb{R}^{E},\qquad p_t = \mathrm{softmax}(\ell_t),\qquad
+\mathcal{T}_t = \mathrm{topk}(p_t, k)
+$$
+
+**Adaptive compute (threshold skip).** Dengan $\tau \in [0,1)$:
+
+$$
+m_t = \mathbb{1}\!\left[\max_e p_{t,e} \ge \tau\right]
+$$
+
+Jika $m_t = 0$, token hanya melewati shared expert (komputasi routed = 0).
+Bobot routing dinormalisasi ulang:
+
+$$
+\tilde{w}_{t,e} = \frac{p_{t,e}\, m_t}{\sum_{e' \in \mathcal{T}_t} p_{t,e'}}
+$$
+
+**Shared expert** (selalu aktif, menyerap pengetahuan umum — mencegah expert
+routing kelaparan pada korpus kecil):
+
+$$
+y^{\text{sh}}_t = W^{\text{sh}}_2\,\sigma\!\left(W^{\text{sh}}_1 x_t\right)
+$$
+
+**Routed experts** (SwiGLU, lebar kecil $d_e$):
+
+$$
+y^{\text{rt}}_t = \sum_{e \in \mathcal{T}_t} \tilde{w}_{t,e}\, \mathrm{Expert}_e(x_t)
+$$
+
+$$
+\mathrm{ASCA\text{-}MoE}(x_t) = y^{\text{sh}}_t + y^{\text{rt}}_t
+$$
+
+**Load balancing** (Switch-style, dengan $N = B\cdot T$, $f_e$ = fraksi token,
+$\bar{p}_e$ = rata-rata prob):
+
+$$
+\mathcal{L}_{\text{aux}} = \alpha\, E \sum_{e=1}^{E} f_e \bar{p}_e
+\;+\; \beta \left(\log \sum_{e} e^{\ell_{t,e}}\right)^2 \quad (z\text{-loss})
+$$
+
+Biaya aktif per token: $O(D\,d_e \cdot k + D\,d^{\text{sh}})$ — sublinear terhadap $E$,
+sehingga menambah expert menambah kapasitas tanpa menambah FLOPs/token.
+
+### 3.4 Efficient Memory (SegmentMemory)
+
+Tujuan: konteks panjang dengan anggaran memori terbatas, tanpa KV-cache $O(T)$.
+
+Bagi sekuens menjadi $S = T/L_s$ segmen. Ringkasan segmen $s$ dihitung dengan
+$M$ query yang dipelajari $Q^{\text{mem}} \in \mathbb{R}^{M\times D}$:
+
+$$
+\mathrm{Sum}^{(s)} = \mathrm{softmax}\!\left(\frac{Q^{\text{mem}} K_s^\top}{\sqrt{D}}\right) V_s \in \mathbb{R}^{M\times D}
+$$
+
+Token di segmen $s$ membaca ringkasan **hanya dari segmen $< s$** (kausal antar-segmen):
+
+$$
+\mathrm{Mem}^{(s)} = \mathrm{softmax}\!\left(\frac{q_t \,[\mathrm{Sum}^{(0..s-1)}]^\top}{\sqrt{D}}\right)[\mathrm{Sum}^{(0..s-1)}]V
+$$
+
+lalu digabung dengan residual bergerbang:
+
+$$
+h_t \leftarrow h_t + \sigma(w_m)\odot \mathrm{Mem}^{(s)}_t
+$$
+
+Biaya: $O(T M D + S^2 M D)$ — $M \ll T$, jadi jauh di bawah attention penuh.
+Kausal: ringkasan segmen $s$ sendiri tidak pernah dibaca oleh token di segmen $s$. ✓
+
+### 3.5 Shared Decoder
+
+$$
+\begin{aligned}
+z &= \mathrm{RMSNorm}(H^L) \\
+z' &= z + \sigma(\gamma)\odot H^{0} \quad (\text{gated semantic skip, } \gamma \text{ init } 0)\\
+\mathrm{logits} &= z'\, E^\top \quad (\text{tied embedding})
+\end{aligned}
+$$
+
+Weight tying memangkas $V\cdot D$ parameter (signifikan pada model kecil) dan
+memaksa ruang laten input/output berbagi geometri.
+
+### 3.6 Block
+
+Pre-norm residual, mengikuti pola stabil:
+
+$$
+\begin{aligned}
+H &\leftarrow H + \mathrm{Attn}(\mathrm{RMSNorm}(H)) \\
+H &\leftarrow H + \mathrm{Mem}(\mathrm{RMSNorm}(H)) \\
+H &\leftarrow H + \mathrm{MoE}(\mathrm{RMSNorm}(H))
+\end{aligned}
+$$
+
+---
+
+## 4. Anggaran Komputasi
+
+FLOPs aktif per token (dominasi, $D$ besar):
+
+| Komponen | FLOPs/token |
+|---|---|
+| Attention lokal | $\approx 4 T_{\text{eff}} D_h H$ dengan $T_{\text{eff}} = \min(T, w)$ |
+| Attention linear | $\approx 4 C D_h H + 4 D_h^2 H$ |
+| MoE (shared + top-$k$) | $4 D (d^{\text{sh}} + k\, d_e)$ |
+| Dense baseline (pembanding) | $4 T D + 8 D d_{ff}$ |
+
+Kunci klaim yang harus diuji: pada **FLOPs/token dan VRAM yang sama**, ASCA harus
+mencapai validation loss lebih rendah daripada baseline dense — bukan sekadar
+"parameter lebih banyak".
+
+---
+
+## 5. Matriks Ablasi
+
+Setiap baris adalah konfigurasi yang wajib dijalankan pada budget token identik.
+
+| ID | Konfigurasi | Flag |
+|---|---|---|
+| B0 | Dense Transformer (kontrol) | `baseline/dense_transformer.py` |
+| A0 | ASCA penuh | semua `use_*` = true |
+| A1 | tanpa Semantic Encoder | `use_semantic_encoder=false` |
+| A2 | attention lokal saja | `use_hybrid_attention=false` |
+| A3 | tanpa MoE (MLP dense) | `use_moe=false` |
+| A4 | tanpa SegmentMemory | `use_memory=false` |
+| A5 | MoE tanpa shared expert | `n_shared_experts=0` |
+| A6 | tanpa threshold skip | `router_threshold=0.0` |
+
+---
+
+## 6. Protokol Evaluasi
+
+Semua perbandingan pada **jumlah token latih, batch efektif, dan LR schedule identik**.
+
+- **Language**: validation loss & perplexity pada korpus uji yang sama.
+- **Efisiensi**: tokens/sec (training), ms/token (decode), active FLOPs/token.
+- **Memori**: peak VRAM pada $T \in \{512, 1024, 2048, 4096\}$, dan VRAM decode
+  per token (KV-cache growth).
+- **Reasoning/coding/math**: GSM8K, HumanEval, MBPP — hanya relevan setelah
+  skala cukup; pada tahap prototipe dilaporkan sebagai `n/a`.
+- **Statistik**: minimal 3 seed, laporkan mean ± std. Tidak ada klaim dari 1 run.
+
+Hasil ditulis ke `docs/EXPERIMENTS.md` oleh `benchmarks/train_toy.py`
+(format JSON + tabel markdown).
+
+---
+
+## 7. Batasan yang Diakui (v0.1)
+
+1. Gating decay pada attention linear masih per-chunk, bukan per-token.
+2. SegmentMemory memakai ringkasan statis per segmen (tidak ada update rekuren
+   antar-forward pada versi training paralel).
+3. Attention lokal memakai mask eksplisit (cocok untuk $T \le 4096$); untuk skala
+   besar perlu FlexAttention/FlashAttention dengan window native.
+4. Belum ada positional encoding pada jalur linear (recency ditangani oleh forget
+   gate); ini asumsi desain yang perlu diuji.
+5. Belum ada hasil benchmark apa pun. **Tidak ada klaim keunggulan.**
