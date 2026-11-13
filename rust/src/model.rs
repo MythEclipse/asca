@@ -113,50 +113,91 @@ impl HashMoe {
             route[t] = e;
             buckets[e].push(t);
         }
+
+        // Tiap expert mendapat buffer kontigu miliknya sendiri. Sebelumnya semua expert
+        // menulis ke vec bersama (pre/hidden/out) sehingga loop ini tidak bisa
+        // diparalelkan tanpa unsafe; dengan buffer per expert pembagiannya bersih dan
+        // hasilnya digabung setelah semua thread selesai. Baris yang ditulis tiap expert
+        // tetap sama persis, jadi matematikanya tidak berubah.
+        struct Job {
+            e: usize,
+            rows: Vec<usize>,
+            pre: Vec<f32>,
+            hidden: Vec<f32>,
+            out: Vec<f32>,
+        }
+        let mut jobs: Vec<Job> = buckets
+            .iter()
+            .enumerate()
+            .map(|(e, rows)| Job {
+                e,
+                rows: rows.clone(),
+                pre: vec![0.0f32; rows.len() * d_ff],
+                hidden: vec![0.0f32; rows.len() * d_ff],
+                out: vec![0.0f32; rows.len() * d],
+            })
+            .collect();
+
+        let w1v = &self.w1.value;
+        let w2v = &self.w2.value;
+        let b1v = &self.b1.value;
+        let b2v = &self.b2.value;
+        let xnr = &xn;
+        std::thread::scope(|s| {
+            for job in jobs.iter_mut() {
+                s.spawn(move || {
+                    let e = job.e;
+                    let n = job.rows.len();
+                    if n == 0 {
+                        return;
+                    }
+                    let (pre, hidden, out) = (&mut job.pre, &mut job.hidden, &mut job.out);
+                    let rows = &job.rows;
+                    let b1 = &b1v.d[e * d_ff..(e + 1) * d_ff];
+                    for i in 0..n {
+                        pre[i * d_ff..(i + 1) * d_ff].copy_from_slice(b1);
+                    }
+                    // pre = xn @ w1[:, expert]
+                    for c in 0..d {
+                        let w1row = &w1v.row(c)[e * d_ff..(e + 1) * d_ff];
+                        for (i, &t) in rows.iter().enumerate() {
+                            let xc = xnr.at(t, c);
+                            if xc == 0.0 {
+                                continue;
+                            }
+                            crate::simd::axpy(&mut pre[i * d_ff..(i + 1) * d_ff], xc, w1row);
+                        }
+                    }
+                    for i in 0..n {
+                        for j in 0..d_ff {
+                            hidden[i * d_ff + j] = silu(pre[i * d_ff + j]);
+                        }
+                        out[i * d..(i + 1) * d].copy_from_slice(&b2v.d);
+                    }
+                    // out += hidden @ w2[expert, :]
+                    for j in 0..d_ff {
+                        let w2row = w2v.row(e * d_ff + j);
+                        for i in 0..n {
+                            let hj = hidden[i * d_ff + j];
+                            if hj == 0.0 {
+                                continue;
+                            }
+                            crate::simd::axpy(&mut out[i * d..(i + 1) * d], hj, w2row);
+                        }
+                    }
+                });
+            }
+        });
+
         let mut pre = vec![0.0f32; t_len * d_ff];
         let mut hidden = vec![0.0f32; t_len * d_ff];
         let mut out = Mat::zeros(t_len, d);
-
-        for e in 0..self.n_experts {
-            let rows = &buckets[e];
-            if rows.is_empty() {
-                continue;
-            }
-            let b1 = &self.b1.value.d[e * d_ff..(e + 1) * d_ff];
-            for &t in rows.iter() {
-                pre[t * d_ff..(t + 1) * d_ff].copy_from_slice(b1);
-            }
-            // pre = xn @ w1[:, expert]
-            for c in 0..d {
-                let w1row = &self.w1.value.row(c)[e * d_ff..(e + 1) * d_ff];
-                for &t in rows.iter() {
-                    let xc = xn.at(t, c);
-                    if xc == 0.0 {
-                        continue;
-                    }
-                    let prow = &mut pre[t * d_ff..(t + 1) * d_ff];
-                    crate::simd::axpy(prow, xc, w1row);
-                }
-            }
-            for &t in rows.iter() {
-                let prow = &pre[t * d_ff..(t + 1) * d_ff];
-                let hrow = &mut hidden[t * d_ff..(t + 1) * d_ff];
-                for j in 0..d_ff {
-                    hrow[j] = silu(prow[j]);
-                }
-                out.row_mut(t).copy_from_slice(&self.b2.value.d);
-            }
-            // out += hidden @ w2[expert, :]
-            for j in 0..d_ff {
-                let w2row = self.w2.value.row(e * d_ff + j);
-                for &t in rows.iter() {
-                    let hj = hidden[t * d_ff + j];
-                    if hj == 0.0 {
-                        continue;
-                    }
-                    let orow = out.row_mut(t);
-                    crate::simd::axpy(orow, hj, w2row);
-                }
+        for job in jobs.iter() {
+            for (i, &t) in job.rows.iter().enumerate() {
+                pre[t * d_ff..(t + 1) * d_ff].copy_from_slice(&job.pre[i * d_ff..(i + 1) * d_ff]);
+                hidden[t * d_ff..(t + 1) * d_ff]
+                    .copy_from_slice(&job.hidden[i * d_ff..(i + 1) * d_ff]);
+                out.row_mut(t).copy_from_slice(&job.out[i * d..(i + 1) * d]);
             }
         }
         (
@@ -206,62 +247,132 @@ impl HashMoe {
     pub fn backward(&mut self, cache: &MoeCache, dout: &Mat) -> Mat {
         let (t_len, d) = (cache.x.rows, cache.x.cols);
         let d_ff = self.d_ff;
-        let mut dpre = vec![0.0f32; t_len * d_ff];
         let mut dxn = Mat::zeros(t_len, d);
 
-        for e in 0..self.n_experts {
-            let rows = &cache.buckets[e];
-            if rows.is_empty() {
-                continue;
-            }
-            // dW2 += hidden^T dout ; db2 += dout
-            for j in 0..d_ff {
-                let g2row = &mut self.w2.grad.row_mut(e * d_ff + j);
-                for &t in rows.iter() {
-                    let hj = cache.hidden[t * d_ff + j];
-                    if hj == 0.0 {
-                        continue;
+        // Sama seperti forward: tiap expert menghitung ke buffer gradiennya sendiri, lalu
+        // digabung. Di versi lama semua expert menulis ke w1.grad/w2.grad/b1.grad/b2.grad
+        // bersama sehingga loop 32,4% waktu training ini terkunci di satu core.
+        struct Job {
+            e: usize,
+            rows: Vec<usize>,
+            dpre: Vec<f32>,
+            dw1: Vec<f32>,
+            dw2: Vec<f32>,
+            db1: Vec<f32>,
+            db2: Vec<f32>,
+            dxn: Vec<f32>,
+        }
+        let mut jobs: Vec<Job> = cache
+            .buckets
+            .iter()
+            .enumerate()
+            .map(|(e, rows)| Job {
+                e,
+                rows: rows.clone(),
+                dpre: vec![0.0f32; rows.len() * d_ff],
+                dw1: vec![0.0f32; d * d_ff],
+                dw2: vec![0.0f32; d_ff * d],
+                db1: vec![0.0f32; d_ff],
+                db2: vec![0.0f32; d],
+                dxn: vec![0.0f32; rows.len() * d],
+            })
+            .collect();
+
+        let w1v = &self.w1.value;
+        let w2v = &self.w2.value;
+        std::thread::scope(|s| {
+            for job in jobs.iter_mut() {
+                s.spawn(move || {
+                    let e = job.e;
+                    let n = job.rows.len();
+                    if n == 0 {
+                        return;
                     }
-                    crate::simd::axpy(g2row, hj, dout.row(t));
-                }
+                    let rows = &job.rows;
+                    let (dpre, dw1, dw2, db1, db2, dxn) = (
+                        &mut job.dpre,
+                        &mut job.dw1,
+                        &mut job.dw2,
+                        &mut job.db1,
+                        &mut job.db2,
+                        &mut job.dxn,
+                    );
+                    // dW2 += hidden^T dout ; db2 += dout
+                    for &t in rows.iter() {
+                        let dr = dout.row(t);
+                        for j in 0..d_ff {
+                            let hj = cache.hidden[t * d_ff + j];
+                            if hj == 0.0 {
+                                continue;
+                            }
+                            crate::simd::axpy(&mut dw2[j * d..(j + 1) * d], hj, dr);
+                        }
+                        for c in 0..d {
+                            db2[c] += dr[c];
+                        }
+                    }
+                    // dpre = dout @ w2[expert]^T, lalu dikali turunan SiLU
+                    for (i, &t) in rows.iter().enumerate() {
+                        let dr = dout.row(t);
+                        for j in 0..d_ff {
+                            let w2row = w2v.row(e * d_ff + j);
+                            dpre[i * d_ff + j] = crate::simd::dot(dr, w2row);
+                        }
+                    }
+                    for (i, &t) in rows.iter().enumerate() {
+                        for j in 0..d_ff {
+                            let pre = cache.pre[t * d_ff + j];
+                            let sg = 1.0 / (1.0 + (-pre).exp());
+                            let dh = dpre[i * d_ff + j] * (sg * (1.0 + pre * (1.0 - sg)));
+                            db1[j] += dh;
+                            dpre[i * d_ff + j] = dh;
+                        }
+                    }
+                    // dW1 += xn^T dpre ; dxn += dpre @ w1[expert]^T
+                    for c in 0..d {
+                        let w1row = &w1v.row(c)[e * d_ff..(e + 1) * d_ff];
+                        let gw = &mut dw1[c * d_ff..(c + 1) * d_ff];
+                        for (i, &t) in rows.iter().enumerate() {
+                            let xc = cache.xn.at(t, c);
+                            if xc == 0.0 {
+                                continue;
+                            }
+                            crate::simd::axpy(gw, xc, &dpre[i * d_ff..(i + 1) * d_ff]);
+                        }
+                        for i in 0..n {
+                            dxn[i * d + c] +=
+                                crate::simd::dot(&dpre[i * d_ff..(i + 1) * d_ff], w1row);
+                        }
+                    }
+                });
             }
-            for &t in rows.iter() {
-                let dr = dout.row(t);
+        });
+
+        // gabungkan hasil per expert
+        for job in jobs.iter() {
+            let e = job.e;
+            for j in 0..d_ff {
+                let row = self.w2.grad.row_mut(e * d_ff + j);
                 for c in 0..d {
-                    self.b2.grad.d[c] += dr[c];
+                    row[c] += job.dw2[j * d + c];
                 }
             }
-            // dpre = dout @ w2[expert]^T, lalu dikali turunan SiLU
-            for j in 0..d_ff {
-                let w2row = self.w2.value.row(e * d_ff + j);
-                for &t in rows.iter() {
-                    dpre[t * d_ff + j] = crate::simd::dot(dout.row(t), w2row);
-                }
-            }
-            for &t in rows.iter() {
-                for j in 0..d_ff {
-                    let pre = cache.pre[t * d_ff + j];
-                    let s = 1.0 / (1.0 + (-pre).exp());
-                    let dh = dpre[t * d_ff + j] * (s * (1.0 + pre * (1.0 - s)));
-                    self.b1.grad.d[e * d_ff + j] += dh;
-                    dpre[t * d_ff + j] = dh;
-                }
-            }
-            // dW1 += xn^T dpre ; dxn += dpre @ w1[expert]^T
             for c in 0..d {
-                let g1row = &mut self.w1.grad.row_mut(c)[e * d_ff..(e + 1) * d_ff];
-                for &t in rows.iter() {
-                    let xc = cache.xn.at(t, c);
-                    if xc == 0.0 {
-                        continue;
-                    }
-                    let drow = &dpre[t * d_ff..(t + 1) * d_ff];
-                    crate::simd::axpy(g1row, xc, drow);
+                let row = self.w1.grad.row_mut(c);
+                for j in 0..d_ff {
+                    row[e * d_ff + j] += job.dw1[c * d_ff + j];
                 }
-                let w1row = &self.w1.value.row(c)[e * d_ff..(e + 1) * d_ff];
-                for &t in rows.iter() {
-                    let drow = &dpre[t * d_ff..(t + 1) * d_ff];
-                    dxn.row_mut(t)[c] += crate::simd::dot(drow, w1row);
+            }
+            for j in 0..d_ff {
+                self.b1.grad.d[e * d_ff + j] += job.db1[j];
+            }
+            for c in 0..d {
+                self.b2.grad.d[c] += job.db2[c];
+            }
+            for (i, &t) in job.rows.iter().enumerate() {
+                let row = dxn.row_mut(t);
+                for c in 0..d {
+                    row[c] += job.dxn[i * d + c];
                 }
             }
         }
