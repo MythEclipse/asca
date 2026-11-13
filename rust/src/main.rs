@@ -77,18 +77,17 @@ fn cmd_decode(args: &[String]) {
     for &ctx in ctxs.iter() {
         // panaskan state sepanjang `ctx` token, lalu ukur `steps` langkah berikutnya
         let mut st = model.new_decode_state();
-        let mut id = 0u32;
         for _ in 0..ctx {
-            id = rng.below(256) as u32;
+            let id = rng.below(256) as u32;
             let _ = model.step(id, &mut st);
         }
         for _ in 0..warmup {
-            id = rng.below(256) as u32;
+            let id = rng.below(256) as u32;
             let _ = model.step(id, &mut st);
         }
         let t0 = std::time::Instant::now();
         for _ in 0..steps {
-            id = rng.below(256) as u32;
+            let id = rng.below(256) as u32;
             let _ = model.step(id, &mut st);
         }
         let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
