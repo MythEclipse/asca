@@ -1,5 +1,6 @@
 //! CLI ASCA v2: train / eval / sample / inspect.
 
+use asca_rs::bpe::Bpe;
 use asca_rs::dense::{DenseCfg, DenseModel};
 use asca_rs::model::{Config, Model};
 use asca_rs::tensor::Rng;
@@ -28,6 +29,7 @@ fn main() {
         "bench" => cmd_bench(&args),
         "gpu" => cmd_gpu(&args),
         "decode" => cmd_decode(&args),
+        "bpe" => cmd_bpe(&args),
         _ => {
             println!("asca — ASCA v2 (tanpa attention, state konstan, Rust murni)");
             println!("pakai:");
@@ -73,7 +75,7 @@ fn cmd_decode(args: &[String]) {
         "dense" => {
             let d_ff: usize = arg(args, "--d-ff", "128").parse().unwrap_or(128);
             let cfg = DenseCfg {
-                vocab: 256,
+                vocab: vocab_for(args),
                 d_model: 64,
                 n_heads: 4,
                 n_layers: 2,
@@ -124,9 +126,84 @@ fn cmd_decode(args: &[String]) {
     }
 }
 
+/// Tokenizer BPE: latih, lalu laporkan kompresi. Tanpa ini model hanya melihat byte,
+/// jadi "LLM nyata" belum mungkin.
+fn cmd_bpe(args: &[String]) {
+    let sub = args.get(2).cloned().unwrap_or_default();
+    match sub.as_str() {
+        "train" => {
+            let path = arg(args, "--data", "");
+            let vocab: usize = arg(args, "--vocab", "8192").parse().unwrap();
+            let out = arg(args, "--out", "tok.bin");
+            let text = std::fs::read(&path).expect("gagal baca data");
+            let t0 = std::time::Instant::now();
+            let bpe = Bpe::train(&text, vocab);
+            let dt = t0.elapsed().as_secs_f64();
+            bpe.save(&out).expect("gagal simpan");
+            // kompresi pada potongan yang tidak dipakai menghitung: 1 MB terakhir
+            let sample = &text[text.len().saturating_sub(1 << 20)..];
+            let ids = bpe.encode(sample);
+            println!(
+                "bpe: {} merge, vocab {} dalam {:.1} s",
+                bpe.vocab_size() - 256,
+                bpe.vocab_size(),
+                dt
+            );
+            println!(
+                "kompresi: {} byte -> {} token ({:.2} byte/token) pada 1 MB terakhir",
+                sample.len(),
+                ids.len(),
+                sample.len() as f64 / ids.len() as f64
+            );
+            // cek round-trip pada data nyata, bukan hanya data uji
+            assert_eq!(bpe.decode(&ids), sample.to_vec(), "round-trip gagal");
+            println!("round-trip: OK");
+            println!("disimpan: {out}");
+        }
+        "stats" => {
+            let tok = arg(args, "--tokenizer", "tok.bin");
+            let path = arg(args, "--data", "");
+            let bpe = Bpe::load(&tok).expect("gagal muat tokenizer");
+            let text = std::fs::read(&path).expect("gagal baca data");
+            let ids = bpe.encode(&text);
+            println!(
+                "vocab {} | {} byte -> {} token ({:.2} byte/token)",
+                bpe.vocab_size(),
+                text.len(),
+                ids.len(),
+                text.len() as f64 / ids.len() as f64
+            );
+        }
+        _ => println!("pakai: asca bpe train --data FILE --vocab 8192 --out tok.bin"),
+    }
+}
+
+/// Muat data; kalau `--tokenizer` diberikan, teks di-encode jadi subword BPE.
+/// Tanpa flag itu, perilakunya tetap seperti sebelumnya (byte sebagai id).
+fn load_data(args: &[String]) -> Data {
+    let path = arg(args, "--data", "");
+    let tok = arg(args, "--tokenizer", "");
+    if tok.is_empty() {
+        Data::load(&path, 0.05).expect("gagal baca data")
+    } else {
+        let bpe = Bpe::load(&tok).expect("gagal muat tokenizer");
+        Data::load_with_bpe(&path, 0.05, &bpe).expect("gagal baca data")
+    }
+}
+
+/// Vocab harus sama dengan tokenizer; kalau `--tokenizer` ada, ukurannya yang menang.
+fn vocab_for(args: &[String]) -> usize {
+    let tok = arg(args, "--tokenizer", "");
+    if tok.is_empty() {
+        arg(args, "--vocab", "256").parse().unwrap()
+    } else {
+        Bpe::load(&tok).expect("gagal muat tokenizer").vocab_size()
+    }
+}
+
 fn build_cfg(args: &[String]) -> Config {
     Config {
-        vocab: 256,
+        vocab: vocab_for(args),
         d_model: arg(args, "--d-model", "64").parse().unwrap(),
         n_heads: arg(args, "--n-heads", "4").parse().unwrap(),
         n_layers: arg(args, "--n-layers", "2").parse().unwrap(),
@@ -136,8 +213,7 @@ fn build_cfg(args: &[String]) -> Config {
 }
 
 fn cmd_train(args: &[String]) {
-    let data_path = arg(args, "--data", "");
-    assert!(!data_path.is_empty(), "butuh --data FILE");
+    assert!(!arg(args, "--data", "").is_empty(), "butuh --data FILE");
     let out = arg(args, "--out", "asca2.ckpt");
     let cfg = build_cfg(args);
     let tcfg = TrainCfg {
@@ -150,7 +226,7 @@ fn cmd_train(args: &[String]) {
         eval_batches: arg(args, "--eval-batches", "8").parse().unwrap(),
         log_every: arg(args, "--log-every", "25").parse().unwrap(),
     };
-    let data = Data::load(&data_path, 0.05).expect("gagal baca data");
+    let data = load_data(args);
     let mut rng = Rng::new(arg(args, "--seed", "0").parse().unwrap());
     let mut model = Model::new(cfg.clone(), &mut rng);
     println!(
@@ -171,9 +247,9 @@ fn cmd_train(args: &[String]) {
 
 fn cmd_eval(args: &[String]) {
     let ckpt = arg(args, "--ckpt", "");
-    let data_path = arg(args, "--data", "");
+    assert!(!arg(args, "--data", "").is_empty(), "butuh --data FILE");
     let (mut model, cfg) = train::load(&ckpt, 0).expect("gagal load checkpoint");
-    let data = Data::load(&data_path, 0.05).expect("gagal baca data");
+    let data = load_data(args);
     let tcfg = TrainCfg {
         steps: 0,
         seq_len: arg(args, "--seq-len", "128").parse().unwrap(),
@@ -428,8 +504,7 @@ fn cmd_bench(args: &[String]) {
     use asca_rs::bench::{self, BenchCfg, Trainable};
     use asca_rs::dense::dense_matched_to;
 
-    let data_path = arg(args, "--data", "");
-    assert!(!data_path.is_empty(), "butuh --data FILE");
+    assert!(!arg(args, "--data", "").is_empty(), "butuh --data FILE");
     let cfg = build_cfg(args);
     let bcfg = BenchCfg {
         steps: arg(args, "--steps", "400").parse().unwrap(),
@@ -453,12 +528,18 @@ fn cmd_bench(args: &[String]) {
     if bcfg_dense.lr != bcfg.lr {
         println!("lr: asca {} | dense {}", bcfg.lr, bcfg_dense.lr);
     }
-    let data = Data::load(&data_path, 0.05).expect("gagal baca data");
+    let data = load_data(args);
     println!(
         "bench: steps {} seq {} batch {} lr {} seeds {:?}",
         bcfg.steps, bcfg.seq_len, bcfg.batch, bcfg.lr, seeds
     );
-    println!("data: {} byte ({} train)", data.bytes.len(), data.train_end);
+    println!(
+        "data: {} byte -> {} token ({} train, {:.2} byte/token)",
+        data.raw_bytes,
+        data.tokens.len(),
+        data.train_end,
+        data.raw_bytes as f64 / data.tokens.len() as f64
+    );
 
     // acuan: ASCA seed pertama, untuk menentukan target pencocokan parameter
     let mut rng0 = Rng::new(seeds[0]);

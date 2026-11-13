@@ -7,11 +7,36 @@ use crate::model::{Config, Model, step};
 use crate::tensor::{AdamW, Rng};
 
 pub struct Data {
-    pub bytes: Vec<u8>,
+    /// id token (byte sebagai u32 kalau tanpa tokenizer, subword kalau dengan BPE)
+    pub tokens: Vec<u32>,
     pub train_end: usize,
+    /// jumlah byte asli, untuk pelaporan kompresi
+    pub raw_bytes: usize,
 }
 
 impl Data {
+    /// Muat data dengan tokenizer BPE. Model melihat subword, bukan byte.
+    pub fn load_with_bpe(
+        path: &str,
+        val_frac: f32,
+        bpe: &crate::bpe::Bpe,
+    ) -> std::io::Result<Self> {
+        let raw = fs::read(path)?;
+        if raw.len() < 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file terlalu kecil",
+            ));
+        }
+        let tokens = bpe.encode(&raw);
+        let train_end = ((tokens.len() as f32) * (1.0 - val_frac)) as usize;
+        Ok(Self {
+            tokens,
+            train_end,
+            raw_bytes: raw.len(),
+        })
+    }
+
     pub fn load(path: &str, val_frac: f32) -> std::io::Result<Self> {
         let bytes = fs::read(path)?;
         if bytes.len() < 1024 {
@@ -21,7 +46,12 @@ impl Data {
             ));
         }
         let train_end = ((bytes.len() as f32) * (1.0 - val_frac)) as usize;
-        Ok(Self { bytes, train_end })
+        let raw_bytes = bytes.len();
+        Ok(Self {
+            tokens: bytes.iter().map(|&b| b as u32).collect(),
+            train_end,
+            raw_bytes,
+        })
     }
 
     /// Ambil satu sekuens (ids, targets) mulai dari offset acak di rentang tertentu.
@@ -47,18 +77,12 @@ impl Data {
     pub fn batch(&self, rng: &mut Rng, seq_len: usize, split: Split) -> (Vec<u32>, Vec<u32>) {
         let (lo, hi) = match split {
             Split::Train => (0, self.train_end),
-            Split::Val => (self.train_end, self.bytes.len()),
+            Split::Val => (self.train_end, self.tokens.len()),
         };
         let span = hi.saturating_sub(lo).saturating_sub(seq_len + 1).max(1);
         let start = lo + rng.below(span);
-        let ids = self.bytes[start..start + seq_len]
-            .iter()
-            .map(|&b| b as u32)
-            .collect();
-        let tgts = self.bytes[start + 1..start + 1 + seq_len]
-            .iter()
-            .map(|&b| b as u32)
-            .collect();
+        let ids = self.tokens[start..start + seq_len].to_vec();
+        let tgts = self.tokens[start + 1..start + 1 + seq_len].to_vec();
         (ids, tgts)
     }
 }
