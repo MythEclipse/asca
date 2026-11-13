@@ -42,6 +42,9 @@ curve: build
 	$(BIN) bench --data "$(DATA)" --steps $(STEPS) --seq-len 128 --batch 4 \
 		--lr $(LR) --seeds $(SEEDS) --eval-curve 250 --match total
 
+prepare:
+	bash scripts/prepare_corpus.sh $(MB) $(VOCAB)
+
 analyze:
 	awk -f scripts/analyze_curve.sh $(LOG)
 

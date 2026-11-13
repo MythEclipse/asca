@@ -30,6 +30,7 @@ fn main() {
         "gpu" => cmd_gpu(&args),
         "decode" => cmd_decode(&args),
         "bpe" => cmd_bpe(&args),
+        "tokenize" => cmd_tokenize(&args),
         "chat" => cmd_chat(&args),
         _ => {
             println!("asca — ASCA v2 (tanpa attention, state konstan, Rust murni)");
@@ -182,6 +183,11 @@ fn cmd_bpe(args: &[String]) {
 /// Muat data; kalau `--tokenizer` diberikan, teks di-encode jadi subword BPE.
 /// Tanpa flag itu, perilakunya tetap seperti sebelumnya (byte sebagai id).
 fn load_data(args: &[String]) -> Data {
+    // File token ter-encode menang: tidak perlu meng-encode ulang korpus.
+    let tokfile = arg(args, "--tokenized", "");
+    if !tokfile.is_empty() {
+        return Data::load_tokens(&tokfile, 0.05).expect("gagal muat file token");
+    }
     let path = arg(args, "--data", "");
     let tok = arg(args, "--tokenizer", "");
     if tok.is_empty() {
@@ -194,12 +200,35 @@ fn load_data(args: &[String]) -> Data {
 
 /// Vocab harus sama dengan tokenizer; kalau `--tokenizer` ada, ukurannya yang menang.
 fn vocab_for(args: &[String]) -> usize {
+    let tokfile = arg(args, "--tokenized", "");
+    if !tokfile.is_empty() {
+        return Data::vocab_of_tokens(&tokfile).expect("gagal baca header file token");
+    }
     let tok = arg(args, "--tokenizer", "");
     if tok.is_empty() {
         arg(args, "--vocab", "256").parse().unwrap()
     } else {
         Bpe::load(&tok).expect("gagal muat tokenizer").vocab_size()
     }
+}
+
+/// Encode korpus sekali, simpan id token. Dipakai oleh --tokenized.
+fn cmd_tokenize(args: &[String]) {
+    let path = arg(args, "--data", "");
+    let tok = arg(args, "--tokenizer", "");
+    let out = arg(args, "--out", "corpus.tok");
+    let bpe = Bpe::load(&tok).expect("gagal muat tokenizer");
+    let t0 = std::time::Instant::now();
+    let data = Data::load_with_bpe(&path, 0.05, &bpe).expect("gagal baca data");
+    data.save_tokens(&out, bpe.vocab_size())
+        .expect("gagal simpan token");
+    println!(
+        "tokenize: {} byte -> {} token ({:.2} byte/token) dalam {:.1} s -> {out}",
+        data.raw_bytes,
+        data.tokens.len(),
+        data.raw_bytes as f64 / data.tokens.len() as f64,
+        t0.elapsed().as_secs_f64()
+    );
 }
 
 fn build_cfg(args: &[String]) -> Config {
@@ -214,7 +243,10 @@ fn build_cfg(args: &[String]) -> Config {
 }
 
 fn cmd_train(args: &[String]) {
-    assert!(!arg(args, "--data", "").is_empty(), "butuh --data FILE");
+    assert!(
+        !arg(args, "--data", "").is_empty() || !arg(args, "--tokenized", "").is_empty(),
+        "butuh --data FILE atau --tokenized FILE"
+    );
     let out = arg(args, "--out", "asca2.ckpt");
     let cfg = build_cfg(args);
     let tcfg = TrainCfg {
@@ -264,7 +296,10 @@ fn cmd_train(args: &[String]) {
 
 fn cmd_eval(args: &[String]) {
     let ckpt = arg(args, "--ckpt", "");
-    assert!(!arg(args, "--data", "").is_empty(), "butuh --data FILE");
+    assert!(
+        !arg(args, "--data", "").is_empty() || !arg(args, "--tokenized", "").is_empty(),
+        "butuh --data FILE atau --tokenized FILE"
+    );
     let (mut model, cfg) = train::load(&ckpt, 0).expect("gagal load checkpoint");
     let data = load_data(args);
     let tcfg = TrainCfg {
@@ -704,7 +739,10 @@ fn cmd_bench(args: &[String]) {
     use asca_rs::bench::{self, BenchCfg, Trainable};
     use asca_rs::dense::dense_matched_to;
 
-    assert!(!arg(args, "--data", "").is_empty(), "butuh --data FILE");
+    assert!(
+        !arg(args, "--data", "").is_empty() || !arg(args, "--tokenized", "").is_empty(),
+        "butuh --data FILE atau --tokenized FILE"
+    );
     let cfg = build_cfg(args);
     let bcfg = BenchCfg {
         steps: arg(args, "--steps", "400").parse().unwrap(),

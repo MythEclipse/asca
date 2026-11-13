@@ -37,6 +37,62 @@ impl Data {
         })
     }
 
+    /// Simpan id token yang sudah di-encode, supaya proses berikutnya tidak perlu
+    /// meng-encode ulang korpus (26 detik untuk 100 MB, dan itu dibayar setiap kali
+    /// menjalankan sweep LR atau melanjutkan training).
+    pub fn save_tokens(&self, path: &str, vocab: usize) -> std::io::Result<()> {
+        let mut f = fs::File::create(path)?;
+        f.write_all(b"ASCATOK1")?;
+        f.write_all(&(self.tokens.len() as u64).to_le_bytes())?;
+        f.write_all(&(self.train_end as u64).to_le_bytes())?;
+        f.write_all(&(self.raw_bytes as u64).to_le_bytes())?;
+        // ukuran vocab ikut disimpan: tanpa ini model akan dibangun dengan vocab 256
+        // padahal tokennya sampai 12287, dan embedding-nya salah ukuran.
+        f.write_all(&(vocab as u64).to_le_bytes())?;
+        let mut buf = Vec::with_capacity(self.tokens.len() * 4);
+        for t in self.tokens.iter() {
+            buf.extend_from_slice(&t.to_le_bytes());
+        }
+        f.write_all(&buf)
+    }
+
+    /// Ukuran vocab dari header file token, tanpa memuat seluruh tokennya.
+    pub fn vocab_of_tokens(path: &str) -> std::io::Result<usize> {
+        let buf = fs::read(path)?;
+        if buf.len() < 40 || &buf[..8] != b"ASCATOK1" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bukan file token ASCA",
+            ));
+        }
+        Ok(u64::from_le_bytes(buf[32..40].try_into().unwrap()) as usize)
+    }
+
+    pub fn load_tokens(path: &str, val_frac: f32) -> std::io::Result<Self> {
+        let buf = fs::read(path)?;
+        if buf.len() < 40 || &buf[..8] != b"ASCATOK1" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "bukan file token ASCA",
+            ));
+        }
+        let n = u64::from_le_bytes(buf[8..16].try_into().unwrap()) as usize;
+        let _train_end_saved = u64::from_le_bytes(buf[16..24].try_into().unwrap()) as usize;
+        let raw_bytes = u64::from_le_bytes(buf[24..32].try_into().unwrap()) as usize;
+        let mut tokens = Vec::with_capacity(n);
+        let mut off = 40;
+        for _ in 0..n {
+            tokens.push(u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()));
+            off += 4;
+        }
+        let train_end = ((tokens.len() as f32) * (1.0 - val_frac)) as usize;
+        Ok(Self {
+            tokens,
+            train_end,
+            raw_bytes,
+        })
+    }
+
     pub fn load(path: &str, val_frac: f32) -> std::io::Result<Self> {
         let bytes = fs::read(path)?;
         if bytes.len() < 1024 {
