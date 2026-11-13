@@ -476,6 +476,9 @@ fn cmd_bench(args: &[String]) {
         .into_iter()
         .filter(|(m, _)| want == "both" || want == *m)
         .collect();
+    // Sweep per arsitektur: menjalankan baseline dense saat hanya LR ASCA yang disapu
+    // membuang ~90% waktu (dense total-matched ~75 s per 400 langkah).
+    let only = arg(args, "--only", "both");
     for (mode, target) in modes {
         println!("\n=== pencocokan {mode} params (target {target}) ===");
         let mut a_losses = Vec::new();
@@ -487,7 +490,18 @@ fn cmd_bench(args: &[String]) {
         for &seed in seeds.iter() {
             let mut rng = Rng::new(seed);
             let mut asca = Model::new(cfg.clone(), &mut rng);
-            let (r, curve_a) = bench::run_curve("asca", &mut asca, &data, &bcfg, seed, eval_every);
+            let (a_loss, a_tps_v, curve_a) = if only == "dense" {
+                (0.0f32, 0.0f32, Vec::new())
+            } else {
+                let (r, ca) = bench::run_curve("asca", &mut asca, &data, &bcfg, seed, eval_every);
+                (r.val_loss, r.tok_per_sec, ca)
+            };
+            if only == "asca" {
+                println!("  seed {seed}: asca {a_loss:.4} ({a_tps_v:.0} tok/s)");
+                a_losses.push(a_loss);
+                a_tps.push(a_tps_v);
+                continue;
+            }
             let mut dense = dense_matched_to(
                 target,
                 cfg.vocab,
@@ -512,11 +526,11 @@ fn cmd_bench(args: &[String]) {
             }
             println!(
                 "  seed {seed}: asca {:.4} ({:.0} tok/s) | dense d_ff={} {:.4} ({:.0} tok/s)",
-                r.val_loss, r.tok_per_sec, dense.cfg.d_ff, rd.val_loss, rd.tok_per_sec
+                a_loss, a_tps_v, dense.cfg.d_ff, rd.val_loss, rd.tok_per_sec
             );
-            a_losses.push(r.val_loss);
+            a_losses.push(a_loss);
             d_losses.push(rd.val_loss);
-            a_tps.push(r.tok_per_sec);
+            a_tps.push(a_tps_v);
             d_tps.push(rd.tok_per_sec);
             dp = rd.params;
             da = rd.active_params;
