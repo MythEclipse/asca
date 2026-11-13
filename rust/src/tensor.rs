@@ -86,10 +86,7 @@ impl Mat {
                 if ap == 0.0 {
                     continue;
                 }
-                let b = other.row(p);
-                for j in 0..m {
-                    o[j] += ap * b[j];
-                }
+                crate::simd::axpy(o, ap, other.row(p));
             }
         }
         out
@@ -110,10 +107,7 @@ impl Mat {
                 if ai == 0.0 {
                     continue;
                 }
-                let o = out.row_mut(i);
-                for j in 0..n {
-                    o[j] += ai * b[j];
-                }
+                crate::simd::axpy(out.row_mut(i), ai, b);
             }
         }
         out
@@ -122,18 +116,13 @@ impl Mat {
     /// `self (rows x K) @ other^T` dengan other (cols x K) -> (rows x cols).
     pub fn matmul_t(&self, other: &Mat) -> Mat {
         assert_eq!(self.cols, other.cols, "matmul_t: dim tidak cocok");
-        let (n, k, m) = (self.rows, self.cols, other.rows);
+        let (n, m) = (self.rows, other.rows);
         let mut out = Mat::zeros(n, m);
         for i in 0..n {
             let a = self.row(i);
             let o = out.row_mut(i);
             for j in 0..m {
-                let b = other.row(j);
-                let mut s = 0.0f32;
-                for p in 0..k {
-                    s += a[p] * b[p];
-                }
-                o[j] = s;
+                o[j] = crate::simd::dot(a, other.row(j));
             }
         }
         out
@@ -192,7 +181,7 @@ pub fn rmsnorm_rows(x: &Mat, eps: f32) -> Mat {
     let cols = x.cols;
     for r in 0..x.rows {
         let row = x.row(r);
-        let ms = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+        let ms = crate::simd::dot(row, row) / cols as f32;
         let inv = 1.0 / (ms + eps).sqrt();
         let o = out.row_mut(r);
         for c in 0..cols {
@@ -208,13 +197,10 @@ pub fn rmsnorm_rows_backward(x: &Mat, dy: &Mat, eps: f32) -> Mat {
     let cols = x.cols;
     for r in 0..x.rows {
         let row = x.row(r);
-        let ms = row.iter().map(|v| v * v).sum::<f32>() / cols as f32;
+        let ms = crate::simd::dot(row, row) / cols as f32;
         let inv = 1.0 / (ms + eps).sqrt();
         let dyr = dy.row(r);
-        let mut mean = 0.0f32;
-        for c in 0..cols {
-            mean += dyr[c] * row[c] * inv;
-        }
+        let mut mean = crate::simd::dot(dyr, row) * inv;
         mean /= cols as f32;
         let dxr = dx.row_mut(r);
         for c in 0..cols {

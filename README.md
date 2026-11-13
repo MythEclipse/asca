@@ -57,14 +57,15 @@ claimed yet**. The earlier "ASCA wins by 0.24" is retracted.
 
 What *is* measured is cost, and it keeps moving as the engine improves. After a 3.08×
 CPU optimisation pass and cross-sequence batching (see [`docs/PERF.md`](docs/PERF.md)),
-ASCA trains **3.33× faster** at matched total parameters (20,410 vs 6,130 tok/s) and at
-matched active parameters the two are **at parity** (20,320 vs 21,493 tok/s, ratio 0.95).
+ASCA trains **5.42× faster** at matched total parameters (32,174 vs 5,933 tok/s) and
+**1.59× faster** at matched active parameters (33,844 vs 21,219 tok/s).
 
-Two earlier throughput claims are retracted: "ASCA is 2× slower at matched active
-parameters" (unoptimised code) and "ASCA is 1.26× faster at matched active parameters"
-(measured before batching — batching plus GPU offload lifted the dense baseline by 31%
-and left ASCA flat, because ASCA's cost is per-token MoE buckets and the delta scan,
-while dense's cost is large GEMMs that benefit from 512-row batches).
+Throughput ratios have moved a lot as the engine improved, and every earlier figure is
+superseded: "ASCA is 2× slower at matched active parameters" (unoptimised code), then
+"1.26× faster" (before batching), then "at parity" (before SIMD). The latest is 1.59×.
+The lesson is recorded in `docs/PERF.md`: a ratio measured before a shared optimisation
+is not a result. Note also that GPU offload partly *masks* CPU gains on the dense
+baseline, so optimising only one path flatters the other.
 
 What survives as an ASCA advantage on this axis is **decode state**: 2,048 floats that
 do not grow with context, versus 32,768 for the dense KV cache (262,144 at context

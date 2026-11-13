@@ -135,9 +135,7 @@ impl HashMoe {
                         continue;
                     }
                     let prow = &mut pre[t * d_ff..(t + 1) * d_ff];
-                    for j in 0..d_ff {
-                        prow[j] += xc * w1row[j];
-                    }
+                    crate::simd::axpy(prow, xc, w1row);
                 }
             }
             for &t in rows.iter() {
@@ -157,9 +155,7 @@ impl HashMoe {
                         continue;
                     }
                     let orow = out.row_mut(t);
-                    for c in 0..d {
-                        orow[c] += hj * w2row[c];
-                    }
+                    crate::simd::axpy(orow, hj, w2row);
                 }
             }
         }
@@ -195,10 +191,7 @@ impl HashMoe {
                     if hj == 0.0 {
                         continue;
                     }
-                    let dr = dout.row(t);
-                    for c in 0..d {
-                        g2row[c] += hj * dr[c];
-                    }
+                    crate::simd::axpy(g2row, hj, dout.row(t));
                 }
             }
             for &t in rows.iter() {
@@ -211,12 +204,7 @@ impl HashMoe {
             for j in 0..d_ff {
                 let w2row = self.w2.value.row(e * d_ff + j);
                 for &t in rows.iter() {
-                    let dr = dout.row(t);
-                    let mut acc = 0.0f32;
-                    for c in 0..d {
-                        acc += dr[c] * w2row[c];
-                    }
-                    dpre[t * d_ff + j] = acc;
+                    dpre[t * d_ff + j] = crate::simd::dot(dout.row(t), w2row);
                 }
             }
             for &t in rows.iter() {
@@ -237,18 +225,12 @@ impl HashMoe {
                         continue;
                     }
                     let drow = &dpre[t * d_ff..(t + 1) * d_ff];
-                    for j in 0..d_ff {
-                        g1row[j] += xc * drow[j];
-                    }
+                    crate::simd::axpy(g1row, xc, drow);
                 }
                 let w1row = &self.w1.value.row(c)[e * d_ff..(e + 1) * d_ff];
                 for &t in rows.iter() {
                     let drow = &dpre[t * d_ff..(t + 1) * d_ff];
-                    let mut acc = 0.0f32;
-                    for j in 0..d_ff {
-                        acc += drow[j] * w1row[j];
-                    }
-                    dxn.row_mut(t)[c] += acc;
+                    dxn.row_mut(t)[c] += crate::simd::dot(drow, w1row);
                 }
             }
         }

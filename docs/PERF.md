@@ -156,6 +156,42 @@ arsitektur mendapat batching dan offload GPU, throughput-nya **setara** (selisih
 Keunggulan ASCA yang tersisa pada mode ini adalah **state decode** (2.048 float konstan
 vs 32.768 yang tumbuh O(T)), bukan kecepatan training.
 
+## Kernel SIMD AVX2/FMA (`src/simd.rs`)
+
+Loop terdalam sebelumnya skalar. Sekarang ada kernel AVX2+FMA untuk `axpy`, `dot`,
+`scale`, `scale_axpy`, dan `axpy2`, dengan deteksi fitur saat runtime (`is_x86_feature_detected!`,
+std saja) sehingga binary yang sama tetap jalan di mesin tanpa AVX2 lewat jalur skalar.
+Dua unit test membandingkan jalur AVX2 dengan jalur skalar untuk panjang 0, 1, 7, 8, 9, 33,
+dan 128.
+
+Dipasang di: `Mat::matmul`, `Mat::matmul_ta`, `Mat::matmul_t`, `rmsnorm_rows` (+backward),
+loop MoE forward/backward, scan delta forward/backward, dan backward attention dense.
+
+Hasil (400 langkah, 3 seed, lr 6e-3, `ASCA_GPU_MIN=4e6`):
+
+| model | sebelum SIMD | sesudah SIMD | perubahan |
+|---|---|---|---|
+| ASCA (total) | 20.410 tok/s | **32.174 tok/s** | **+58%** |
+| ASCA (active) | 20.320 tok/s | **33.844 tok/s** | **+67%** |
+| dense d_ff=1024 | 6.130 tok/s | 5.933 tok/s | ~0% |
+| dense d_ff=128 | 21.493 tok/s | 21.219 tok/s | ~0% |
+
+Loss **tidak berubah sama sekali** (1,7343 / 1,9762 / 1,9778), jadi ini murni kecepatan.
+
+### Kenapa dense tidak ikut naik
+
+Karena matmul dense sudah dilempar ke GPU (512×64×128 = 4,2e6 sudah di atas ambang 4e6),
+sehingga perbaikan matmul CPU tidak menyentuhnya. ASCA tidak bisa begitu: biayanya ada di
+kerja **per-token** (bucket MoE, scan delta) yang tidak punya bentuk GEMM besar untuk
+di-offload, jadi vektorisasi CPU langsung terasa. Ini juga menjelaskan kenapa offload GPU
+sebagian **menutupi** perbaikan CPU pada baseline — kalau hanya salah satu jalur yang
+dioptimasi, rasionya menyesatkan.
+
+| pencocokan | ASCA | dense | rasio |
+|---|---|---|---|
+| total params 331k | 32.174 tok/s | 5.933 tok/s | **5,42×** |
+| active params 99k | 33.844 tok/s | 21.219 tok/s | **1,59×** |
+
 ## Yang belum dikerjakan
 
 1. ~~Batch lintas sekuens~~ **selesai** — lihat bagian di atas; hasilnya netral untuk

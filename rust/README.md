@@ -87,15 +87,19 @@ Result (TinyStories bytes, 3 seeds). Short run first, then the long one that cor
 
 | tokens | matching | ASCA val loss | dense val loss | Δ | ASCA tok/s | dense tok/s |
 |---|---|---|---|---|---|---|
-| 205k | total (331k) | 1.735 | 1.976 | −0.242 | **20,410** | 6,130 |
-| 205k | active (99k) | 1.735 | 1.978 | −0.244 | **20,320** | 21,493 |
+| 205k | total (331k) | 1.735 | 1.976 | −0.242 | **32,174** | 5,933 |
+| 205k | active (99k) | 1.735 | 1.978 | −0.244 | **33,844** | 21,219 |
 | 1.02M | total (331k) | 1.297 | 1.369 | **−0.072** | 6,580¹ | 3,973¹ |
 
 The advantage **shrinks 69%** between 128k and 1M tokens and is **not significant** at
-1M (t = −4.0, df 2, p ≈ 0.058). What holds: at matched total params ASCA trains 3.33×
-faster, while at matched active params the two are at parity (0.95×). Its decode state
+1M (t = −4.0, df 2, p ≈ 0.058). What holds: at matched total params ASCA trains 5.42×
+faster, and 1.59× at matched active params. Its decode state
 is 2,048 floats constant versus 32,768 growing with context. Throughput figures are
 post-optimisation and post-batching — see `../docs/PERF.md`.
+
+Inner loops use hand-written AVX2/FMA kernels (`src/simd.rs`, runtime feature detection,
+scalar fallback). This is worth +58% end-to-end for ASCA and ~0% for the dense baseline,
+whose matmuls are already offloaded to the GPU.
 
 Batching (`batch` sequences stacked into one `B*T` row block) is verified by
 `tests/batch_parity.rs`: one `batch=4` forward/backward matches four `batch=1` passes to
