@@ -24,6 +24,7 @@ fn main() {
         "sample" => cmd_sample(&args),
         "inspect" => cmd_inspect(&args),
         "bench" => cmd_bench(&args),
+        "gpu" => cmd_gpu(&args),
         _ => {
             println!("asca — ASCA v2 (tanpa attention, state konstan, Rust murni)");
             println!("pakai:");
@@ -154,6 +155,195 @@ fn cmd_sample(args: &[String]) {
         }
     }
     println!();
+}
+
+fn cmd_gpu(args: &[String]) {
+    use asca_rs::cuda;
+    use asca_rs::tensor::{Mat, Rng};
+
+    println!("{}", cuda::describe());
+    if !cuda::available() {
+        println!("tidak ada backend GPU; selesai.");
+        return;
+    }
+    println!("kernel terdaftar: {:?}", cuda::KERNELS);
+
+    // --- paritas terhadap CPU
+    let mut rng = Rng::new(7);
+    let mut worst: f32 = 0.0;
+    for (m, k, n) in [(64, 64, 192), (128, 64, 512), (37, 53, 91), (256, 256, 256)] {
+        let mut a = Mat::zeros(m, k);
+        a.fill_rand(&mut rng, 0.1);
+        let mut b = Mat::zeros(k, n);
+        b.fill_rand(&mut rng, 0.1);
+        cuda::set_enabled(false);
+        let cpu = a.matmul(&b);
+        cuda::set_enabled(true);
+        let g = cuda::gpu().unwrap();
+        let gpu_out = g.matmul(&a, &b).expect("matmul GPU gagal");
+        let mut err = 0.0f32;
+        let mut scale = 1e-9f32;
+        for i in 0..cpu.d.len() {
+            err = err.max((cpu.d[i] - gpu_out.d[i]).abs());
+            scale = scale.max(cpu.d[i].abs());
+        }
+        let rel = err / scale;
+        worst = worst.max(rel);
+        println!("  matmul {m}x{k}@{k}x{n}: galat maks {err:.3e} (relatif {rel:.3e})");
+
+        // transpose-A: C = A^T @ B dengan A disimpan (K,M) dan B (K,N) -> C (M,N)
+        let mut at = Mat::zeros(k, m);
+        at.fill_rand(&mut rng, 0.1);
+        let mut b2 = Mat::zeros(k, n);
+        b2.fill_rand(&mut rng, 0.1);
+        cuda::set_enabled(false);
+        let cpu_ta = at.transpose().matmul(&b2);
+        cuda::set_enabled(true);
+        let gpu_ta = g.matmul_ta(&at, &b2).expect("matmul_ta gagal");
+        let mut e2 = 0.0f32;
+        let mut s2 = 1e-9f32;
+        for i in 0..cpu_ta.d.len() {
+            e2 = e2.max((cpu_ta.d[i] - gpu_ta.d[i]).abs());
+            s2 = s2.max(cpu_ta.d[i].abs());
+        }
+        println!(
+            "  matmul_ta {k}x{m}^T@{k}x{n}: galat maks {e2:.3e} (relatif {:.3e})",
+            e2 / s2
+        );
+        worst = worst.max(e2 / s2);
+    }
+    println!("galat relatif terburuk: {worst:.3e}");
+
+    // --- paritas kernel delta rule terhadap referensi CPU
+    {
+        let (t_len, h, dh) = (24usize, 4usize, 16usize);
+        let d = h * dh;
+        let mut q = Mat::zeros(t_len, d);
+        q.fill_rand(&mut rng, 1.0);
+        let mut k = Mat::zeros(t_len, d);
+        k.fill_rand(&mut rng, 1.0);
+        let mut v = Mat::zeros(t_len, d);
+        v.fill_rand(&mut rng, 0.5);
+        // normalisasi L2 per head seperti di DeltaBlock
+        for r in 0..t_len {
+            for hh in 0..h {
+                for mtx in [&mut q, &mut k] {
+                    let row = mtx.row_mut(r);
+                    let mut n2 = 0.0f32;
+                    for c in 0..dh {
+                        n2 += row[hh * dh + c] * row[hh * dh + c];
+                    }
+                    let inv = 1.0 / n2.sqrt().max(1e-12);
+                    for c in 0..dh {
+                        row[hh * dh + c] *= inv;
+                    }
+                }
+            }
+        }
+        let alpha: Vec<f32> = (0..t_len * h).map(|_| 0.85 + 0.1 * rng.uniform()).collect();
+        let beta: Vec<f32> = (0..t_len * h).map(|_| 0.7 + 0.2 * rng.uniform()).collect();
+        // referensi CPU
+        let mut cpu_out = Mat::zeros(t_len, d);
+        let mut state = vec![0.0f32; h * dh * dh];
+        for t in 0..t_len {
+            for hh in 0..h {
+                let off = hh * dh;
+                let a = alpha[t * h + hh];
+                let b = beta[t * h + hh];
+                let mut sk = vec![0.0f32; dh];
+                for i in 0..dh {
+                    let mut acc = 0.0f32;
+                    for a2 in 0..dh {
+                        acc += state[hh * dh * dh + a2 * dh + i] * k.at(t, off + a2);
+                    }
+                    sk[i] = acc;
+                }
+                let mut u = vec![0.0f32; dh];
+                for i in 0..dh {
+                    u[i] = b * (v.at(t, off + i) - a * sk[i]);
+                }
+                for a2 in 0..dh {
+                    for i in 0..dh {
+                        let idx = hh * dh * dh + a2 * dh + i;
+                        state[idx] = a * state[idx] + k.at(t, off + a2) * u[i];
+                    }
+                }
+                for i in 0..dh {
+                    let mut acc = 0.0f32;
+                    for a2 in 0..dh {
+                        acc += state[hh * dh * dh + a2 * dh + i] * q.at(t, off + a2);
+                    }
+                    cpu_out.set(t, off + i, acc);
+                }
+            }
+        }
+        let gpu_out = cuda::gpu()
+            .unwrap()
+            .delta_fwd(&q, &k, &v, &alpha, &beta, t_len, h, dh)
+            .expect("delta_fwd gagal");
+        let mut e = 0.0f32;
+        let mut sc = 1e-9f32;
+        for i in 0..cpu_out.d.len() {
+            e = e.max((cpu_out.d[i] - gpu_out.d[i]).abs());
+            sc = sc.max(cpu_out.d[i].abs());
+        }
+        println!(
+            "  delta_fwd T={t_len} H={h} dh={dh}: galat maks {e:.3e} (relatif {:.3e})",
+            e / sc
+        );
+    }
+
+    // --- benchmark
+    let sizes: Vec<(usize, usize, usize)> = arg(
+        args,
+        "--sizes",
+        "128x64x192,512x64x1024,1024x1024x1024,4096x1024x1024",
+    )
+    .split(',')
+    .filter_map(|s| {
+        let p: Vec<usize> = s.split('x').filter_map(|x| x.trim().parse().ok()).collect();
+        if p.len() == 3 {
+            Some((p[0], p[1], p[2]))
+        } else {
+            None
+        }
+    })
+    .collect();
+    println!("\n| M | K | N | CPU ms | GPU ms | CPU GFLOPS | GPU GFLOPS | speedup |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for (m, k, n) in sizes {
+        let mut a = Mat::zeros(m, k);
+        a.fill_rand(&mut rng, 0.1);
+        let mut b = Mat::zeros(k, n);
+        b.fill_rand(&mut rng, 0.1);
+        let reps = if m * k * n > 100_000_000 { 3 } else { 20 };
+
+        cuda::set_enabled(false);
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(a.matmul(&b));
+        }
+        let cpu_s = t0.elapsed().as_secs_f32() / reps as f32;
+
+        let g = cuda::gpu().unwrap();
+        let _ = g.matmul(&a, &b);
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps {
+            std::hint::black_box(g.matmul(&a, &b).unwrap());
+        }
+        let gpu_s = t1.elapsed().as_secs_f32() / reps as f32;
+        cuda::set_enabled(true);
+
+        let flops = 2.0 * (m * k * n) as f64;
+        println!(
+            "| {m} | {k} | {n} | {:.3} | {:.3} | {:.1} | {:.1} | {:.2}x |",
+            cpu_s * 1e3,
+            gpu_s * 1e3,
+            flops / cpu_s as f64 / 1e9,
+            flops / gpu_s as f64 / 1e9,
+            cpu_s / gpu_s
+        );
+    }
 }
 
 fn cmd_bench(args: &[String]) {

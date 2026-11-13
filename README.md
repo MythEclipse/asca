@@ -62,9 +62,18 @@ compute and memory efficiency through adaptive and sparse mechanisms.
 > information. Fixing it shrank the gap from −0.35 to −0.24. **When the baseline loses,
 > audit the baseline first.** Full detail in [`docs/RESULTS_V2.md`](docs/RESULTS_V2.md).
 >
-> Still open: 2–4M token runs with 5+ seeds (does the residual −0.07 survive?), a
-> long-range recall test (where attention should win), and CUDA kernels — absolute tok/s
-> here is CPU scalar code and means nothing outside this crate. The v1 research record
+> **CUDA kernels are written and verified** (tiled GEMM, transposed-A GEMM, RMSNorm fwd/bwd,
+> elementwise, and the delta-rule scan as one block per head with the whole time loop
+> inside the kernel). Parity with CPU is ≤ 2.6e-7 relative and training loss is identical;
+> GEMM is **20.5× faster** at 4096×1024×1024. It does **not** speed up training yet —
+> 6,856 tok/s CPU vs 6,829 tok/s GPU — because a step is 74.7 ms while its matmuls are
+> only ~13 ms (~18%); the rest is elementwise work, the delta scan, and one H2D/D2H copy
+> plus sync per op. See [`docs/CUDA.md`](docs/CUDA.md) for the measurements and the fix
+> list.
+>
+> Still open: 2–4M token runs with 5+ seeds (does the residual −0.07 survive?) and a
+> long-range recall test (where attention should win). Absolute tok/s here is scalar CPU
+> code and means nothing outside this crate. The v1 research record
 > follows below.
 >
 > **Status: v0.8 — the earlier negative result is retracted; it was mostly a learning-rate artifact.**

@@ -101,12 +101,36 @@ to pick the parameter matching.
 
 See `../docs/RESULTS_V2.md` for the full protocol and caveats.
 
+## GPU (optional)
+
+`build.rs` compiles `kernels/asca.cu` with `nvcc` into PTX and embeds it; the driver API
+is bound directly, no crates. Without `nvcc` the crate still builds and the CPU path
+runs. Kernels: tiled GEMM (normal and transposed-A), add_bias, axpy, scale, RMSNorm
+(forward and backward), and the delta-rule scan (one block per head, state in shared
+memory, whole time loop inside the kernel).
+
+```bash
+./target/release/asca gpu                    # parity + GEMM benchmark
+ASCA_GPU=0 ./target/release/asca train ...   # force the CPU path
+ASCA_CUDA_ARCH=sm_90 cargo build --release   # other architecture
+```
+
+Parity against CPU: GEMM and delta_fwd both ≤ 2.6e-7 relative, and training loss is
+identical. GEMM speedup: 0.97× at 128×64×192 (copy overhead), **4.1×** at 512×64×1024,
+**20.5×** at 4096×1024×1024.
+
+**It does not speed up training yet**: 6,856 tok/s (CPU) vs 6,829 tok/s (GPU) on ASCA.
+One step is 74.7 ms while the matmuls in it are only ~13 ms (~18%) — the rest is
+RMSNorm, elementwise work, the delta scan and per-op allocations, and every call pays a
+full H2D/D2H copy plus a sync. `docs/CUDA.md` has the measurements and the fix list
+(device-resident tensors, fused elementwise, cross-sequence batching, GPU delta backward).
+
 ## Not done yet
 
 - No loss-vs-tokens curve out to millions of tokens; dense may catch up.
 - No long-range recall test (where attention usually beats a compressed state).
-- No CUDA kernels; matmuls are naive scalar loops, so absolute tok/s means nothing
-  outside this crate.
+- GPU kernels exist and are verified, but per-op offload gives no end-to-end speedup
+  yet; tensors still live on the host. Absolute tok/s means nothing outside this crate.
 - Only 3 seeds; a strong claim needs 5+ and a measured noise floor.
 - `w_gate` / `b_gate` receive very small gradients (scale 4.6e-4 vs 1.3e0 for
   `b_qkv`); whether the gates actually learn needs checking.

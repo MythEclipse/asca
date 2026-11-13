@@ -65,6 +65,16 @@ impl Mat {
 
     /// `self (rows x K) @ other (K x cols) -> (rows x cols)`.
     pub fn matmul(&self, other: &Mat) -> Mat {
+        // Jalur GPU hanya dipakai kalau ukurannya cukup besar; di bawah ambang itu
+        // biaya salin H2D/D2H melebihi matmul CPU-nya sendiri.
+        if crate::cuda::available() && crate::cuda::worth_offload(self.rows, self.cols, other.cols)
+        {
+            if let Some(g) = crate::cuda::gpu() {
+                if let Ok(out) = g.matmul(self, other) {
+                    return out;
+                }
+            }
+        }
         assert_eq!(self.cols, other.rows, "matmul: inner dim tidak cocok");
         let (n, k, m) = (self.rows, self.cols, other.cols);
         let mut out = Mat::zeros(n, m);

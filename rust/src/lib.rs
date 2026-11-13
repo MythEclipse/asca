@@ -4,6 +4,7 @@
 //! (Mat, Param, Rng, RMSNorm identik) supaya perbandingan efisiensi sah.
 
 pub mod bench;
+pub mod cuda;
 pub mod delta;
 pub mod dense;
 pub mod model;
