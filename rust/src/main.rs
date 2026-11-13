@@ -175,6 +175,7 @@ fn cmd_bench(args: &[String]) {
         .split(',')
         .map(|s| s.trim().parse().unwrap())
         .collect();
+    let eval_every: usize = arg(args, "--eval-curve", "0").parse().unwrap();
     let data = Data::load(&data_path, 0.05).expect("gagal baca data");
     println!(
         "bench: steps {} seq {} batch {} lr {} seeds {:?}",
@@ -193,7 +194,12 @@ fn cmd_bench(args: &[String]) {
     );
 
     // Dua perbandingan yang sah: total params sama, dan active params sama.
-    for (mode, target) in [("total", asca_total), ("active", asca_active)] {
+    let want = arg(args, "--match", "both");
+    let modes: Vec<(&str, usize)> = [("total", asca_total), ("active", asca_active)]
+        .into_iter()
+        .filter(|(m, _)| want == "both" || want == *m)
+        .collect();
+    for (mode, target) in modes {
         println!("\n=== pencocokan {mode} params (target {target}) ===");
         let mut a_losses = Vec::new();
         let mut d_losses = Vec::new();
@@ -204,7 +210,7 @@ fn cmd_bench(args: &[String]) {
         for &seed in seeds.iter() {
             let mut rng = Rng::new(seed);
             let mut asca = Model::new(cfg.clone(), &mut rng);
-            let r = bench::run("asca", &mut asca, &data, &bcfg, seed);
+            let (r, curve_a) = bench::run_curve("asca", &mut asca, &data, &bcfg, seed, eval_every);
             let mut dense = dense_matched_to(
                 target,
                 cfg.vocab,
@@ -213,7 +219,13 @@ fn cmd_bench(args: &[String]) {
                 cfg.n_layers,
                 seed ^ 0x5eed,
             );
-            let rd = bench::run("dense", &mut dense, &data, &bcfg, seed);
+            let (rd, curve_d) = bench::run_curve("dense", &mut dense, &data, &bcfg, seed, eval_every);
+            if eval_every > 0 {
+                println!("    kurva (token, asca, dense):");
+                for ((tok, la), (_, ld)) in curve_a.iter().zip(curve_d.iter()) {
+                    println!("      {:>8}  {:.4}  {:.4}  delta {:+.4}", tok, la, ld, la - ld);
+                }
+            }
             println!(
                 "  seed {seed}: asca {:.4} ({:.0} tok/s) | dense d_ff={} {:.4} ({:.0} tok/s)",
                 r.val_loss, r.tok_per_sec, dense.cfg.d_ff, rd.val_loss, rd.tok_per_sec

@@ -115,9 +115,25 @@ pub fn run<T: Trainable>(
     cfg: &BenchCfg,
     seed: u64,
 ) -> BenchResult {
+    run_curve(label, model, data, cfg, seed, 0).0
+}
+
+/// Seperti [`run`], tetapi juga mencatat `(token_terlihat, val_loss)` tiap
+/// `eval_every_steps` langkah. Dipakai untuk kurva loss vs token: satu-satunya cara
+/// tahu apakah keunggulan bertahan atau hanya efek awal training.
+pub fn run_curve<T: Trainable>(
+    label: &str,
+    model: &mut T,
+    data: &Data,
+    cfg: &BenchCfg,
+    seed: u64,
+    eval_every_steps: usize,
+) -> (BenchResult, Vec<(usize, f32)>) {
+    let mut curve: Vec<(usize, f32)> = Vec::new();
     let mut rng = Rng::new(seed);
     let mut opt = AdamW::new(cfg.lr);
     let t0 = std::time::Instant::now();
+    let mut eval_rng = Rng::new(seed ^ 0xE7A1);
     for step_i in 0..cfg.steps {
         opt.lr = lr_at(step_i, cfg);
         model.zero_grads();
@@ -134,6 +150,17 @@ pub fn run<T: Trainable>(
         for p in model.params_mut() {
             opt.update(p);
         }
+        if eval_every_steps > 0 && (step_i + 1) % eval_every_steps == 0 {
+            let mut vl = 0.0f32;
+            for _ in 0..cfg.eval_batches {
+                let (ids, tgts) = data.batch(&mut eval_rng, cfg.seq_len, Split::Val);
+                model.zero_grads();
+                vl += model.forward_backward(&ids, &tgts);
+            }
+            model.zero_grads();
+            let seen = (step_i + 1) * cfg.batch * cfg.seq_len;
+            curve.push((seen, vl / cfg.eval_batches as f32));
+        }
     }
     let seconds = t0.elapsed().as_secs_f32();
     let tokens = (cfg.steps * cfg.batch * cfg.seq_len) as f32;
@@ -148,7 +175,7 @@ pub fn run<T: Trainable>(
     model.zero_grads();
     vl /= cfg.eval_batches as f32;
 
-    BenchResult {
+    let res = BenchResult {
         label: label.to_string(),
         params: model.num_params(),
         active_params: model.active_params(),
@@ -156,7 +183,8 @@ pub fn run<T: Trainable>(
         val_loss: vl,
         tok_per_sec: tokens / seconds.max(1e-6),
         seconds,
-    }
+    };
+    (res, curve)
 }
 
 pub fn mean_std(xs: &[f32]) -> (f32, f32) {

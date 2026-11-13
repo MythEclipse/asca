@@ -83,18 +83,23 @@ attention. Its gradients are verified by finite differences too
     --seq-len 128 --lr 6e-3 --seeds 0,1,2
 ```
 
-Result (TinyStories bytes, 400 steps × 4 × 128 = 205k tokens, 3 seeds):
+Result (TinyStories bytes, 3 seeds). Short run first, then the long one that corrects it:
 
-| matching | ASCA val loss | dense val loss | ASCA tok/s | dense tok/s |
-|---|---|---|---|---|
-| total params (331k) | **1.735** | 1.976 | 6,810 | 4,243 |
-| active params (99k) | **1.735** | 1.978 | 7,019 | 14,529 |
+| tokens | matching | ASCA val loss | dense val loss | Δ | ASCA tok/s | dense tok/s |
+|---|---|---|---|---|---|---|
+| 205k | total (331k) | 1.735 | 1.976 | −0.242 | 6,810 | 4,243 |
+| 205k | active (99k) | 1.735 | 1.978 | −0.244 | 7,019 | 14,529 |
+| 1.02M | total (331k) | 1.297 | 1.369 | **−0.072** | 6,580 | 3,973 |
 
-Decode state at context 128: 2,048 floats constant (ASCA) vs 32,768 growing with
-context (dense KV cache).
+The advantage **shrinks 69%** between 128k and 1M tokens and is **not significant** at
+1M (t = −4.0, df 2, p ≈ 0.058). What holds: at matched total params ASCA trains 1.66×
+faster and its decode state is 2,048 floats constant, versus 32,768 growing with
+context.
 
-See `../docs/RESULTS_V2.md` for the caveats — this is a small-scale result, not an
-architecture claim.
+Use `--eval-curve N` to record the loss curve every N steps and `--match total|active|both`
+to pick the parameter matching.
+
+See `../docs/RESULTS_V2.md` for the full protocol and caveats.
 
 ## Not done yet
 

@@ -58,6 +58,47 @@ State decode pada konteks 128: **ASCA 2.048 float (konstan)** vs **dense 32.768 
   ASCA yang hanya 99k aktif (hash-MoE tetap harus menyimpan semua expert).
 - Kedua LR memberi kesimpulan sama, jadi hasilnya tidak bergantung pada satu titik LR.
 
+## 3b. Kurva loss vs token (1,024M token, 3 seed) — MENGOREKSI §3
+
+Uji ini dijalankan karena hasil §3 (205k token) belum bisa dipercaya: keunggulan di awal
+training sering hanya efek inisialisasi/induksi, bukan sifat arsitektur.
+
+Protokol: 2000 langkah × batch 4 × seq 128 = 1.024.000 token, lr 6e-3, 3 seed,
+pencocokan total params (331k), evaluasi tiap 250 langkah pada set validasi yang sama.
+
+| token | ASCA | dense | Δ (asca−dense) | t (df=2) |
+|---|---|---|---|---|
+| 128.000 | 1,8448 | 2,0776 | **−0,2328 ± 0,0310** | −13,02 |
+| 256.000 | 1,7267 | 1,9038 | −0,1771 ± 0,0436 | −7,04 |
+| 384.000 | 1,5905 | 1,6941 | −0,1036 ± 0,0777 | −2,31 |
+| 512.000 | 1,4990 | 1,5743 | −0,0753 ± 0,0460 | −2,84 |
+| 640.000 | 1,4534 | 1,5231 | −0,0697 ± 0,0232 | −5,21 |
+| 768.000 | 1,4101 | 1,4893 | −0,0792 ± 0,0243 | −5,64 |
+| 896.000 | 1,2796 | 1,3296 | −0,0499 ± 0,0449 | −1,92 |
+| 1.024.000 | **1,2968 ± 0,0871** | **1,3685 ± 0,0600** | **−0,0720 ± 0,0315** | −3,96 |
+
+Throughput pada run yang sama: ASCA **6.580 tok/s**, dense **3.973 tok/s** (1,66×).
+
+### Yang berubah dari §3
+
+Keunggulan **menyusut 69%**, dari −0,233 pada 128k token menjadi −0,072 pada 1M token.
+Sebagian besar selisih yang terlihat pada 205k token (Δ −0,24) adalah **efek awal
+training**, bukan keunggulan arsitektur yang stabil.
+
+Setelah ~512k token selisihnya relatif datar di kisaran −0,05 s/d −0,08 dan **belum ada
+crossover** sampai 1M token. Tapi dengan 3 seed, t = −3,96 (df=2) berarti **p ≈ 0,058 —
+belum signifikan pada α = 0,05**. Jadi pada 1M token pun belum bisa diklaim ASCA lebih
+baik secara kualitas.
+
+### Bacaan yang jujur
+
+1. Klaim "ASCA menang kualitas ~0,24" dari §3 **dicabut**. Yang benar: pada 205k token
+   selisihnya −0,24, dan itu menyusut menjadi −0,07 pada 1M token.
+2. **Keunggulan efisiensi tidak terpengaruh** dan tetap terukur: 1,66× lebih cepat pada
+   total params sama, state decode 2.048 float konstan vs 32.768 yang tumbuh O(T).
+3. **Belum tahu** apakah sisa selisih −0,07 bertahan, mengecil ke nol, atau berbalik.
+   Itu butuh 2–4M token dan ≥5 seed.
+
 ## 4. Bug yang hampir membuat klaim palsu
 
 Percobaan pertama memberi Δ −0,35 (lebih besar). Setelah diperiksa, baseline dense
@@ -82,11 +123,14 @@ Angka yang menguntungkan diri sendiri harus dicurigai lebih dulu.
    absolut tidak bisa dibandingkan dengan apa pun di luar crate ini.
 5. **Belum diuji pada task yang butuh recall jarak jauh** — di situ attention
    biasanya menang dan state terkompresi kalah.
-6. **Hanya 3 seed.** Untuk klaim kuat butuh ≥5 seed dan noise floor terukur.
+6. **Hanya 3 seed**, dan pada 1M token p ≈ 0,058 — belum signifikan.
+7. **Belum ada crossover test sampai 2–4M token.** Kurva 128k→1M menunjukkan penyusutan
+   69%, jadi arah trennya belum jelas apakah berhenti di −0,07 atau terus mengecil.
 
 ## 6. Langkah berikutnya (berurutan)
 
-1. Kurva loss vs token 205k → 2M untuk kedua arsitektur, 3 seed.
+1. ~~Kurva loss vs token 205k → 2M~~ **sudah sampai 1M** (§3b). Lanjutkan ke 2–4M token
+   dengan ≥5 seed untuk melihat apakah sisa selisih −0,07 bertahan atau hilang.
 2. Task recall jarak jauh (copy/associative recall sintetis) sebagai uji batas.
 3. Kernel CUDA untuk delta block + matmul, lalu ukur ulang tok/s.
 4. Setelah itu baru boleh bicara keunggulan.

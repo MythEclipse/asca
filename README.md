@@ -37,31 +37,36 @@ compute and memory efficiency through adaptive and sparse mechanisms.
 > reaches **val loss 1.379 / ppl 3.97** in 614k tokens. See
 > [`docs/SPEC_V2.md`](docs/SPEC_V2.md) and [`rust/`](rust/README.md).
 >
-> **First same-engine comparison is in** (`asca bench`, both models in this crate, same
-> matmul, optimizer, data, seeds; TinyStories bytes, 400 steps × batch 4 × seq 128,
-> 3 seeds, two learning rates):
+> **Same-engine comparison, and the honest curve.** Both models live in this crate with
+> the same matmul, optimizer, data, seeds and flags (TinyStories bytes, 3 seeds). At
+> 205k tokens ASCA looked clearly ahead (Δ −0.24 at matched total params). A longer run
+> shows most of that was an early-training effect:
 >
-> | matching | ASCA val loss | dense val loss | Δ | ASCA tok/s | dense tok/s |
-> |---|---|---|---|---|---|
-> | total params (331k) | **1.735** | 1.976 | **−0.242** | 6,810 | 4,243 |
-> | active params (99k) | **1.735** | 1.978 | **−0.244** | 7,019 | 14,529 |
+> | tokens | ASCA val loss | dense val loss | Δ | t (df=2) |
+> |---|---|---|---|---|
+> | 128k | 1.845 | 2.078 | **−0.233 ± 0.031** | −13.0 |
+> | 384k | 1.591 | 1.694 | −0.104 ± 0.078 | −2.3 |
+> | 512k | 1.499 | 1.574 | −0.075 ± 0.046 | −2.8 |
+> | 1.024M | **1.297 ± 0.087** | **1.369 ± 0.060** | **−0.072 ± 0.032** | −4.0 |
 >
-> (lr 6e-3; lr 3e-3 gives the same picture, Δ −0.235 / −0.259.) At equal **total**
-> parameters ASCA wins on quality *and* is **1.6× faster**, with a decode state of
-> **2,048 floats that does not grow with context** versus 32,768 for the dense KV cache.
-> At equal **active** parameters ASCA still wins on quality but is **2× slower**.
+> The gap **shrinks 69%** and flattens around −0.05…−0.08 with **no crossover up to 1M
+> tokens** — but t = −4.0 with 3 seeds is p ≈ 0.058, so **no quality advantage can be
+> claimed yet**. The earlier "ASCA wins by 0.24" is retracted.
 >
-> A bug in the baseline nearly made this look better than it is: `rope_apply` rotated
-> only the first head's slice, so 3 of 4 heads had no positional information at all.
-> Fixing it shrank the gap from −0.35 to −0.24. **When the baseline loses, check the
-> baseline first.**
+> What *is* measured and stable: at matched total parameters ASCA trains **1.66× faster**
+> (6,580 vs 3,973 tok/s) with a decode state of **2,048 floats that does not grow with
+> context**, versus 32,768 for the dense KV cache.
 >
-> **This is not yet an architecture claim.** 331k params, 205k tokens, context 128 —
-> v1 was fooled at exactly this scale (synthetic said "wins", real text said "loses").
-> Still missing: a loss-vs-tokens curve out to millions of tokens, a long-range recall
-> test, more seeds, and CUDA kernels. Full detail in
-> [`docs/RESULTS_V2.md`](docs/RESULTS_V2.md); v1 research record follows below.
-
+> A bug in the baseline nearly made the first number look better than it was:
+> `rope_apply` rotated only the first head's slice, so 3 of 4 heads had no positional
+> information. Fixing it shrank the gap from −0.35 to −0.24. **When the baseline loses,
+> audit the baseline first.** Full detail in [`docs/RESULTS_V2.md`](docs/RESULTS_V2.md).
+>
+> Still open: 2–4M token runs with 5+ seeds (does the residual −0.07 survive?), a
+> long-range recall test (where attention should win), and CUDA kernels — absolute tok/s
+> here is CPU scalar code and means nothing outside this crate. The v1 research record
+> follows below.
+>
 > **Status: v0.8 — the earlier negative result is retracted; it was mostly a learning-rate artifact.**
 >
 > v0.7 claimed ASCA was significantly worse than the dense control (p = 0.042). That
