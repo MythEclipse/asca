@@ -78,6 +78,7 @@ impl Trainable for DenseModel {
     }
 }
 
+#[derive(Clone)]
 pub struct BenchCfg {
     pub steps: usize,
     pub seq_len: usize,
