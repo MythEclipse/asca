@@ -46,11 +46,19 @@ sekitar 4% puncak f32 kartu ini — masih ada ruang besar, tapi bukan itu hambat
 
 Diukur, bukan diduga:
 
-- Training ASCA: **6.856 tok/s** CPU vs **6.829 tok/s** GPU (100 langkah, batch 4, seq 128).
-  Praktis nol. Dense: 14.557 → 15.549 tok/s (+7%).
-- Satu langkah = 512 token / 6.856 tok/s ≈ **74,7 ms**.
+- Training ASCA saat itu: **6.856 tok/s** CPU vs **6.829 tok/s** GPU (100 langkah, batch 4,
+  seq 128). Praktis nol. Dense: 14.557 → 15.549 tok/s (+7%).
+- Satu langkah saat itu = 512 token / 6.856 tok/s ≈ **74,7 ms**.
 - FLOPs per langkah ≈ 6 · N_aktif · T = 6 · 99.344 · 512 ≈ **305 MFLOP**.
-- Pada 23,7 GFLOPS (matmul CPU terukur), itu ≈ **13 ms** — hanya **~18%** dari waktu langkah.
+- Pada 23,7 GFLOPS (matmul CPU terukur), itu ≈ **13 ms** — hanya **~18%** dari waktu
+  langkah pada saat itu.
+
+> **Premis ini berubah setelah [`PERF.md`](PERF.md).** Jalur CPU naik 3,08× menjadi
+> **20.407 tok/s**, jadi satu langkah kini ≈ **25 ms** dan porsi matmul di dalamnya
+> relatif lebih besar, tetapi offload per-operasi tetap tidak menarik karena setiap
+> panggilan masih membayar satu salinan H2D + D2H + sinkronisasi. Kesimpulan yang sama
+> berlaku lebih kuat: yang dibutuhkan adalah tensor yang tinggal di device dan kernel
+> yang menyatukan satu blok penuh, bukan GEMM yang lebih cepat untuk matriks 128×64.
 
 Jadi bahkan kalau matmul menjadi instan, langkah hanya turun ~18%. Sisanya: RMSNorm,
 sigmoid, penjumlahan residual, scan delta, dan **alokasi `Mat` per operasi** di kode Rust.

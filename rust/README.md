@@ -87,14 +87,18 @@ Result (TinyStories bytes, 3 seeds). Short run first, then the long one that cor
 
 | tokens | matching | ASCA val loss | dense val loss | Δ | ASCA tok/s | dense tok/s |
 |---|---|---|---|---|---|---|
-| 205k | total (331k) | 1.735 | 1.976 | −0.242 | 6,810 | 4,243 |
-| 205k | active (99k) | 1.735 | 1.978 | −0.244 | 7,019 | 14,529 |
-| 1.02M | total (331k) | 1.297 | 1.369 | **−0.072** | 6,580 | 3,973 |
+| 205k | total (331k) | 1.735 | 1.976 | −0.242 | **20,407** | 4,503 |
+| 205k | active (99k) | 1.735 | 1.978 | −0.244 | **20,679** | 16,370 |
+| 1.02M | total (331k) | 1.297 | 1.369 | **−0.072** | 6,580¹ | 3,973¹ |
 
 The advantage **shrinks 69%** between 128k and 1M tokens and is **not significant** at
-1M (t = −4.0, df 2, p ≈ 0.058). What holds: at matched total params ASCA trains 1.66×
-faster and its decode state is 2,048 floats constant, versus 32,768 growing with
-context.
+1M (t = −4.0, df 2, p ≈ 0.058). What holds: at matched total params ASCA trains 4.53×
+faster (1.26× at matched active params) and its decode state is 2,048 floats constant,
+versus 32,768 growing with context. Throughput figures are post-optimisation — see
+`../docs/PERF.md` for the 3.08× CPU pass and `ASCA_PROF=1` for the built-in profiler.
+
+¹ Measured before the CPU optimisation pass; the loss figures are unaffected, only
+throughput changed.
 
 Use `--eval-curve N` to record the loss curve every N steps and `--match total|active|both`
 to pick the parameter matching.

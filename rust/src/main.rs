@@ -16,6 +16,7 @@ fn arg(args: &[String], name: &str, default: &str) -> String {
 }
 
 fn main() {
+    asca_rs::prof::init();
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).cloned().unwrap_or_else(|| "help".into());
     match cmd.as_str() {
@@ -43,6 +44,9 @@ fn main() {
                 "               [--lr 3e-3] [--d-model 64] [--n-layers 2] [--n-experts 8] [--d-ff 128]"
             );
         }
+    }
+    if std::env::var("ASCA_PROF").ok().as_deref() == Some("1") {
+        println!("\n{}", asca_rs::prof::report());
     }
 }
 

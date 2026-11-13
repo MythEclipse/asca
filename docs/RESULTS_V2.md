@@ -43,19 +43,25 @@ Yang berbeda **hanya arsitekturnya**. Ini satu-satunya cara klaim efisiensi jadi
 
 | mode | ASCA val_loss | dense val_loss | Δ (asca−dense) | t (df=2) | tok/s ASCA | tok/s dense |
 |---|---|---|---|---|---|---|
-| total params 331k | **1,7343 ± 0,1229** | 1,9762 ± 0,0827 | **−0,2419 ± 0,0741** | −5,65 | 6.810 | 4.243 |
-| active params 99k | **1,7343 ± 0,1229** | 1,9778 ± 0,1176 | **−0,2435 ± 0,0097** | −43,35 | 7.019 | 14.529 |
+| total params 331k | **1,7343 ± 0,1229** | 1,9762 ± 0,0827 | **−0,2419 ± 0,0741** | −5,65 | 20.407 | 4.503 |
+| active params 99k | **1,7343 ± 0,1229** | 1,9778 ± 0,1176 | **−0,2435 ± 0,0097** | −43,35 | 20.679 | 16.370 |
 
 State decode pada konteks 128: **ASCA 2.048 float (konstan)** vs **dense 32.768 float
 (tumbuh O(T))**. Pada konteks 1024 dense butuh 262.144 float, ASCA tetap 2.048.
 
 ### Bacaan
 
-- Pada **total params sama**: ASCA menang kualitas ~0,24 dan **1,6× lebih cepat**,
+- Pada **total params sama**: ASCA menang kualitas ~0,24 dan **4,5× lebih cepat**,
   dengan state decode 16× lebih kecil dan tidak tumbuh terhadap konteks.
-- Pada **active params sama**: ASCA masih menang kualitas ~0,24, tapi **2× lebih
-  lambat** — 99k parameter dense jauh lebih murah per token daripada 331k parameter
-  ASCA yang hanya 99k aktif (hash-MoE tetap harus menyimpan semua expert).
+- Pada **active params sama**: ASCA masih menang kualitas ~0,24 dan **1,26× lebih
+  cepat**. Klaim lama bahwa ASCA 2× lebih lambat di sini **dicabut**: itu artefak kode
+  yang belum dioptimasi. Sesudah kedua jalur dioptimasi (lihat
+  [`PERF.md`](PERF.md)), ASCA lebih cepat di kedua mode pencocokan.
+
+> **Catatan revisi (v2.1).** Angka throughput di tabel ini berasal dari run yang sama
+> dengan angka loss (400 langkah, 3 seed, lr 6e-3) tetapi sesudah optimasi CPU 3,08×.
+> Loss tidak berubah sama sekali (1,7343 / 1,9762 / 1,9778), jadi perbaikan itu murni
+> kecepatan. Angka sebelum optimasi: ASCA 6.810/7.019, dense 4.243/14.529.
 - Kedua LR memberi kesimpulan sama, jadi hasilnya tidak bergantung pada satu titik LR.
 
 ## 3b. Kurva loss vs token (1,024M token, 3 seed) — MENGOREKSI §3
@@ -77,7 +83,7 @@ pencocokan total params (331k), evaluasi tiap 250 langkah pada set validasi yang
 | 896.000 | 1,2796 | 1,3296 | −0,0499 ± 0,0449 | −1,92 |
 | 1.024.000 | **1,2968 ± 0,0871** | **1,3685 ± 0,0600** | **−0,0720 ± 0,0315** | −3,96 |
 
-Throughput pada run yang sama: ASCA **6.580 tok/s**, dense **3.973 tok/s** (1,66×).
+Throughput pada run yang sama (sesudah optimasi CPU): ASCA **20.407 tok/s**, dense **4.503 tok/s** (4,53×).
 
 ### Yang berubah dari §3
 

@@ -49,8 +49,12 @@ pub struct HashMoe {
 pub struct MoeCache {
     pub x: Mat,
     pub xn: Mat,
+    /// pra-aktivasi SiLU, disimpan supaya backward tidak perlu menghitung ulang
+    pub pre: Vec<f32>, // (T * d_ff)
     pub hidden: Vec<f32>, // (T * d_ff) aktivasi setelah silu
     pub route: Vec<usize>,
+    /// indeks token per expert; dasar pengelompokan di forward dan backward
+    pub buckets: Vec<Vec<usize>>,
 }
 
 #[inline]
@@ -92,30 +96,71 @@ impl HashMoe {
         vec![&self.w1, &self.b1, &self.w2, &self.b2]
     }
 
+    /// Forward dengan pengelompokan per expert.
+    ///
+    /// Versi per-token membaca blok bobot satu expert berulang kali secara acak
+    /// (token berganti expert di setiap baris). Dengan mengelompokkan token per
+    /// expert dan menaruh loop bobot di luar, satu baris `w1`/`w2` dibaca sekali
+    /// lalu dipakai untuk semua token expert itu — pola GEMM yang sebenarnya.
     pub fn forward(&self, x: &Mat, ids: &[u32]) -> (Mat, MoeCache) {
         let (t_len, d) = (x.rows, x.cols);
-        let xn = rmsnorm_rows(x, EPS);
-        let mut hidden = vec![0.0f32; t_len * self.d_ff];
+        let d_ff = self.d_ff;
+        let xn = crate::prof::time(6, || rmsnorm_rows(x, EPS));
         let mut route = vec![0usize; t_len];
-        let mut out = Mat::zeros(t_len, d);
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); self.n_experts];
         for t in 0..t_len {
             let e = hash_route(ids[t], self.n_experts);
             route[t] = e;
-            let row = xn.row(t);
-            for j in 0..self.d_ff {
-                let col = e * self.d_ff + j;
-                let mut acc = self.b1.value.at(0, col);
-                for c in 0..d {
-                    acc += row[c] * self.w1.value.at(c, col);
-                }
-                hidden[t * self.d_ff + j] = silu(acc);
+            buckets[e].push(t);
+        }
+        let mut pre = vec![0.0f32; t_len * d_ff];
+        let mut hidden = vec![0.0f32; t_len * d_ff];
+        let mut out = Mat::zeros(t_len, d);
+
+        for e in 0..self.n_experts {
+            let rows = &buckets[e];
+            if rows.is_empty() {
+                continue;
             }
+            let b1 = &self.b1.value.d[e * d_ff..(e + 1) * d_ff];
+            for &t in rows.iter() {
+                pre[t * d_ff..(t + 1) * d_ff].copy_from_slice(b1);
+            }
+            // pre = xn @ w1[:, expert]
             for c in 0..d {
-                let mut acc = self.b2.value.at(0, c);
-                for j in 0..self.d_ff {
-                    acc += hidden[t * self.d_ff + j] * self.w2.value.at(e * self.d_ff + j, c);
+                let w1row = &self.w1.value.row(c)[e * d_ff..(e + 1) * d_ff];
+                for &t in rows.iter() {
+                    let xc = xn.at(t, c);
+                    if xc == 0.0 {
+                        continue;
+                    }
+                    let prow = &mut pre[t * d_ff..(t + 1) * d_ff];
+                    for j in 0..d_ff {
+                        prow[j] += xc * w1row[j];
+                    }
                 }
-                out.set(t, c, acc);
+            }
+            for &t in rows.iter() {
+                let prow = &pre[t * d_ff..(t + 1) * d_ff];
+                let hrow = &mut hidden[t * d_ff..(t + 1) * d_ff];
+                for j in 0..d_ff {
+                    hrow[j] = silu(prow[j]);
+                }
+                out.row_mut(t).copy_from_slice(&self.b2.value.d);
+            }
+            // out += hidden @ w2[expert, :]
+            for j in 0..d_ff {
+                let w2row = self.w2.value.row(e * d_ff + j);
+                for &t in rows.iter() {
+                    let hj = hidden[t * d_ff + j];
+                    if hj == 0.0 {
+                        continue;
+                    }
+                    let orow = out.row_mut(t);
+                    for c in 0..d {
+                        orow[c] += hj * w2row[c];
+                    }
+                }
             }
         }
         (
@@ -123,59 +168,91 @@ impl HashMoe {
             MoeCache {
                 x: x.clone(),
                 xn,
+                pre,
                 hidden,
                 route,
+                buckets,
             },
         )
     }
 
     pub fn backward(&mut self, cache: &MoeCache, dout: &Mat) -> Mat {
         let (t_len, d) = (cache.x.rows, cache.x.cols);
-        let mut dhidden = vec![0.0f32; t_len * self.d_ff];
+        let d_ff = self.d_ff;
+        let mut dpre = vec![0.0f32; t_len * d_ff];
         let mut dxn = Mat::zeros(t_len, d);
-        for t in 0..t_len {
-            let e = cache.route[t];
-            // dW2, db2, dhidden
-            for j in 0..self.d_ff {
-                let h = cache.hidden[t * self.d_ff + j];
-                let row = e * self.d_ff + j;
-                for c in 0..d {
-                    self.w2
-                        .grad
-                        .set(row, c, self.w2.grad.at(row, c) + h * dout.at(t, c));
+
+        for e in 0..self.n_experts {
+            let rows = &cache.buckets[e];
+            if rows.is_empty() {
+                continue;
+            }
+            // dW2 += hidden^T dout ; db2 += dout
+            for j in 0..d_ff {
+                let g2row = &mut self.w2.grad.row_mut(e * d_ff + j);
+                for &t in rows.iter() {
+                    let hj = cache.hidden[t * d_ff + j];
+                    if hj == 0.0 {
+                        continue;
+                    }
+                    let dr = dout.row(t);
+                    for c in 0..d {
+                        g2row[c] += hj * dr[c];
+                    }
                 }
             }
+            for &t in rows.iter() {
+                let dr = dout.row(t);
+                for c in 0..d {
+                    self.b2.grad.d[c] += dr[c];
+                }
+            }
+            // dpre = dout @ w2[expert]^T, lalu dikali turunan SiLU
+            for j in 0..d_ff {
+                let w2row = self.w2.value.row(e * d_ff + j);
+                for &t in rows.iter() {
+                    let dr = dout.row(t);
+                    let mut acc = 0.0f32;
+                    for c in 0..d {
+                        acc += dr[c] * w2row[c];
+                    }
+                    dpre[t * d_ff + j] = acc;
+                }
+            }
+            for &t in rows.iter() {
+                for j in 0..d_ff {
+                    let pre = cache.pre[t * d_ff + j];
+                    let s = 1.0 / (1.0 + (-pre).exp());
+                    let dh = dpre[t * d_ff + j] * (s * (1.0 + pre * (1.0 - s)));
+                    self.b1.grad.d[e * d_ff + j] += dh;
+                    dpre[t * d_ff + j] = dh;
+                }
+            }
+            // dW1 += xn^T dpre ; dxn += dpre @ w1[expert]^T
             for c in 0..d {
-                self.b2.grad.d[c] += dout.at(t, c);
-            }
-            for j in 0..self.d_ff {
-                let row = e * self.d_ff + j;
-                let mut acc = 0.0f32;
-                for c in 0..d {
-                    acc += dout.at(t, c) * self.w2.value.at(row, c);
+                let g1row = &mut self.w1.grad.row_mut(c)[e * d_ff..(e + 1) * d_ff];
+                for &t in rows.iter() {
+                    let xc = cache.xn.at(t, c);
+                    if xc == 0.0 {
+                        continue;
+                    }
+                    let drow = &dpre[t * d_ff..(t + 1) * d_ff];
+                    for j in 0..d_ff {
+                        g1row[j] += xc * drow[j];
+                    }
                 }
-                dhidden[t * self.d_ff + j] = acc;
-            }
-            // silu backward: d/dx [x*sigmoid(x)] = sigmoid(x)*(1 + x*(1-sigmoid(x)))
-            let xr = cache.xn.row(t);
-            for j in 0..self.d_ff {
-                let col = e * self.d_ff + j;
-                let mut pre = self.b1.value.at(0, col);
-                for c in 0..d {
-                    pre += xr[c] * self.w1.value.at(c, col);
-                }
-                let s = 1.0 / (1.0 + (-pre).exp());
-                let dh = dhidden[t * self.d_ff + j] * (s * (1.0 + pre * (1.0 - s)));
-                self.b1.grad.d[col] += dh;
-                for c in 0..d {
-                    self.w1
-                        .grad
-                        .set(c, col, self.w1.grad.at(c, col) + xr[c] * dh);
-                    dxn.row_mut(t)[c] += dh * self.w1.value.at(c, col);
+                let w1row = &self.w1.value.row(c)[e * d_ff..(e + 1) * d_ff];
+                for &t in rows.iter() {
+                    let drow = &dpre[t * d_ff..(t + 1) * d_ff];
+                    let mut acc = 0.0f32;
+                    for j in 0..d_ff {
+                        acc += drow[j] * w1row[j];
+                    }
+                    dxn.row_mut(t)[c] += acc;
                 }
             }
         }
-        rmsnorm_rows_backward(&cache.x, &dxn, EPS)
+        crate::prof::time(6, || rmsnorm_rows_backward(&cache.x, &dxn, EPS))
     }
 }
 
@@ -279,7 +356,7 @@ impl Model {
             let (dy, delta_cache) = layer.delta.forward(&x_in);
             let mut x_mid = x_in.clone();
             x_mid.axpy(1.0, &dy);
-            let (dm, moe_cache) = layer.moe.forward(&x_mid, ids);
+            let (dm, moe_cache) = crate::prof::time(4, || layer.moe.forward(&x_mid, ids));
             let mut x_out = x_mid.clone();
             x_out.axpy(1.0, &dm);
             x = x_out.clone();
@@ -291,8 +368,8 @@ impl Model {
                 x_out,
             });
         }
-        let h_final = rmsnorm_rows(&x, EPS);
-        let logits = h_final.matmul(&self.head.value);
+        let h_final = crate::prof::time(6, || rmsnorm_rows(&x, EPS));
+        let logits = crate::prof::time(7, || h_final.matmul(&self.head.value));
         (
             logits,
             ModelCache {
@@ -354,31 +431,29 @@ impl Model {
         }
 
         // head
-        let d_head = cache.h_final.transpose().matmul(&dlogits);
+        let d_head = crate::prof::time(9, || cache.h_final.matmul_ta(&dlogits));
         self.head.grad.axpy(1.0, &d_head);
-        let dh = dlogits.matmul(&self.head.value.transpose());
+        let dh = crate::prof::time(9, || dlogits.matmul_t(&self.head.value));
 
         let mut dx = rmsnorm_rows_backward(&cache.layers.last().unwrap().x_out, &dh, EPS);
         for (li, layer) in self.layers.iter_mut().enumerate().rev() {
             let lc = &cache.layers[li];
             // residual kedua: x_out = x_mid + moe(...)
             let mut d_mid = dx.clone();
-            let d_moe = layer.moe.backward(&lc.moe_cache, &dx);
+            let d_moe = crate::prof::time(5, || layer.moe.backward(&lc.moe_cache, &dx));
             d_mid.axpy(1.0, &d_moe);
             // residual pertama: x_mid = x_in + delta(...)
             let mut d_in = d_mid.clone();
-            let d_delta = layer.delta.backward(&lc.delta_cache, &d_mid);
+            let d_delta = crate::prof::time(3, || layer.delta.backward(&lc.delta_cache, &d_mid));
             d_in.axpy(1.0, &d_delta);
             dx = d_in;
         }
         // embedding
         for (t, &id) in cache.ids.iter().enumerate() {
+            let src = dx.row(t);
+            let dst = self.embed.grad.row_mut(id as usize);
             for c in 0..self.cfg.d_model {
-                self.embed.grad.set(
-                    id as usize,
-                    c,
-                    self.embed.grad.at(id as usize, c) + dx.at(t, c),
-                );
+                dst[c] += src[c];
             }
         }
         let _ = &cache.x0;

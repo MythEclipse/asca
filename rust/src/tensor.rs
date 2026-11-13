@@ -95,6 +95,30 @@ impl Mat {
         out
     }
 
+    /// `self^T @ other` dengan self (K x M) dan other (K x N) -> (M x N).
+    /// Sama hasilnya dengan `self.transpose().matmul(other)`, tetapi tanpa
+    /// mengalokasi dan menyalin matriks transpose lebih dulu.
+    pub fn matmul_ta(&self, other: &Mat) -> Mat {
+        assert_eq!(self.rows, other.rows, "matmul_ta: dim tidak cocok");
+        let (k, m, n) = (self.rows, self.cols, other.cols);
+        let mut out = Mat::zeros(m, n);
+        for p in 0..k {
+            let a = self.row(p);
+            let b = other.row(p);
+            for i in 0..m {
+                let ai = a[i];
+                if ai == 0.0 {
+                    continue;
+                }
+                let o = out.row_mut(i);
+                for j in 0..n {
+                    o[j] += ai * b[j];
+                }
+            }
+        }
+        out
+    }
+
     /// `self (rows x K) @ other^T` dengan other (cols x K) -> (rows x cols).
     pub fn matmul_t(&self, other: &Mat) -> Mat {
         assert_eq!(self.cols, other.cols, "matmul_t: dim tidak cocok");

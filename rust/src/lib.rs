@@ -8,5 +8,6 @@ pub mod cuda;
 pub mod delta;
 pub mod dense;
 pub mod model;
+pub mod prof;
 pub mod tensor;
 pub mod train;

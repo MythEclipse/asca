@@ -53,6 +53,8 @@ pub struct DenseLayerCache {
     pub attn: AttnCache,
     pub x_mid: Mat,
     pub xn2: Mat,
+    /// pra-aktivasi SiLU, disimpan supaya backward tidak menghitungnya ulang
+    pub pre: Mat,
     pub hidden: Mat,
     pub x_out: Mat,
 }
@@ -272,8 +274,10 @@ impl DenseModel {
             pre.add_row_bias(&layer.b1.value.d);
             let mut hidden = Mat::zeros(t_len, self.cfg.d_ff);
             for r in 0..t_len {
+                let src = pre.row(r);
+                let dst = hidden.row_mut(r);
                 for c in 0..self.cfg.d_ff {
-                    hidden.set(r, c, silu(pre.at(r, c)));
+                    dst[c] = silu(src[c]);
                 }
             }
             let mut ff = hidden.matmul(&layer.w2.value);
@@ -294,6 +298,7 @@ impl DenseModel {
                 },
                 x_mid,
                 xn2,
+                pre,
                 hidden,
                 x_out,
             });
@@ -426,20 +431,22 @@ impl DenseModel {
             let mut dv = Mat::zeros(t_len, d);
             for hh in 0..h {
                 let off = hh * dh;
+                let mut dp = vec![0.0f32; t_len];
+                let mut dscores = vec![0.0f32; t_len];
                 for t in 0..t_len {
-                    // dp[t,s] = dO_t . v_s
-                    let mut dp = vec![0.0f32; t + 1];
+                    // dp[t,s] = dO_t . v_s ; slice baris diambil sekali per t
+                    let do_t = &d_o.row(t)[off..off + dh];
                     let mut sum = 0.0f32;
                     for s in 0..=t {
                         let p = lc.attn.probs[(hh * t_len + t) * t_len + s];
+                        let vs = &lc.attn.v.row(s)[off..off + dh];
                         let mut acc = 0.0f32;
                         for c in 0..dh {
-                            acc += d_o.at(t, off + c) * lc.attn.v.at(s, off + c);
+                            acc += do_t[c] * vs[c];
                         }
                         dp[s] = acc;
                         sum += p * acc;
                     }
-                    let mut dscores = vec![0.0f32; t + 1];
                     for s in 0..=t {
                         let p = lc.attn.probs[(hh * t_len + t) * t_len + s];
                         dscores[s] = p * (dp[s] - sum);

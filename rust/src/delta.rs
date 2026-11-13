@@ -108,8 +108,7 @@ impl DeltaBlock {
         let h = self.cfg.n_heads;
         let dh = self.dh;
 
-        let qkv = x.matmul(&self.w_qkv.value);
-        let mut qkv = qkv;
+        let mut qkv = crate::prof::time(0, || x.matmul(&self.w_qkv.value));
         qkv.add_row_bias(&self.b_qkv.value.d);
 
         let mut q = Mat::zeros(t_len, d);
@@ -145,11 +144,11 @@ impl DeltaBlock {
             }
         }
 
-        let gate = {
+        let gate = crate::prof::time(0, || {
             let mut g = x.matmul(&self.w_gate.value);
             g.add_row_bias(&self.b_gate.value.d);
             g
-        };
+        });
         let mut alpha = Mat::zeros(t_len, h);
         let mut beta = Mat::zeros(t_len, h);
         for r in 0..t_len {
@@ -159,52 +158,61 @@ impl DeltaBlock {
             }
         }
 
-        let mut o = Mat::zeros(t_len, d);
-        let mut s_pre: Vec<Vec<f32>> = Vec::with_capacity(h);
-        for hh in 0..h {
-            let mut s = vec![0.0f32; dh * dh];
-            let mut states = Vec::with_capacity((t_len + 1) * dh * dh);
-            let off = hh * dh;
-            for t in 0..t_len {
-                states.extend_from_slice(&s);
-                let kt = &k.row(t)[off..off + dh];
-                let vt = &v.row(t)[off..off + dh];
-                let a = alpha.at(t, hh);
-                let b = beta.at(t, hh);
-                // Sk = S^T k  (Sk[i] = sum_a S[a][i] k[a])
+        let (o, s_pre) = crate::prof::time(1, || {
+            let mut o = Mat::zeros(t_len, d);
+            let mut s_pre: Vec<Vec<f32>> = Vec::with_capacity(h);
+            for hh in 0..h {
+                let mut s = vec![0.0f32; dh * dh];
+                let mut states = Vec::with_capacity((t_len + 1) * dh * dh);
+                let off = hh * dh;
+                // `sk` dan `u` dialokasikan sekali per head, bukan per timestep: versi
+                // sebelumnya membuat 2 Vec x T x H per layer-forward.
                 let mut sk = vec![0.0f32; dh];
-                for i in 0..dh {
-                    let mut acc = 0.0;
-                    for a_i in 0..dh {
-                        acc += s[a_i * dh + i] * kt[a_i];
-                    }
-                    sk[i] = acc;
-                }
-                // u = beta*(v - alpha*Sk); S = alpha*S + k u^T
                 let mut u = vec![0.0f32; dh];
-                for i in 0..dh {
-                    u[i] = b * (vt[i] - a * sk[i]);
-                }
-                for a_i in 0..dh {
-                    for i in 0..dh {
-                        s[a_i * dh + i] = a * s[a_i * dh + i] + kt[a_i] * u[i];
-                    }
-                }
-                // o_t = S^T q
-                let qt = &q.row(t)[off..off + dh];
-                for i in 0..dh {
-                    let mut acc = 0.0;
+                for t in 0..t_len {
+                    states.extend_from_slice(&s);
+                    let kt = &k.row(t)[off..off + dh];
+                    let vt = &v.row(t)[off..off + dh];
+                    let a = alpha.at(t, hh);
+                    let b = beta.at(t, hh);
+                    // Sk = S^T k  (Sk[i] = sum_a S[a][i] k[a])
+                    sk.iter_mut().for_each(|z| *z = 0.0);
                     for a_i in 0..dh {
-                        acc += s[a_i * dh + i] * qt[a_i];
+                        let ka = kt[a_i];
+                        if ka == 0.0 {
+                            continue;
+                        }
+                        let srow = &s[a_i * dh..(a_i + 1) * dh];
+                        for i in 0..dh {
+                            sk[i] += srow[i] * ka;
+                        }
                     }
-                    o.set(t, off + i, acc);
+                    // u = beta*(v - alpha*Sk); S = alpha*S + k u^T
+                    for i in 0..dh {
+                        u[i] = b * (vt[i] - a * sk[i]);
+                    }
+                    for a_i in 0..dh {
+                        for i in 0..dh {
+                            s[a_i * dh + i] = a * s[a_i * dh + i] + kt[a_i] * u[i];
+                        }
+                    }
+                    // o_t = S^T q
+                    let qt = &q.row(t)[off..off + dh];
+                    for i in 0..dh {
+                        let mut acc = 0.0;
+                        for a_i in 0..dh {
+                            acc += s[a_i * dh + i] * qt[a_i];
+                        }
+                        o.set(t, off + i, acc);
+                    }
                 }
+                states.extend_from_slice(&s);
+                s_pre.push(states);
             }
-            states.extend_from_slice(&s);
-            s_pre.push(states);
-        }
+            (o, s_pre)
+        });
 
-        let mut y = o.matmul(&self.w_o.value);
+        let mut y = crate::prof::time(2, || o.matmul(&self.w_o.value));
         y.add_row_bias(&self.b_o.value.d);
 
         let cache = DeltaCache {
@@ -231,14 +239,14 @@ impl DeltaBlock {
         let dh = self.dh;
 
         // y = o @ w_o + b_o
-        let w_o_t = self.w_o.value.transpose();
-        let d_o = dy.matmul(&w_o_t);
+        let d_o = dy.matmul_t(&self.w_o.value);
         // dW_o = o^T @ dy ; db_o = sum(dy)
-        let d_w_o = cache.o.transpose().matmul(dy);
+        let d_w_o = cache.o.matmul_ta(dy);
         self.w_o.grad.axpy(1.0, &d_w_o);
         for r in 0..dy.rows {
+            let src = dy.row(r);
             for c in 0..dy.cols {
-                self.b_o.grad.d[c] += dy.at(r, c);
+                self.b_o.grad.d[c] += src[c];
             }
         }
 

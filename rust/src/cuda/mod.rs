@@ -311,13 +311,21 @@ pub fn gpu() -> Option<&'static Gpu> {
 }
 
 static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static ENV_CHECKED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 /// `ASCA_GPU=0` mematikan jalur GPU tanpa membangun ulang — dipakai untuk mengukur
 /// CPU dan GPU di binary yang sama.
+///
+/// Penting: `std::env::var` mengalokasi dan membaca environment setiap panggilan.
+/// Versi pertama fungsi ini dipanggil dari dalam `Mat::matmul`, artinya satu lookup
+/// environment per perkalian matriks — biaya itu sempat membuat matmul 5x lebih lambat
+/// daripada benchmark terisolasi. Sekarang environment dibaca sekali saja.
 pub fn available() -> bool {
-    if std::env::var("ASCA_GPU").ok().as_deref() == Some("0") {
-        return false;
-    }
+    ENV_CHECKED.get_or_init(|| {
+        if std::env::var("ASCA_GPU").ok().as_deref() == Some("0") {
+            ENABLED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
     ENABLED.load(std::sync::atomic::Ordering::Relaxed) && gpu().is_some()
 }
 
@@ -333,7 +341,11 @@ pub fn describe() -> String {
     }
 }
 
-/// Ambang ukuran: di bawah ini salinan H2D/D2H lebih mahal daripada matmul CPU.
+/// Ambang ukuran offload, **diukur** bukan ditebak.
+///
+/// `asca gpu` menunjukkan 128x64x192 = 1,6e6 hanya 0,90x (salinan lebih mahal), sedang
+/// 512x64x1024 = 3,4e7 sudah 4x. Ambang 1e6 yang dipakai sebelumnya justru membuat
+/// matmul kecil model (qkv 128x64x192) dilempar ke GPU dan 3x lebih lambat.
 pub fn worth_offload(m: usize, k: usize, n: usize) -> bool {
-    m * k * n >= 1_000_000
+    m.saturating_mul(k).saturating_mul(n) >= 20_000_000
 }
