@@ -3,28 +3,36 @@
 From-scratch LLM architecture research (*random init*, no pretrained weights) targeting
 compute and memory efficiency through adaptive and sparse mechanisms.
 
-> **Status: v0.7 — NEGATIVE result on real text.**
+> **Status: v0.8 — the earlier negative result is retracted; it was mostly a learning-rate artifact.**
 >
-> On TinyStories (byte-level, 24M tokens, seq 1024, **5 seeds**):
+> v0.7 claimed ASCA was significantly worse than the dense control (p = 0.042). That
+> was measured with **one shared learning rate (3e-3) for both architectures**. Tuning
+> the LR per architecture on the same corpus (TinyStories, 12M tokens, 3 seeds) gives:
 >
-> | | val loss | throughput | VRAM |
+> | lr | dense-matched | ASCA (8 experts) | Δ |
 > |---|---|---|---|
-> | dense-matched (control) | **0.8065 ± 0.0105** | **769k tok/s** | **286 MB** |
-> | full ASCA | 0.8282 ± 0.0069 | 224k tok/s | 709 MB |
+> | 1e-3 | 0.9319 | 1.0481 | +0.1162 |
+> | 3e-3 | 0.9013 | 0.9246 | +0.0234 |
+> | 6e-3 | **0.8875** | **0.8973** | **+0.0098** |
+> | 1e-2 | 0.8967 | 0.8977 | **+0.0011** |
 >
-> Paired t = 2.95, df = 4, **p = 0.042** — all five seeds are worse. ASCA is 3.4×
-> slower and uses 2.5× more VRAM. **No advantage is claimed.**
+> ASCA with 16 experts at lr 6e-3 reaches **0.8813** — nominally the best number in the
+> table, inside the noise band of the dense control.
 >
-> **Methodological lesson:** every early experiment used a synthetic corpus, and there
-> ASCA looked equal or even slightly better (Δ −0.002…−0.009). That conclusion **did
-> not survive** real text — the sign flipped, and the variant that looked "just as
-> good" on synthetic data turned out to be +0.09 worse. **Synthetic-corpus ablations
-> are no longer used for architecture decisions.**
+> **Current claim status: no quality difference is detectable in either direction** —
+> not "ASCA is worse", not "ASCA is better". What is measured and unambiguous is the
+> **cost**: at its best quality point ASCA is **3.7× slower to train and uses 3.4× more
+> VRAM** than the dense control. For an architecture whose thesis is efficiency, that
+> is the real problem.
 >
-> What still holds up: **parallel prefill at 48,955 tok/s** (1.32× slower than dense)
-> and **1.60 ms/token decode** with CUDA Graphs, with a **constant 3.8 MB decode
-> cache vs 24 MB** for dense. Full details in
-> [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md).
+> Two protocol rules came out of this and are now binding: **LR must be tuned per
+> architecture before any claim**, and **ablations on the synthetic corpus are not used
+> for architecture decisions** (see v0.7 below in
+> [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md)).
+>
+> What still holds from earlier work: **parallel prefill at 48,955 tok/s** (1.32× slower
+> than dense) and **1.60 ms/token decode** with CUDA Graphs, with a **constant 3.8 MB
+> decode cache vs 24 MB** for dense.
 
 ---
 
@@ -173,11 +181,9 @@ forward pass; 611 → 48,955 tok/s).
 
 Open, in priority order:
 
-1. **Diagnose the deficit**: is ASCA losing because effective capacity is smaller
-   (0.9M active params spread over 4 sublayers vs one wide MLP), because of
-   optimization (LR/warmup were never tuned per architecture), or because the scale is
-   simply too small? Candidate experiments: match **total** params (not active), sweep
-   LR, and plot loss vs tokens (does ASCA catch up with longer training?).
+1. ~~Diagnose the deficit~~ **done (v0.8)**: it was mostly LR. Capacity also matters
+   (4→8→16 experts improves monotonically). Next: 5+ seeds at the best LR per model to
+   see whether the two are separable at all, and a loss-vs-tokens curve.
 2. **Scale**: 24M tokens at d=128 is a toy regime. ≥100M tokens and the `small`
    preset are required before any claim.
 3. **Keep what already wins**: constant decode cache (3.8 MB vs 24 MB) and parallel

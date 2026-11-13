@@ -18,6 +18,54 @@ Hasil benchmark otomatis. Setiap entri menyertakan konfigurasi lengkap.
   **Selisih < ~0.08 val loss pada budget ini tidak bermakna**; jangan menafsirkan
   satu seed sebagai bukti.
 
+## Diagnosis defisit: LR sweep + kapasitas (TinyStories 12M, 3 seed)
+
+Dua hipotesis diuji: (a) defisit karena **optimisasi** (LR tidak di-tuning per
+arsitektur), (b) defisit karena **kapasitas** (MoE kekurangan kapasitas efektif).
+Protokol: TinyStories byte-level, 12M token, seq 1024, batch 8, 3 seed, `torch.compile`.
+
+| Model | lr 1e-3 | lr 3e-3 | lr 6e-3 | lr 1e-2 |
+|---|---|---|---|---|
+| dense-matched | 0.9319 ± 0.0123 | 0.9013 ± 0.0160 | **0.8875 ± 0.0079** | 0.8967 ± 0.0218 |
+| ASCA (8 expert) | 1.0481 ± 0.0069 | 0.9246 ± 0.0099 | **0.8973 ± 0.0105** | 0.8977 ± 0.0138 |
+| **Δ (ASCA − dense)** | **+0.1162** | **+0.0234** | **+0.0098** | **+0.0011** |
+
+Kapasitas (lr 3e-3, top_k tetap 2 sehingga active params ~sama):
+
+| n_experts | val loss | throughput | VRAM |
+|---|---|---|---|
+| 4 | 0.9310 ± 0.0086 | 220k tok/s | 627 MB |
+| 8 | 0.9246 ± 0.0099 | 231k tok/s | 718 MB |
+| 16 | 0.9078 ± 0.0104 | 196k tok/s | 864 MB |
+
+Kombinasi terbaik: **16 expert + lr 6e-3 → 0.8813 ± 0.0121** (210k tok/s, 967 MB).
+
+### Koreksi: hasil "ASCA kalah signifikan (p=0.042)" sebagian besar artefak LR
+
+Protokol lama memakai **satu LR (3e-3) untuk kedua arsitektur**. Ternyata itu
+merugikan ASCA: pada lr 3e-3 selisihnya +0.0234, tetapi
+
+- pada lr 1e-2 selisihnya tinggal **+0.0011** (praktis nol),
+- pada LR optimal masing-masing (6e-3 untuk keduanya) selisihnya **+0.0098** ≈ 1σ,
+- ASCA 16 expert pada lr 6e-3 malah **−0.0062 di bawah** dense (dalam noise).
+
+Jadi klaim "ASCA secara signifikan lebih buruk pada teks nyata" **dicabut**. Yang
+tersisa: **tidak ada perbedaan kualitas yang bisa dideteksi** pada skala ini, ke dua
+arah. Uji p=0.042 sebelumnya sah secara statistik untuk konfigurasi yang diuji, tetapi
+konfigurasi itu tidak adil untuk ASCA.
+
+### Yang tetap berlaku
+
+1. **Tidak ada keunggulan kualitas.** Hasil terbaik ASCA (0.8813) dan dense (0.8875)
+   berada dalam 1σ; dengan 3 seed ini tidak bisa dipisahkan. Butuh ≥5 seed.
+2. **Defisit efisiensi justru makin besar.** ASCA 3.7× lebih lambat (210k vs 756k
+   tok/s) dan 3.4× lebih boros VRAM (967 vs 286 MB) pada titik kualitas terbaiknya.
+   Untuk arsitektur yang menjual efisiensi, ini masalah utama — bukan kualitas.
+3. **Kapasitas memang menolong ASCA** (4→8→16 expert monoton membaik), jadi sebagian
+   defisit lama berasal dari kapasitas efektif yang terlalu kecil, bukan hanya LR.
+4. **Aturan protokol baru**: LR harus di-tuning per arsitektur sebelum klaim apa pun.
+   Perbandingan dengan satu LR bersama tidak valid.
+
 ## ⚠️ Korpus NYATA (TinyStories): hasil sintetis TIDAK terprediksi
 
 Ini eksperimen paling penting di dokumen ini. Semua eksperimen sebelumnya memakai
@@ -199,6 +247,26 @@ yang lebih panjang, di mana ia mungkin baru mulai berguna.
 - Semua run hanya 20M token dan `d_model=128`. Ini rezim "mainan": klaim skala besar
   tetap tidak boleh dibuat.
 - Tidak ada tuning hyperparameter per model; LR/batch sama untuk semua.
+
+## Status ringkas v0.8 — koreksi hasil negatif: defisit kualitas sebagian besar artefak LR
+
+**Koreksi penting.** Klaim v0.7 ("ASCA signifikan lebih buruk, p=0.042") **dicabut**.
+Itu diukur dengan satu LR (3e-3) untuk kedua arsitektur. Setelah LR di-tuning per
+arsitektur pada korpus yang sama (TinyStories, 12M token, 3 seed):
+
+| lr | dense-matched | ASCA (8 expert) | Δ |
+|---|---|---|---|
+| 1e-3 | 0.9319 | 1.0481 | +0.1162 |
+| 3e-3 | 0.9013 | 0.9246 | +0.0234 |
+| 6e-3 | **0.8875** | **0.8973** | **+0.0098** |
+| 1e-2 | 0.8967 | 0.8977 | **+0.0011** |
+
+ASCA 16 expert @ lr 6e-3: **0.8813** (nominal terbaik, dalam noise vs dense).
+
+**Status klaim sekarang: tidak ada perbedaan kualitas yang terdeteksi, ke dua arah.**
+Bukan "ASCA lebih buruk", juga bukan "ASCA lebih baik". Yang jelas dan terukur
+hanyalah **biaya**: pada titik kualitas terbaiknya ASCA 3.7× lebih lambat dan 3.4×
+lebih boros VRAM. Untuk arsitektur yang menjual efisiensi, itu masalah utamanya.
 
 ## Status ringkas v0.7 — hasil NEGATIF pada teks nyata (baca ini dulu)
 
@@ -1318,4 +1386,474 @@ _2026-11-12 22:44:49 · seed 0 · device cuda · torch 2.11.0+cu128_
 |---|---|---|---|---|---|---|---|---|---|
 | B0-dense-matched | 1240320 | 1209472 | 4575488 | 23994368 | 0.8065 ± 0.0094 | 2.240 ± 0.021 | 769441 ± 15774 | 286 ± 0 | 5 |
 | A0-asca | 1833349 | 1212677 | 5890304 | 23994368 | 0.8282 ± 0.0061 | 2.289 ± 0.014 | 223684 ± 1982 | 709 ± 7 | 5 |
+
+
+## Training komparasi (nano, 1465 step — DIAGNOSIS lr sweep lr=1e-3 (TinyStories 12M))
+
+_2026-11-13 15:25:27 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "file",
+  "tokens_in_corpus": 19014224,
+  "vocab": 241,
+  "steps": 1465,
+  "batch": 8,
+  "seq_len": 1024,
+  "train_tokens": 12001280,
+  "lr": 0.001,
+  "warmup": 100,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 241,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 1024,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 8,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_capacity_factor": 1.5,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "dense-matched",
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| B0-dense-matched | 1240320 | 1209472 | 4575488 | 12001280 | 0.9319 ± 0.0100 | 2.539 ± 0.025 | 804447 ± 3274 | 286 ± 0 | 3 |
+| A0-asca | 1833349 | 1212677 | 5940992 | 12001280 | 1.0481 ± 0.0056 | 2.852 ± 0.016 | 231490 ± 2559 | 680 ± 9 | 3 |
+
+
+## Training komparasi (nano, 1465 step — DIAGNOSIS lr sweep lr=3e-3 (TinyStories 12M))
+
+_2026-11-13 15:29:06 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "file",
+  "tokens_in_corpus": 19014224,
+  "vocab": 241,
+  "steps": 1465,
+  "batch": 8,
+  "seq_len": 1024,
+  "train_tokens": 12001280,
+  "lr": 0.003,
+  "warmup": 100,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 241,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 1024,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 8,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_capacity_factor": 1.5,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "dense-matched",
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| B0-dense-matched | 1240320 | 1209472 | 4575488 | 12001280 | 0.9013 ± 0.0131 | 2.463 ± 0.032 | 772067 ± 5714 | 286 ± 0 | 3 |
+| A0-asca | 1833349 | 1212677 | 5870720 | 12001280 | 0.9246 ± 0.0081 | 2.521 ± 0.021 | 231094 ± 2576 | 718 ± 13 | 3 |
+
+
+## Training komparasi (nano, 1465 step — DIAGNOSIS lr sweep lr=6e-3 (TinyStories 12M))
+
+_2026-11-13 15:32:51 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "file",
+  "tokens_in_corpus": 19014224,
+  "vocab": 241,
+  "steps": 1465,
+  "batch": 8,
+  "seq_len": 1024,
+  "train_tokens": 12001280,
+  "lr": 0.006,
+  "warmup": 100,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 241,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 1024,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 8,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_capacity_factor": 1.5,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "dense-matched",
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| B0-dense-matched | 1240320 | 1209472 | 4575488 | 12001280 | 0.8875 ± 0.0065 | 2.429 ± 0.016 | 756320 ± 3180 | 286 ± 0 | 3 |
+| A0-asca | 1833349 | 1212677 | 5767424 | 12001280 | 0.8973 ± 0.0085 | 2.453 ± 0.021 | 225238 ± 2012 | 741 ± 5 | 3 |
+
+
+## Training komparasi (nano, 1465 step — DIAGNOSIS kapasitas n_experts=4)
+
+_2026-11-13 15:36:03 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "file",
+  "tokens_in_corpus": 19014224,
+  "vocab": 241,
+  "steps": 1465,
+  "batch": 8,
+  "seq_len": 1024,
+  "train_tokens": 12001280,
+  "lr": 0.003,
+  "warmup": 100,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 241,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 1024,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 4,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_capacity_factor": 1.5,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| A0-asca | 1438085 | 1210629 | 5357824 | 12001280 | 0.9310 ± 0.0070 | 2.537 ± 0.018 | 220100 ± 2567 | 627 ± 2 | 3 |
+
+
+## Training komparasi (nano, 1465 step — DIAGNOSIS kapasitas n_experts=16)
+
+_2026-11-13 15:39:40 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "file",
+  "tokens_in_corpus": 19014224,
+  "vocab": 241,
+  "steps": 1465,
+  "batch": 8,
+  "seq_len": 1024,
+  "train_tokens": 12001280,
+  "lr": 0.003,
+  "warmup": 100,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 241,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 1024,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 16,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_capacity_factor": 1.5,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| A0-asca | 2623877 | 1216773 | 6936064 | 12001280 | 0.9078 ± 0.0085 | 2.479 ± 0.021 | 195573 ± 2278 | 864 ± 8 | 3 |
+
+
+## Training komparasi (nano, 1465 step — DIAGNOSIS lr=1e-2 (TinyStories 12M))
+
+_2026-11-13 15:44:41 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "file",
+  "tokens_in_corpus": 19014224,
+  "vocab": 241,
+  "steps": 1465,
+  "batch": 8,
+  "seq_len": 1024,
+  "train_tokens": 12001280,
+  "lr": 0.01,
+  "warmup": 100,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 241,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 1024,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 8,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_capacity_factor": 1.5,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "dense-matched",
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| B0-dense-matched | 1240320 | 1209472 | 4575488 | 12001280 | 0.8967 ± 0.0178 | 2.452 ± 0.044 | 787240 ± 15218 | 286 ± 0 | 3 |
+| A0-asca | 1833349 | 1212677 | 5780096 | 12001280 | 0.8977 ± 0.0112 | 2.454 ± 0.027 | 207656 ± 4370 | 757 ± 2 | 3 |
+
+
+## Training komparasi (nano, 1465 step — DIAGNOSIS lr=6e-3 + 16 expert)
+
+_2026-11-13 15:47:48 · seed 0 · device cuda · torch 2.11.0+cu128_
+
+```json
+{
+  "preset": "nano",
+  "corpus": "file",
+  "tokens_in_corpus": 19014224,
+  "vocab": 241,
+  "steps": 1465,
+  "batch": 8,
+  "seq_len": 1024,
+  "train_tokens": 12001280,
+  "lr": 0.006,
+  "warmup": 100,
+  "seed": 0,
+  "device": "cuda",
+  "torch": "2.11.0+cu128",
+  "asca_config": {
+    "vocab_size": 241,
+    "d_model": 128,
+    "n_layers": 4,
+    "n_heads": 4,
+    "head_dim": 32,
+    "max_seq_len": 1024,
+    "bias": false,
+    "dropout": 0.0,
+    "init_std": 0.02,
+    "use_semantic_encoder": true,
+    "sem_conv_kernel": 4,
+    "sem_reduction": 4,
+    "use_hybrid_attention": true,
+    "local_window": 128,
+    "linear_chunk": 64,
+    "local_attn_impl": "sdpa",
+    "rope_theta": 10000.0,
+    "use_moe": true,
+    "n_experts": 16,
+    "top_k": 2,
+    "n_shared_experts": 1,
+    "expert_ff": 64,
+    "shared_ff": 256,
+    "moe_capacity_factor": 1.5,
+    "moe_impl": "grouped",
+    "router_threshold": 0.0,
+    "aux_loss_coef": 0.01,
+    "z_loss_coef": 0.001,
+    "dense_ff": 344,
+    "use_memory": true,
+    "n_memory_slots": 32,
+    "mem_segment_len": 256,
+    "tie_embeddings": true
+  },
+  "models": [
+    "asca"
+  ],
+  "compile": true
+}
+```
+
+| model | params | active_params | flops_per_token | tokens | val_loss | ppl | tokens_per_sec | peak_vram_mb | n_seeds |
+|---|---|---|---|---|---|---|---|---|---|
+| A0-asca | 2623877 | 1216773 | 6925312 | 12001280 | 0.8813 ± 0.0099 | 2.414 ± 0.024 | 210608 ± 1722 | 967 ± 5 | 3 |
 

@@ -69,6 +69,11 @@ def main() -> int:
     ap.add_argument("--seeds", default=None, help="mis. 0,1,2 — agregasi mean±std (protokol: minimal 3 seed)")
     ap.add_argument("--compile", action="store_true", help="torch.compile model (lebih cepat, +10-15s di awal)")
     ap.add_argument("--tag", default="")
+    ap.add_argument(
+        "--set",
+        default=None,
+        help="override config ASCA, mis. 'n_experts=16,expert_ff=64' (dipisah koma)",
+    )
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -101,7 +106,26 @@ def main() -> int:
     )
 
     wanted = [m.strip() for m in args.models.split(",") if m.strip()]
-    base_cfg = asca_config(args.preset, vocab, args.seq_len)
+    over: dict = {}
+    for item in (args.set or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, _, val = item.partition("=")
+        key, val = key.strip(), val.strip()
+        if val.lower() in ("true", "false"):
+            over[key] = val.lower() == "true"
+        else:
+            try:
+                over[key] = int(val)
+            except ValueError:
+                try:
+                    over[key] = float(val)
+                except ValueError:
+                    over[key] = val
+    if over:
+        print(f"  override config: {over}", flush=True)
+    base_cfg = asca_config(args.preset, vocab, args.seq_len, **over)
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else [args.seed]
     rows = []
     raw: dict[str, list[dict]] = {}
