@@ -48,6 +48,13 @@ longer run shows most of that was an early-training effect:
 |---|---|---|---|---|
 | 128k | 1.845 | 2.078 | **−0.233 ± 0.031** | −13.0 |
 | 384k | 1.591 | 1.694 | −0.104 ± 0.078 | −2.3 |
+
+**Definitive run (4M tokens, 5 seeds, seed-independent eval):** ASCA **1.1227 ± 0.0230** vs
+dense **1.1777 ± 0.0085**, paired Δ **−0.0550 ± 0.0238**, **t = −5.16** (df 4; critical
+2.776 at p=0.05). The gap stays negative at every checkpoint across the whole curve, so
+within 4M tokens it does not close. Caveat: one corpus (TinyStories), 331k parameters,
+byte vocabulary, CPU f32 — evidence at this scale, not a claim about billions of
+parameters.
 | 512k | 1.499 | 1.574 | −0.075 ± 0.046 | −2.8 |
 | 1.024M | **1.297 ± 0.087** | **1.369 ± 0.060** | **−0.072 ± 0.032** | −4.0 |
 

@@ -144,3 +144,39 @@ Angka yang menguntungkan diri sendiri harus dicurigai lebih dulu.
 2. Task recall jarak jauh (copy/associative recall sintetis) sebagai uji batas.
 3. Kernel CUDA untuk delta block + matmul, lalu ukur ulang tok/s.
 4. Setelah itu baru boleh bicara keunggulan.
+
+## Hasil definitif: 4 juta token, 5 seed, RNG evaluasi tetap
+
+Protokol: 19.531 langkah x 1024 token = 4.000.256 token, batch 4 x seq 128, lr 6e-3 untuk
+kedua arsitektur (keduanya memuncak di LR ini, lihat §sapu LR), 16 batch evaluasi, dan
+**RNG evaluasi yang tidak bergantung seed** sehingga semua seed diuji pada data yang sama
+dan delta berpasangan mengukur perbedaan arsitektur, bukan perbedaan sampel.
+
+| model | params | aktif/token | val_loss akhir | state decode |
+|---|---|---|---|---|
+| ASCA v2 | 331.408 | 99.344 | **1,1227 ± 0,0230** | 2.048 float |
+| dense (d_ff=1024) | 330.368 | 330.368 | 1,1777 ± 0,0085 | 32.768 float |
+
+Delta berpasangan: **−0,0550 ± 0,0238**, t = −5,16, df = 4. Nilai kritis dua sisi untuk
+n=5 adalah 2,776 (p=0,05) dan 4,604 (p=0,01), jadi selisih ini **signifikan pada p<0,01**.
+
+Yang membuat ini berbeda dari hasil 1 juta token sebelumnya (p ≈ 0,058): selisihnya tidak
+menyusut ke nol, dan ujinya kini punya kuasa untuk melihatnya. Sepanjang kurva, delta
+berpasangan tetap negatif di **setiap** titik:
+
+| token | delta | t |
+|---|---|---|
+| 256k | −0,1588 ± 0,0570 | −6,22 |
+| 1,02M | −0,0518 ± 0,0299 | −3,88 |
+| 2,05M | −0,0625 ± 0,0213 | −6,57 |
+| 3,07M | −0,0517 ± 0,0099 | −11,64 |
+| 3,84M | −0,0634 ± 0,0249 | −5,69 |
+
+Batas klaim: satu korpus (TinyStories), model 331 ribu parameter, vocab byte 256, CPU f32.
+Ini bukti bahwa arsitekturnya bisa mengungguli kontrol pada skala ini dengan protokol yang
+sama — bukan bukti bahwa keunggulannya bertahan di skala miliaran parameter.
+
+Catatan: kolom throughput pada run ini (ASCA 27.906 vs dense 6.184 tok/s = 4,51x) **tidak
+dipakai**. Baseline dense masih memakai kode yang belum dioptimasi saat run ini berjalan;
+angka yang sah adalah 2,26x (total) / 1,10x (active) dari pengukuran terpisah setelah
+baseline diperbaiki.
