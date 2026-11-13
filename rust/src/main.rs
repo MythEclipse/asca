@@ -26,6 +26,7 @@ fn main() {
         "inspect" => cmd_inspect(&args),
         "bench" => cmd_bench(&args),
         "gpu" => cmd_gpu(&args),
+        "decode" => cmd_decode(&args),
         _ => {
             println!("asca — ASCA v2 (tanpa attention, state konstan, Rust murni)");
             println!("pakai:");
@@ -48,6 +49,52 @@ fn main() {
     if std::env::var("ASCA_PROF").ok().as_deref() == Some("1") {
         println!("\n{}", asca_rs::prof::report());
     }
+}
+
+/// Decode autoregresif satu token demi satu, mengukur ms/token pada beberapa panjang
+/// konteks. Kalau state benar-benar konstan, biayanya harus datar terhadap konteks —
+/// inilah beda mendasar dengan KV cache yang tumbuh O(T).
+fn cmd_decode(args: &[String]) {
+    let cfg = build_cfg(args);
+    let ctxs: Vec<usize> = arg(args, "--ctx", "128,512,1024,2048")
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    let steps: usize = arg(args, "--steps", "32").parse().unwrap_or(32);
+    let warmup: usize = arg(args, "--warmup", "8").parse().unwrap_or(8);
+    let mut rng = Rng::new(7);
+    let model = Model::new(cfg, &mut rng);
+    let mut st = model.new_decode_state();
+    let floats: usize = st.delta.iter().flatten().map(|v| v.len()).sum();
+    println!(
+        "ASCA decode: {} param total, {} aktif/token, state {} float (konstan)",
+        model.num_params(),
+        <Model as asca_rs::bench::Trainable>::active_params(&model),
+        floats
+    );
+    println!("| konteks | ms/token | tok/s |");
+    println!("|---|---|---|");
+    for &ctx in ctxs.iter() {
+        // panaskan state sepanjang `ctx` token, lalu ukur `steps` langkah berikutnya
+        let mut st = model.new_decode_state();
+        let mut id = 0u32;
+        for _ in 0..ctx {
+            id = rng.below(256) as u32;
+            let _ = model.step(id, &mut st);
+        }
+        for _ in 0..warmup {
+            id = rng.below(256) as u32;
+            let _ = model.step(id, &mut st);
+        }
+        let t0 = std::time::Instant::now();
+        for _ in 0..steps {
+            id = rng.below(256) as u32;
+            let _ = model.step(id, &mut st);
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+        println!("| {ctx} | {ms:.3} | {:.0} |", 1e3 / ms);
+    }
+    let _ = &mut st;
 }
 
 fn build_cfg(args: &[String]) -> Config {

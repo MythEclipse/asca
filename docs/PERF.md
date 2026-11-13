@@ -208,6 +208,29 @@ dioptimasi, rasionya menyesatkan.
 | total params 331k | 32.174 tok/s | 5.933 tok/s | **5,42×** |
 | active params 99k | 33.844 tok/s | 21.219 tok/s | **1,59×** |
 
+## Decode: biaya per token datar terhadap konteks
+
+`asca decode` mendekode satu token demi satu dan mengukur ms/token pada beberapa panjang
+konteks. Hasil pada model tiny (state 2.048 float):
+
+| konteks | ms/token | tok/s |
+|---|---|---|
+| 128 | 0,009 | 116.755 |
+| 512 | 0,009 | 116.328 |
+| 1.024 | 0,009 | 117.004 |
+| 2.048 | 0,010 | 103.265 |
+
+Datar. Ini konsekuensi langsung dari rekurensi: state `S` berukuran `dh x dh` per head
+diperbarui di tempat, jadi biaya per token tidak bergantung pada berapa token sudah
+dilihat. Dense harus menyimpan K dan V untuk setiap posisi: pada konteks 2.048 dengan
+model yang sama itu 2048 x 64 x 2 (K,V) x 2 layer = **524.288 float**, dan attention-nya
+membaca seluruh cache setiap token.
+
+Catatan jujur: angka dense belum diukur dengan jalur decode inkremental (KV cache) di
+engine ini, jadi tabel di atas hanya membuktikan properti ASCA (datar), bukan rasio
+terhadap dense. Yang bisa diklaim sekarang: **biaya decode ASCA tidak tumbuh terhadap
+konteks**, dan state-nya 2.048 float konstan.
+
 ## Yang belum dikerjakan
 
 1. ~~Batch lintas sekuens~~ **selesai** — lihat bagian di atas; hasilnya netral untuk

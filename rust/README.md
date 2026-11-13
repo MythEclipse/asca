@@ -116,6 +116,18 @@ to pick the parameter matching.
 
 See `../docs/RESULTS_V2.md` for the full protocol and caveats.
 
+## Decode
+
+```bash
+./target/release/asca decode --ctx 128,512,1024,2048 --steps 32
+```
+
+Measures ms/token at increasing context by decoding one token at a time with the carried
+state. The cost is flat (0.009 ms/token from ctx 128 to 2048) because the recurrent state
+is `dh x dh` per head and updated in place — no KV cache, nothing that grows with context.
+`tests/decode_parity.rs` checks that stepping token-by-token reproduces the full-sequence
+forward to 4.7e-7 relative.
+
 ## GPU (optional)
 
 `build.rs` compiles `kernels/asca.cu` with `nvcc` into PTX and embeds it; the driver API
