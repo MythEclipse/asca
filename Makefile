@@ -1,45 +1,45 @@
-# ASCA — target operasional.
-# Wajib memakai venv bersama (~/.venvs/ml); PYTHONPATH Hermes di-unset agar
-# site-packages python3.14 milik Hermes tidak bocor ke interpreter ini.
-PY      := env -u PYTHONPATH -u PYTHONHOME ~/.venvs/ml/bin/python
-PRESET  ?= nano
-STEPS   ?= 600
-BATCH   ?= 8
-SEQ     ?= 256
-SEEDS   ?= 0,1,2
-OUT     ?= docs/EXPERIMENTS.md
+# ASCA — target operasional. Seluruh pipeline sekarang Rust; tidak ada Python.
+CARGO  ?= cargo
+BIN    := rust/target/release/asca
+DATA   ?= $(shell ./scripts/fetch_corpus.sh 2>/dev/null || echo "")
+STEPS  ?= 400
+SEEDS  ?= 0,1,2
+LR     ?= 6e-3
 
-.PHONY: help test bench vram train ablations all clean
+.PHONY: help build test gpu train bench curve clean corpus
 
 help:
-	@echo "make test                      # 12 test: kausalitas, referensi naif, MoE, dll"
-	@echo "make bench  PRESET=nano        # FLOPs/token & throughput"
-	@echo "make vram   PRESET=nano        # peak VRAM 512..4096 & latensi decode"
-	@echo "make train  PRESET=nano        # komparasi dense-matched vs ASCA (3 seed)"
-	@echo "make ablations PRESET=nano     # A1..A6 vs A0"
-	@echo "make all                       # test + bench + vram + train"
+	@echo "make build                    # cargo build --release"
+	@echo "make test                     # 3 gradcheck: delta block, model, dense baseline"
+	@echo "make gpu                      # paritas kernel CUDA + benchmark GEMM"
+	@echo "make corpus                   # unduh TinyStories ke ~/.cache/asca"
+	@echo "make train  STEPS=400         # latih ASCA (checkpoint ke /tmp/asca.ckpt)"
+	@echo "make bench  STEPS=400         # ASCA vs dense di engine yang sama"
+	@echo "make curve  STEPS=2000        # kurva loss vs token"
+
+corpus:
+	@./scripts/fetch_corpus.sh
+
+build:
+	cd rust && $(CARGO) build --release
 
 test:
-	$(PY) tests/run_tests.py
+	cd rust && $(CARGO) test --release
 
-bench:
-	$(PY) benchmarks/bench_flops.py --preset $(PRESET) --out $(OUT)
+gpu:
+	$(BIN) gpu
 
-decode:
-	$(PY) benchmarks/bench_decode.py --preset $(PRESET) --contexts 512,1024,2048
+train: build
+	$(BIN) train --data "$(DATA)" --steps $(STEPS) --seq-len 128 --batch 4 \
+		--lr $(LR) --warmup 40 --out /tmp/asca.ckpt
 
-vram:
-	$(PY) benchmarks/bench_vram.py --preset $(PRESET) --out $(OUT)
+bench: build
+	$(BIN) bench --data "$(DATA)" --steps $(STEPS) --seq-len 128 --batch 4 \
+		--lr $(LR) --seeds $(SEEDS)
 
-train:
-	$(PY) benchmarks/train_toy.py --preset $(PRESET) --steps $(STEPS) --batch $(BATCH) \
-		--seq-len $(SEQ) --models dense-matched,asca --seeds $(SEEDS) --out $(OUT)
-
-ablations:
-	$(PY) benchmarks/train_toy.py --preset $(PRESET) --steps $(STEPS) --batch $(BATCH) \
-		--seq-len $(SEQ) --models asca,A1,A2,A3,A4,A5,A6 --seeds 0 --out $(OUT)
-
-all: test bench decode vram train
+curve: build
+	$(BIN) bench --data "$(DATA)" --steps $(STEPS) --seq-len 128 --batch 4 \
+		--lr $(LR) --seeds $(SEEDS) --eval-curve 250 --match total
 
 clean:
-	rm -rf data/cache __pycache__ */__pycache__ .pytest_cache
+	cd rust && $(CARGO) clean

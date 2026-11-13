@@ -1,3 +1,7 @@
+> **ARSIP v1.** Spesifikasi ini milik implementasi PyTorch yang sudah dihapus dari
+> repo. Disimpan sebagai catatan sejarah; arsitektur yang berlaku sekarang ada di
+> [`SPEC_V2.md`](SPEC_V2.md). Perintah Python di dokumen ini sudah tidak bisa dijalankan.
+
 # ASCA — Adaptive Sparse Cognitive Architecture
 
 **Spesifikasi Matematis & Dataflow Tensor**

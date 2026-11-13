@@ -1,3 +1,8 @@
+> **ARSIP v1.** Log eksperimen ini berasal dari implementasi PyTorch yang sudah dihapus
+> dari repo (semua kode `asca/`, `baseline/`, `benchmarks/`, `tests/`). Angka di bawah
+> tetap valid sebagai catatan sejarah. Hasil yang berlaku sekarang ada di
+> [`RESULTS_V2.md`](RESULTS_V2.md) dan [`CUDA.md`](CUDA.md).
+
 # EXPERIMENTS — ASCA
 
 Hasil benchmark otomatis. Setiap entri menyertakan konfigurasi lengkap.
