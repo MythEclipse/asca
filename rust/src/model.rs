@@ -458,6 +458,8 @@ impl Model {
         let v = self.cfg.vocab;
         let mut dlogits = Mat::zeros(t_len, v);
         let mut loss = 0.0f32;
+        // Softmax atas vocab (bisa 8192) lewat slice baris, bukan `set()`/`at()` per
+        // elemen: versi lama melakukan 4,2 juta akses ber-bounds-check per langkah.
         for t in 0..t_len {
             let row = logits.row(t);
             let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
@@ -467,15 +469,11 @@ impl Model {
             }
             let lse = max + sum.ln();
             loss += lse - row[targets[t] as usize];
+            let drow = dlogits.row_mut(t);
             for c in 0..v {
-                let p = (row[c] - lse).exp();
-                dlogits.set(t, c, p);
+                drow[c] = (row[c] - lse).exp();
             }
-            dlogits.set(
-                t,
-                targets[t] as usize,
-                dlogits.at(t, targets[t] as usize) - 1.0,
-            );
+            drow[targets[t] as usize] -= 1.0;
         }
         loss /= t_len as f32;
         for x in dlogits.d.iter_mut() {

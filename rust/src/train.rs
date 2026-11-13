@@ -176,7 +176,10 @@ where
         step(model, &mut opt);
         if cfg.log_every > 0 && (step_i + 1) % cfg.log_every == 0 {
             let el = t0.elapsed().as_secs_f32();
-            let tok = ((step_i + 1) * cfg.batch * cfg.seq_len) as f32;
+            // Setelah resume, `step_i` dimulai dari start_step. Menghitung token dari 0
+            // membuat tok/s terlihat jauh lebih tinggi dari kenyataan (bug yang sempat
+            // saya buat: 250 langkah dilaporkan sebagai 2.750).
+            let tok = ((step_i + 1 - start_step) * cfg.batch * cfg.seq_len) as f32;
             println!(
                 "step {:5}/{}  loss {:.4}  lr {:.2e}  {:.0} tok/s  {:.1}s",
                 step_i + 1,

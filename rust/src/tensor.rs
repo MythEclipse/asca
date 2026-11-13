@@ -125,6 +125,15 @@ impl Mat {
 
     /// `self (rows x K) @ other^T` dengan other (cols x K) -> (rows x cols).
     pub fn matmul_t(&self, other: &Mat) -> Mat {
+        // Sama seperti matmul_ta: jalur CPU di bawah tidak punya versi GPU. Untuk bentuk
+        // besar, transpose lalu serahkan ke `matmul`. Tanpa ini, `dlogits.matmul_t(head)`
+        // (512 x 8192 x 128 = 537 juta MAC) jalan di CPU padahal GPU tersedia.
+        if crate::cuda::available()
+            && crate::cuda::worth_offload(self.rows, self.cols, other.rows)
+            && self.rows * self.cols >= 1024
+        {
+            return self.matmul(&other.transpose());
+        }
         assert_eq!(self.cols, other.cols, "matmul_t: dim tidak cocok");
         let (n, m) = (self.rows, other.rows);
         let mut out = Mat::zeros(n, m);
