@@ -30,6 +30,7 @@ fn main() {
         "gpu" => cmd_gpu(&args),
         "decode" => cmd_decode(&args),
         "bpe" => cmd_bpe(&args),
+        "chat" => cmd_chat(&args),
         _ => {
             println!("asca — ASCA v2 (tanpa attention, state konstan, Rust murni)");
             println!("pakai:");
@@ -378,6 +379,136 @@ fn cmd_sample(args: &[String]) {
     let _ = so.write_all(&bytes);
     let _ = so.write_all(b"\n");
     let _ = so.flush();
+}
+
+/// REPL untuk benar-benar memakai model: satu baris masukan, jawaban mengalir token demi
+/// token. Memakai jalur decode inkremental yang sama dengan `sample`, jadi biaya per token
+/// konstan dan konteks percakapan bisa terus tumbuh tanpa melambat.
+fn cmd_chat(args: &[String]) {
+    use std::io::{BufRead, Write};
+    let ckpt = arg(args, "--ckpt", "");
+    let (model, cfg) = train::load(&ckpt, 0).expect("gagal load checkpoint");
+    let tok = arg(args, "--tokenizer", "");
+    let bpe = if tok.is_empty() {
+        None
+    } else {
+        Some(Bpe::load(&tok).expect("gagal muat tokenizer"))
+    };
+    let mut temp: f32 = arg(args, "--temp", "0.8").parse().unwrap();
+    let top_k: usize = arg(args, "--top-k", "40").parse().unwrap();
+    let top_p: f32 = arg(args, "--top-p", "0.95").parse().unwrap();
+    let max_new: usize = arg(args, "--tokens", "200").parse().unwrap();
+    let mut rng = Rng::new(arg(args, "--seed", "0").parse().unwrap());
+    let mut st = model.new_decode_state();
+    let mut ctx_ids: Vec<u32> = Vec::new();
+    println!(
+        "ASCA chat — /reset, /temp N, /quit. Model {} param.",
+        model.num_params()
+    );
+    let stdin = std::io::stdin();
+    loop {
+        print!("> ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.is_empty() {
+            continue;
+        }
+        if line == "/quit" || line == "/exit" {
+            break;
+        }
+        if line == "/reset" {
+            ctx_ids.clear();
+            st = model.new_decode_state();
+            println!("(konteks direset)");
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/temp ") {
+            if let Ok(v) = rest.trim().parse() {
+                temp = v;
+                println!("(temp = {temp})");
+            }
+            continue;
+        }
+        let mut ids: Vec<u32> = match &bpe {
+            Some(b) => b.encode(line.as_bytes()),
+            None => line.bytes().map(|c| c as u32).collect(),
+        };
+        ids.retain(|&i| (i as usize) < cfg.vocab);
+        if ids.is_empty() {
+            continue;
+        }
+        // prompt masuk ke state, lalu jawaban mengalir keluar
+        let mut logits = None;
+        for &id in ctx_ids.iter().chain(ids.iter()) {
+            logits = Some(model.step(id, &mut st));
+        }
+        ctx_ids.extend_from_slice(&ids);
+        let mut out_bytes: Vec<u8> = Vec::new();
+        let mut produced: Vec<u32> = Vec::new();
+        for _ in 0..max_new {
+            let lg = logits.as_ref().unwrap();
+            let row = lg.row(0);
+            let mut idx: Vec<usize> = (0..row.len()).collect();
+            if top_k > 0 && top_k < row.len() {
+                idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+                idx.truncate(top_k);
+            }
+            let max = idx
+                .iter()
+                .map(|&i| row[i])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut probs: Vec<(usize, f32)> = idx
+                .iter()
+                .map(|&i| (i, ((row[i] - max) / temp).exp()))
+                .collect();
+            probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let total: f32 = probs.iter().map(|x| x.1).sum();
+            let mut acc = 0.0;
+            let mut cut = probs.len();
+            for (i, (_, p)) in probs.iter().enumerate() {
+                acc += p / total;
+                if acc >= top_p {
+                    cut = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(cut);
+            let sum: f32 = probs.iter().map(|x| x.1).sum();
+            let mut r = rng.uniform() * sum;
+            let mut pick = probs[0].0;
+            for &(i, p) in probs.iter() {
+                r -= p;
+                if r <= 0.0 {
+                    pick = i;
+                    break;
+                }
+            }
+            produced.push(pick as u32);
+            ctx_ids.push(pick as u32);
+            // cetak hanya byte yang sudah lengkap (subword bisa memotong UTF-8)
+            let chunk = match &bpe {
+                Some(b) => b.decode(&[pick as u32]),
+                None => vec![pick as u8],
+            };
+            out_bytes.extend_from_slice(&chunk);
+            if let Ok(s) = std::str::from_utf8(&out_bytes) {
+                print!("{s}");
+                let _ = std::io::stdout().flush();
+                out_bytes.clear();
+            }
+            logits = Some(model.step(pick as u32, &mut st));
+            if let Some(b) = &bpe {
+                if b.decode(&[pick as u32]).first() == Some(&b'\n') {
+                    break;
+                }
+            }
+        }
+        println!();
+    }
 }
 
 fn cmd_gpu(args: &[String]) {

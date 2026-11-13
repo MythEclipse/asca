@@ -320,6 +320,20 @@ pub fn save(path: &str, model: &Model) -> std::io::Result<()> {
 }
 
 pub fn load(path: &str, seq_hint: usize) -> std::io::Result<(Model, Config)> {
+    // Terima kedua format: checkpoint bobot-saja (MAGIC) dan checkpoint yang bisa
+    // dilanjutkan (MAGIC_R, berisi momen AdamW). Tanpa ini, model yang disimpan oleh
+    // training terbaru tidak bisa dipakai untuk sample/chat.
+    {
+        let mut head = [0u8; 8];
+        use std::io::Read as _;
+        if let Ok(mut fh) = fs::File::open(path) {
+            if fh.read_exact(&mut head).is_ok() && &head == MAGIC_R {
+                let (m, _opt, _step) = load_resume(path)?;
+                let cfg = m.cfg.clone();
+                return Ok((m, cfg));
+            }
+        }
+    }
     let mut f = fs::File::open(path)?;
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
