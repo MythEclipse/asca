@@ -3,6 +3,44 @@
 From-scratch LLM architecture research (*random init*, no pretrained weights) targeting
 compute and memory efficiency through adaptive and sparse mechanisms.
 
+> **v2 is now a from-scratch Rust implementation.** The v1 code in this repo is
+> PyTorch, and that was a methodological dead end: the efficiency numbers measured
+> PyTorch's dispatcher (~2,900 kernel launches per decode token), not the architecture,
+> and the model was still a Transformer variant with attention, softmax, a tokenizer
+> and a learned router. So the architecture was redesigned and reimplemented with **no
+> external dependencies**: training, checkpoint loading and inference are all Rust.
+>
+> **ASCA v2 (Delta Memory Core)** — no attention, no softmax in the feature path, no
+> tokenizer, constant-size state:
+>
+> | Aspect | v1 (PyTorch) | v2 (pure Rust) |
+> |---|---|---|
+> | Attention | hybrid softmax + linear | **none** |
+> | Decode state | KV cache, O(T) | **S of size d x d per head, O(1)** |
+> | Tokenizer | byte via library | **byte-level, none** |
+> | MoE routing | learned top-k + aux loss | **hash(id) % n_experts**, zero FLOP |
+> | Training | PyTorch autograd | **hand-written BPTT backward** |
+> | Dependencies | torch, numpy, tokenizers | **zero** |
+>
+> Core recurrence (gated delta rule — an associative memory that *overwrites* slots
+> instead of accumulating blindly):
+>
+> ```text
+> u_t = beta_t * (v_t - alpha_t * S_{t-1}^T k_t)
+> S_t = alpha_t * S_{t-1} + k_t u_t^T
+> o_t = S_t^T q_t
+> ```
+>
+> Verified so far: recurrent and chunked forms agree to **1.8e-15**; all hand-written
+> gradients match finite differences on 40 entries across every parameter; a 331k-param
+> model trains on TinyStories bytes at **6,583 tok/s on CPU** (naive matmul, no GPU) and
+> reaches **val loss 1.379 / ppl 3.97** in 614k tokens. See
+> [`docs/SPEC_V2.md`](docs/SPEC_V2.md) and [`rust/`](rust/README.md).
+>
+> **No efficiency claim is made yet.** The decisive next step is a dense baseline
+> implemented *in the same Rust crate with the same kernels* — otherwise the comparison
+> repeats exactly the mistake v1 made. The full v1 research record follows below.
+
 > **Status: v0.8 — the earlier negative result is retracted; it was mostly a learning-rate artifact.**
 >
 > v0.7 claimed ASCA was significantly worse than the dense control (p = 0.042). That

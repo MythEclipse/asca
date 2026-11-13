@@ -1,0 +1,30 @@
+[package]
+name = "asca-rs"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "ASCA v2 - attention-free, constant-state language model, from scratch in Rust"
+
+[lib]
+name = "asca_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asca"
+path = "src/main.rs"
+
+[[test]]
+name = "gradcheck"
+harness = false
+
+[[test]]
+name = "gradcheck_model"
+harness = false
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
