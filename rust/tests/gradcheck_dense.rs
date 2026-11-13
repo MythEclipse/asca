@@ -20,7 +20,7 @@ fn main() {
     let tgts: Vec<u32> = (0..10).map(|_| rng.below(256) as u32).collect();
 
     model.zero_grads();
-    let (logits, cache) = model.forward(&ids);
+    let (logits, cache) = model.forward(&ids, 1);
     let loss = model.backward(&cache, &logits, &tgts);
     println!("loss awal {loss:.6}");
 

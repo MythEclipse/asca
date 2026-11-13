@@ -106,11 +106,60 @@ norm          6.3    0.4%
 Backward sekarang mendominasi (~73%), sesuai harapan untuk model kecil: biaya forward
 dan backward sebanding, tetapi backward punya lebih banyak akumulasi gradien.
 
+## Batching lintas sekuens (dan apa yang benar-benar terjadi)
+
+Batch 4 sekarang diproses sebagai satu matriks `B*T` baris: rekurensi delta dan attention
+tetap per sekuens (block-diagonal), tetapi semua GEMM memakai 512 baris.
+
+Gate paritas: `tests/batch_parity.rs` membandingkan satu forward/backward `batch=4`
+dengan empat `batch=1` yang dirata-ratakan. Loss dan gradien cocok sampai **4,3e-7**
+(ASCA) dan **5,2e-7** (dense) — artinya tidak ada token yang bocor antar sekuens.
+
+Hasilnya **tidak seperti yang saya harapkan**:
+
+| model | sebelum batching | sesudah batching | perubahan |
+|---|---|---|---|
+| ASCA (total 331k) | 20.407 tok/s | 20.410 tok/s | ~0% |
+| ASCA (active 99k) | 20.407 tok/s | 20.320 tok/s | ~0% |
+| dense d_ff=1024 | 4.503 tok/s | **6.130 tok/s** | **+36%** |
+| dense d_ff=128 | 16.370 tok/s | **21.493 tok/s** | **+31%** |
+
+Batching membantu **dense**, bukan ASCA. Alasannya: dense menghabiskan waktunya di GEMM
+besar (attention + FFN) yang langsung menikmati 512 baris dan ambang GPU, sedangkan biaya
+ASCA didominasi kerja per-token (bucket MoE, scan delta) yang tidak menjadi lebih besar
+ketika baris ditambah. Untuk ASCA batching bahkan sedikit merugikan (−0,4%), mungkin
+karena working set yang lebih besar.
+
+### Ambang offload GPU harus dikalibrasi ulang
+
+Ambang `2e7` sebelumnya diukur untuk matriks 128 baris. Pada 512 baris GPU sudah menang
+jauh lebih awal:
+
+| bentuk | CPU ms | GPU ms | speedup |
+|---|---|---|---|
+| 512×64×128 | 0,272 | 0,162 | 1,68× |
+| 512×64×192 | 0,422 | 0,200 | 2,11× |
+| 512×64×1024 | 2,583 | 0,655 | 3,95× |
+
+Ambang bawaan kini **4e6**, bisa diatur lewat `ASCA_GPU_MIN`. Dengan ambang itu
+dense-active naik 16.673 → 21.493 tok/s.
+
+### Dampak pada perbandingan
+
+| pencocokan | ASCA | dense | rasio |
+|---|---|---|---|
+| total params 331k | 20.410 tok/s | 6.130 tok/s | **3,33×** (sebelumnya 4,53×) |
+| active params 99k | 20.320 tok/s | 21.493 tok/s | **0,95×** (sebelumnya 1,26×) |
+
+Klaim "ASCA 1,26× lebih cepat pada active params sama" **digantikan**: setelah kedua
+arsitektur mendapat batching dan offload GPU, throughput-nya **setara** (selisih 5%).
+Keunggulan ASCA yang tersisa pada mode ini adalah **state decode** (2.048 float konstan
+vs 32.768 yang tumbuh O(T)), bukan kecepatan training.
+
 ## Yang belum dikerjakan
 
-1. **Batch lintas sekuens.** Batch 4 masih diproses satu per satu, jadi setiap GEMM
-   hanya 128 baris. Menggabungkannya menjadi 512 baris akan membuat GEMM 4× lebih besar
-   dan membuka jalur GPU yang sesungguhnya.
+1. ~~Batch lintas sekuens~~ **selesai** — lihat bagian di atas; hasilnya netral untuk
+   ASCA dan +31–36% untuk dense.
 2. **Fusi elementwise.** RMSNorm, residual, sigmoid, dan gate masih beberapa pass
    terpisah dengan alokasi `Mat` di antaranya.
 3. **Kernel GPU untuk seluruh blok**, bukan per operasi — lihat [`CUDA.md`](CUDA.md).

@@ -25,6 +25,10 @@ harness = false
 name = "gradcheck_dense"
 harness = false
 
+[[test]]
+name = "batch_parity"
+harness = false
+
 [dependencies]
 
 [profile.release]

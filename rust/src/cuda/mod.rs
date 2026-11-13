@@ -347,5 +347,18 @@ pub fn describe() -> String {
 /// 512x64x1024 = 3,4e7 sudah 4x. Ambang 1e6 yang dipakai sebelumnya justru membuat
 /// matmul kecil model (qkv 128x64x192) dilempar ke GPU dan 3x lebih lambat.
 pub fn worth_offload(m: usize, k: usize, n: usize) -> bool {
-    m.saturating_mul(k).saturating_mul(n) >= 20_000_000
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let min = *MIN.get_or_init(|| {
+        std::env::var("ASCA_GPU_MIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MIN_FLOPS)
+    });
+    m.saturating_mul(k).saturating_mul(n) >= min
 }
+
+/// Ambang bawaan. Dengan batching, matriks model berukuran 512 baris, dan di ukuran
+/// itu GPU sudah menang (512x64x128 = 4,2e6 -> 1,68x; 512x64x192 = 6,3e6 -> 2,11x;
+/// 512x64x1024 = 3,4e7 -> 3,95x). Pada 128 baris GPU baru menang di atas ~2e7, jadi
+/// ambang ini bergantung pada batching dan harus diukur ulang kalau bentuk berubah.
+pub const DEFAULT_MIN_FLOPS: usize = 4_000_000;

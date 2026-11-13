@@ -25,6 +25,25 @@ impl Data {
     }
 
     /// Ambil satu sekuens (ids, targets) mulai dari offset acak di rentang tertentu.
+    /// `batch` sekuens ditumpuk menjadi satu vektor `B*seq_len`, supaya satu langkah
+    /// cukup satu forward/backward dan semua GEMM memakai `B*seq_len` baris.
+    pub fn batch_seqs(
+        &self,
+        rng: &mut Rng,
+        seq_len: usize,
+        batch: usize,
+        split: Split,
+    ) -> (Vec<u32>, Vec<u32>) {
+        let mut ids = Vec::with_capacity(seq_len * batch);
+        let mut tgts = Vec::with_capacity(seq_len * batch);
+        for _ in 0..batch {
+            let (a, b) = self.batch(rng, seq_len, split);
+            ids.extend_from_slice(&a);
+            tgts.extend_from_slice(&b);
+        }
+        (ids, tgts)
+    }
+
     pub fn batch(&self, rng: &mut Rng, seq_len: usize, split: Split) -> (Vec<u32>, Vec<u32>) {
         let (lo, hi) = match split {
             Split::Train => (0, self.train_end),
@@ -64,27 +83,19 @@ pub struct TrainCfg {
 /// Satu langkah training: forward+backward `batch` sekuens, lalu update.
 pub fn train_step(model: &mut Model, data: &Data, rng: &mut Rng, cfg: &TrainCfg) -> f32 {
     model.zero_grads();
-    let mut loss = 0.0f32;
-    for _ in 0..cfg.batch {
-        let (ids, tgts) = data.batch(rng, cfg.seq_len, Split::Train);
-        let (logits, cache) = model.forward(&ids);
-        loss += model.backward(&cache, &logits, &tgts);
-    }
+    let (ids, tgts) = data.batch_seqs(rng, cfg.seq_len, cfg.batch, Split::Train);
+    let (logits, cache) = model.forward(&ids, cfg.batch);
+    let loss = model.backward(&cache, &logits, &tgts);
     // rata-rata gradien antar sekuens
-    let inv = 1.0 / cfg.batch as f32;
-    for p in model.params_mut() {
-        for g in p.grad.d.iter_mut() {
-            *g *= inv;
-        }
-    }
-    loss / cfg.batch as f32
+    // loss dan gradien sudah dirata-ratakan per token di dalam backward
+    loss
 }
 
 pub fn evaluate(model: &mut Model, data: &Data, rng: &mut Rng, cfg: &TrainCfg) -> f32 {
     let mut total = 0.0f32;
     for _ in 0..cfg.eval_batches {
         let (ids, tgts) = data.batch(rng, cfg.seq_len, Split::Val);
-        let (logits, cache) = model.forward(&ids);
+        let (logits, cache) = model.forward(&ids, 1);
         // backward hanya untuk menghitung loss (gradien dibuang)
         model.zero_grads();
         total += model.backward(&cache, &logits, &tgts);

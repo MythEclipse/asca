@@ -339,7 +339,7 @@ impl Model {
         }
     }
 
-    pub fn forward(&self, ids: &[u32]) -> (Mat, ModelCache) {
+    pub fn forward(&self, ids: &[u32], batch: usize) -> (Mat, ModelCache) {
         let t_len = ids.len();
         let d = self.cfg.d_model;
         let mut x0 = Mat::zeros(t_len, d);
@@ -353,7 +353,7 @@ impl Model {
         let mut layer_caches = Vec::with_capacity(self.layers.len());
         for layer in self.layers.iter() {
             let x_in = x.clone();
-            let (dy, delta_cache) = layer.delta.forward(&x_in);
+            let (dy, delta_cache) = layer.delta.forward(&x_in, batch);
             let mut x_mid = x_in.clone();
             x_mid.axpy(1.0, &dy);
             let (dm, moe_cache) = crate::prof::time(4, || layer.moe.forward(&x_mid, ids));
@@ -384,7 +384,7 @@ impl Model {
 
     /// Loss saja (untuk gradcheck / evaluasi), tanpa menyentuh gradien.
     pub fn loss(&self, ids: &[u32], targets: &[u32]) -> f32 {
-        let (logits, _) = self.forward(ids);
+        let (logits, _) = self.forward(ids, 1);
         let v = self.cfg.vocab;
         let mut loss = 0.0f32;
         for t in 0..logits.rows {

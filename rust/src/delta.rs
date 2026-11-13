@@ -43,8 +43,11 @@ pub struct DeltaCache {
     pub qn: Mat,
     pub kn: Mat,
     pub o: Mat,
-    /// per head: (T+1) state, `s_pre[t]` = state sebelum langkah t, `s_pre[T]` = akhir
+    /// indeks `hh * batch + b`: (seq+1) state per (head, sekuens),
+    /// `s_pre[t]` = state sebelum langkah t, `s_pre[seq]` = state akhir
     pub s_pre: Vec<Vec<f32>>,
+    pub batch: usize,
+    pub seq: usize,
 }
 
 impl DeltaBlock {
@@ -102,9 +105,16 @@ impl DeltaBlock {
         ]
     }
 
-    /// Forward. `x`: (T, d_model) -> `(y, cache)` dengan `y`: (T, d_model).
-    pub fn forward(&self, x: &Mat) -> (Mat, DeltaCache) {
+    /// Forward. `x`: (B*T, d_model) berisi `batch` sekuens yang ditumpuk; rekurensi
+    /// tetap berjalan per sekuens (state di-reset di batas sekuens), sedangkan semua
+    /// perkalian matriks memakai seluruh B*T baris sekaligus.
+    pub fn forward(&self, x: &Mat, batch: usize) -> (Mat, DeltaCache) {
         let (t_len, d) = (x.rows, self.cfg.d_model);
+        assert!(
+            batch >= 1 && t_len % batch == 0,
+            "baris harus habis dibagi batch"
+        );
+        let seq = t_len / batch;
         let h = self.cfg.n_heads;
         let dh = self.dh;
 
@@ -160,54 +170,58 @@ impl DeltaBlock {
 
         let (o, s_pre) = crate::prof::time(1, || {
             let mut o = Mat::zeros(t_len, d);
-            let mut s_pre: Vec<Vec<f32>> = Vec::with_capacity(h);
+            let mut s_pre: Vec<Vec<f32>> = Vec::with_capacity(h * batch);
             for hh in 0..h {
-                let mut s = vec![0.0f32; dh * dh];
-                let mut states = Vec::with_capacity((t_len + 1) * dh * dh);
                 let off = hh * dh;
-                // `sk` dan `u` dialokasikan sekali per head, bukan per timestep: versi
-                // sebelumnya membuat 2 Vec x T x H per layer-forward.
-                let mut sk = vec![0.0f32; dh];
-                let mut u = vec![0.0f32; dh];
-                for t in 0..t_len {
-                    states.extend_from_slice(&s);
-                    let kt = &k.row(t)[off..off + dh];
-                    let vt = &v.row(t)[off..off + dh];
-                    let a = alpha.at(t, hh);
-                    let b = beta.at(t, hh);
-                    // Sk = S^T k  (Sk[i] = sum_a S[a][i] k[a])
-                    sk.iter_mut().for_each(|z| *z = 0.0);
-                    for a_i in 0..dh {
-                        let ka = kt[a_i];
-                        if ka == 0.0 {
-                            continue;
-                        }
-                        let srow = &s[a_i * dh..(a_i + 1) * dh];
-                        for i in 0..dh {
-                            sk[i] += srow[i] * ka;
-                        }
-                    }
-                    // u = beta*(v - alpha*Sk); S = alpha*S + k u^T
-                    for i in 0..dh {
-                        u[i] = b * (vt[i] - a * sk[i]);
-                    }
-                    for a_i in 0..dh {
-                        for i in 0..dh {
-                            s[a_i * dh + i] = a * s[a_i * dh + i] + kt[a_i] * u[i];
-                        }
-                    }
-                    // o_t = S^T q
-                    let qt = &q.row(t)[off..off + dh];
-                    for i in 0..dh {
-                        let mut acc = 0.0;
+                for bi in 0..batch {
+                    let mut s = vec![0.0f32; dh * dh];
+                    let mut states = Vec::with_capacity((seq + 1) * dh * dh);
+                    // `sk` dan `u` dialokasikan sekali per head, bukan per timestep: versi
+                    // sebelumnya membuat 2 Vec x T x H per layer-forward.
+                    let mut sk = vec![0.0f32; dh];
+                    let mut u = vec![0.0f32; dh];
+                    for t in 0..seq {
+                        let r = bi * seq + t;
+                        states.extend_from_slice(&s);
+                        let kt = &k.row(r)[off..off + dh];
+                        let vt = &v.row(r)[off..off + dh];
+                        let a = alpha.at(r, hh);
+                        let b = beta.at(r, hh);
+                        // Sk = S^T k  (Sk[i] = sum_a S[a][i] k[a])
+                        sk.iter_mut().for_each(|z| *z = 0.0);
                         for a_i in 0..dh {
-                            acc += s[a_i * dh + i] * qt[a_i];
+                            let ka = kt[a_i];
+                            if ka == 0.0 {
+                                continue;
+                            }
+                            let srow = &s[a_i * dh..(a_i + 1) * dh];
+                            for i in 0..dh {
+                                sk[i] += srow[i] * ka;
+                            }
                         }
-                        o.set(t, off + i, acc);
+                        // u = beta*(v - alpha*Sk); S = alpha*S + k u^T
+                        for i in 0..dh {
+                            u[i] = b * (vt[i] - a * sk[i]);
+                        }
+                        for a_i in 0..dh {
+                            for i in 0..dh {
+                                s[a_i * dh + i] = a * s[a_i * dh + i] + kt[a_i] * u[i];
+                            }
+                        }
+                        // o_t = S^T q
+                        let qt = &q.row(r)[off..off + dh];
+                        let orow = o.row_mut(r);
+                        for i in 0..dh {
+                            let mut acc = 0.0;
+                            for a_i in 0..dh {
+                                acc += s[a_i * dh + i] * qt[a_i];
+                            }
+                            orow[off + i] = acc;
+                        }
                     }
+                    states.extend_from_slice(&s);
+                    s_pre.push(states);
                 }
-                states.extend_from_slice(&s);
-                s_pre.push(states);
             }
             (o, s_pre)
         });
@@ -228,6 +242,8 @@ impl DeltaBlock {
             kn,
             o,
             s_pre,
+            batch,
+            seq,
         };
         (y, cache)
     }
@@ -258,111 +274,114 @@ impl DeltaBlock {
 
         for hh in 0..h {
             let off = hh * dh;
-            let states = &cache.s_pre[hh];
-            let mut ds = vec![0.0f32; dh * dh];
-            for t in (0..t_len).rev() {
-                let s_t = &states[(t + 1) * dh * dh..(t + 2) * dh * dh];
-                let s_prev = &states[t * dh * dh..(t + 1) * dh * dh];
-                let qt = &cache.q.row(t)[off..off + dh];
-                let kt = &cache.k.row(t)[off..off + dh];
-                let vt = &cache.v.row(t)[off..off + dh];
-                let a = cache.alpha.at(t, hh);
-                let b = cache.beta.at(t, hh);
-                let do_t = &d_o.row(t)[off..off + dh];
+            for bi in 0..cache.batch {
+                let states = &cache.s_pre[hh * cache.batch + bi];
+                let mut ds = vec![0.0f32; dh * dh];
+                for t in (0..cache.seq).rev() {
+                    let r = bi * cache.seq + t;
+                    let s_t = &states[(t + 1) * dh * dh..(t + 2) * dh * dh];
+                    let s_prev = &states[t * dh * dh..(t + 1) * dh * dh];
+                    let qt = &cache.q.row(r)[off..off + dh];
+                    let kt = &cache.k.row(r)[off..off + dh];
+                    let vt = &cache.v.row(r)[off..off + dh];
+                    let a = cache.alpha.at(r, hh);
+                    let b = cache.beta.at(r, hh);
+                    let do_t = &d_o.row(r)[off..off + dh];
 
-                // o_t = S_t^T q_t
-                {
-                    let mut dq = vec![0.0f32; dh];
+                    // o_t = S_t^T q_t
+                    {
+                        let mut dq = vec![0.0f32; dh];
+                        for a_i in 0..dh {
+                            let mut acc = 0.0;
+                            for i in 0..dh {
+                                acc += do_t[i] * s_t[a_i * dh + i];
+                            }
+                            dq[a_i] = acc;
+                        }
+                        let row = d_q.row_mut(r);
+                        for a_i in 0..dh {
+                            row[off + a_i] += dq[a_i];
+                        }
+                        for a_i in 0..dh {
+                            for i in 0..dh {
+                                ds[a_i * dh + i] += qt[a_i] * do_t[i];
+                            }
+                        }
+                    }
+
+                    // Sk = S_prev^T k ; u = beta*(v - alpha*Sk)
+                    // rekonstruksi Sk dan u dari cache
+                    let mut sk = vec![0.0f32; dh];
+                    for i in 0..dh {
+                        let mut acc = 0.0;
+                        for a_i in 0..dh {
+                            acc += s_prev[a_i * dh + i] * kt[a_i];
+                        }
+                        sk[i] = acc;
+                    }
+                    let mut u = vec![0.0f32; dh];
+                    for i in 0..dh {
+                        u[i] = b * (vt[i] - a * sk[i]);
+                    }
+
+                    // S_t = alpha*S_prev + k u^T
+                    let mut dalpha = 0.0f32;
+                    let mut dbeta = 0.0f32;
+                    let mut dk = vec![0.0f32; dh];
+                    let mut du = vec![0.0f32; dh];
+                    for a_i in 0..dh {
+                        for i in 0..dh {
+                            dalpha += ds[a_i * dh + i] * s_prev[a_i * dh + i];
+                        }
+                    }
                     for a_i in 0..dh {
                         let mut acc = 0.0;
                         for i in 0..dh {
-                            acc += do_t[i] * s_t[a_i * dh + i];
+                            acc += ds[a_i * dh + i] * u[i];
                         }
-                        dq[a_i] = acc;
+                        dk[a_i] += acc;
                     }
-                    let row = d_q.row_mut(t);
-                    for a_i in 0..dh {
-                        row[off + a_i] += dq[a_i];
+                    for i in 0..dh {
+                        let mut acc = 0.0;
+                        for a_i in 0..dh {
+                            acc += ds[a_i * dh + i] * kt[a_i];
+                        }
+                        du[i] = acc;
                     }
+                    let mut ds_prev = vec![0.0f32; dh * dh];
+                    for idx in 0..dh * dh {
+                        ds_prev[idx] = a * ds[idx];
+                    }
+
+                    // u = beta*(v - alpha*Sk)
+                    let mut dsk = vec![0.0f32; dh];
+                    for i in 0..dh {
+                        dbeta += du[i] * (vt[i] - a * sk[i]);
+                        d_v.row_mut(r)[off + i] += b * du[i];
+                        dsk[i] = -b * a * du[i];
+                        dalpha += -b * du[i] * sk[i];
+                    }
+
+                    // Sk = S_prev^T k
                     for a_i in 0..dh {
+                        let mut acc = 0.0;
                         for i in 0..dh {
-                            ds[a_i * dh + i] += qt[a_i] * do_t[i];
+                            acc += s_prev[a_i * dh + i] * dsk[i];
+                        }
+                        dk[a_i] += acc;
+                        for i in 0..dh {
+                            ds_prev[a_i * dh + i] += kt[a_i] * dsk[i];
                         }
                     }
-                }
 
-                // Sk = S_prev^T k ; u = beta*(v - alpha*Sk)
-                // rekonstruksi Sk dan u dari cache
-                let mut sk = vec![0.0f32; dh];
-                for i in 0..dh {
-                    let mut acc = 0.0;
+                    let dk_row = d_k.row_mut(r);
                     for a_i in 0..dh {
-                        acc += s_prev[a_i * dh + i] * kt[a_i];
+                        dk_row[off + a_i] += dk[a_i];
                     }
-                    sk[i] = acc;
+                    d_alpha.set(r, hh, dalpha);
+                    d_beta.set(r, hh, dbeta);
+                    ds = ds_prev;
                 }
-                let mut u = vec![0.0f32; dh];
-                for i in 0..dh {
-                    u[i] = b * (vt[i] - a * sk[i]);
-                }
-
-                // S_t = alpha*S_prev + k u^T
-                let mut dalpha = 0.0f32;
-                let mut dbeta = 0.0f32;
-                let mut dk = vec![0.0f32; dh];
-                let mut du = vec![0.0f32; dh];
-                for a_i in 0..dh {
-                    for i in 0..dh {
-                        dalpha += ds[a_i * dh + i] * s_prev[a_i * dh + i];
-                    }
-                }
-                for a_i in 0..dh {
-                    let mut acc = 0.0;
-                    for i in 0..dh {
-                        acc += ds[a_i * dh + i] * u[i];
-                    }
-                    dk[a_i] += acc;
-                }
-                for i in 0..dh {
-                    let mut acc = 0.0;
-                    for a_i in 0..dh {
-                        acc += ds[a_i * dh + i] * kt[a_i];
-                    }
-                    du[i] = acc;
-                }
-                let mut ds_prev = vec![0.0f32; dh * dh];
-                for idx in 0..dh * dh {
-                    ds_prev[idx] = a * ds[idx];
-                }
-
-                // u = beta*(v - alpha*Sk)
-                let mut dsk = vec![0.0f32; dh];
-                for i in 0..dh {
-                    dbeta += du[i] * (vt[i] - a * sk[i]);
-                    d_v.row_mut(t)[off + i] += b * du[i];
-                    dsk[i] = -b * a * du[i];
-                    dalpha += -b * du[i] * sk[i];
-                }
-
-                // Sk = S_prev^T k
-                for a_i in 0..dh {
-                    let mut acc = 0.0;
-                    for i in 0..dh {
-                        acc += s_prev[a_i * dh + i] * dsk[i];
-                    }
-                    dk[a_i] += acc;
-                    for i in 0..dh {
-                        ds_prev[a_i * dh + i] += kt[a_i] * dsk[i];
-                    }
-                }
-
-                let dk_row = d_k.row_mut(t);
-                for a_i in 0..dh {
-                    dk_row[off + a_i] += dk[a_i];
-                }
-                d_alpha.set(t, hh, dalpha);
-                d_beta.set(t, hh, dbeta);
-                ds = ds_prev;
             }
         }
 

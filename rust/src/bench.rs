@@ -11,7 +11,7 @@ use crate::train::{Data, Split};
 
 /// Antarmuka minimal supaya loop training bisa dipakai kedua arsitektur.
 pub trait Trainable {
-    fn forward_backward(&mut self, ids: &[u32], tgts: &[u32]) -> f32;
+    fn forward_backward(&mut self, ids: &[u32], tgts: &[u32], batch: usize) -> f32;
     fn zero_grads(&mut self);
     fn params_mut(&mut self) -> Vec<&mut Param>;
     fn num_params(&self) -> usize;
@@ -22,8 +22,8 @@ pub trait Trainable {
 }
 
 impl Trainable for Model {
-    fn forward_backward(&mut self, ids: &[u32], tgts: &[u32]) -> f32 {
-        let (logits, cache) = self.forward(ids);
+    fn forward_backward(&mut self, ids: &[u32], tgts: &[u32], batch: usize) -> f32 {
+        let (logits, cache) = self.forward(ids, batch);
         self.backward(&cache, &logits, tgts)
     }
     fn zero_grads(&mut self) {
@@ -56,8 +56,8 @@ impl Trainable for Model {
 }
 
 impl Trainable for DenseModel {
-    fn forward_backward(&mut self, ids: &[u32], tgts: &[u32]) -> f32 {
-        let (logits, cache) = self.forward(ids);
+    fn forward_backward(&mut self, ids: &[u32], tgts: &[u32], batch: usize) -> f32 {
+        let (logits, cache) = self.forward(ids, batch);
         self.backward(&cache, &logits, tgts)
     }
     fn zero_grads(&mut self) {
@@ -137,16 +137,8 @@ pub fn run_curve<T: Trainable>(
     for step_i in 0..cfg.steps {
         opt.lr = lr_at(step_i, cfg);
         model.zero_grads();
-        for _ in 0..cfg.batch {
-            let (ids, tgts) = data.batch(&mut rng, cfg.seq_len, Split::Train);
-            model.forward_backward(&ids, &tgts);
-        }
-        let inv = 1.0 / cfg.batch as f32;
-        for p in model.params_mut() {
-            for g in p.grad.d.iter_mut() {
-                *g *= inv;
-            }
-        }
+        let (ids, tgts) = data.batch_seqs(&mut rng, cfg.seq_len, cfg.batch, Split::Train);
+        model.forward_backward(&ids, &tgts, cfg.batch);
         for p in model.params_mut() {
             opt.update(p);
         }
@@ -155,7 +147,7 @@ pub fn run_curve<T: Trainable>(
             for _ in 0..cfg.eval_batches {
                 let (ids, tgts) = data.batch(&mut eval_rng, cfg.seq_len, Split::Val);
                 model.zero_grads();
-                vl += model.forward_backward(&ids, &tgts);
+                vl += model.forward_backward(&ids, &tgts, 1);
             }
             model.zero_grads();
             let seen = (step_i + 1) * cfg.batch * cfg.seq_len;
@@ -170,7 +162,7 @@ pub fn run_curve<T: Trainable>(
     for _ in 0..cfg.eval_batches {
         let (ids, tgts) = data.batch(&mut rng, cfg.seq_len, Split::Val);
         model.zero_grads();
-        vl += model.forward_backward(&ids, &tgts);
+        vl += model.forward_backward(&ids, &tgts, 1);
     }
     model.zero_grads();
     vl /= cfg.eval_batches as f32;

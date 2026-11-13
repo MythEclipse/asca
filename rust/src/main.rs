@@ -135,7 +135,7 @@ fn cmd_sample(args: &[String]) {
     let mut rng = Rng::new(arg(args, "--seed", "0").parse().unwrap());
     print!("{prompt}");
     for _ in 0..n {
-        let (logits, _) = model.forward(&ctx);
+        let (logits, _) = model.forward(&ctx, 1);
         let last = logits.rows - 1;
         let row = logits.row(last);
         // sampling suhu 0.8

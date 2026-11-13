@@ -43,8 +43,8 @@ Yang berbeda **hanya arsitekturnya**. Ini satu-satunya cara klaim efisiensi jadi
 
 | mode | ASCA val_loss | dense val_loss | Δ (asca−dense) | t (df=2) | tok/s ASCA | tok/s dense |
 |---|---|---|---|---|---|---|
-| total params 331k | **1,7343 ± 0,1229** | 1,9762 ± 0,0827 | **−0,2419 ± 0,0741** | −5,65 | 20.407 | 4.503 |
-| active params 99k | **1,7343 ± 0,1229** | 1,9778 ± 0,1176 | **−0,2435 ± 0,0097** | −43,35 | 20.679 | 16.370 |
+| total params 331k | **1,7343 ± 0,1229** | 1,9763 ± 0,0828 | **−0,2420 ± 0,0741** | −5,65 | 20.410 | 6.130 |
+| active params 99k | **1,7343 ± 0,1229** | 1,9778 ± 0,1176 | **−0,2435 ± 0,0097** | −43,35 | 20.320 | 21.493 |
 
 State decode pada konteks 128: **ASCA 2.048 float (konstan)** vs **dense 32.768 float
 (tumbuh O(T))**. Pada konteks 1024 dense butuh 262.144 float, ASCA tetap 2.048.
@@ -53,10 +53,11 @@ State decode pada konteks 128: **ASCA 2.048 float (konstan)** vs **dense 32.768 
 
 - Pada **total params sama**: ASCA menang kualitas ~0,24 dan **4,5× lebih cepat**,
   dengan state decode 16× lebih kecil dan tidak tumbuh terhadap konteks.
-- Pada **active params sama**: ASCA masih menang kualitas ~0,24 dan **1,26× lebih
-  cepat**. Klaim lama bahwa ASCA 2× lebih lambat di sini **dicabut**: itu artefak kode
-  yang belum dioptimasi. Sesudah kedua jalur dioptimasi (lihat
-  [`PERF.md`](PERF.md)), ASCA lebih cepat di kedua mode pencocokan.
+- Pada **active params sama**: ASCA masih menang kualitas ~0,24, tetapi throughput-nya
+  **setara** (rasio 0,95×). Dua klaim sebelumnya dicabut di sini: "ASCA 2× lebih lambat"
+  (artefak kode belum dioptimasi) dan "ASCA 1,26× lebih cepat" (diukur sebelum batching;
+  batching + offload GPU menaikkan dense 31%, ASCA tidak). Yang tersisa sebagai keunggulan
+  ASCA pada mode ini adalah state decode 2.048 float konstan vs 32.768 yang tumbuh O(T).
 
 > **Catatan revisi (v2.1).** Angka throughput di tabel ini berasal dari run yang sama
 > dengan angka loss (400 langkah, 3 seed, lr 6e-3) tetapi sesudah optimasi CPU 3,08×.

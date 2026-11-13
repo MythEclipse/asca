@@ -55,13 +55,20 @@ The gap **shrinks 69%** and flattens around −0.05…−0.08 with **no crossove
 tokens** — but t = −4.0 with 3 seeds is p ≈ 0.058, so **no quality advantage can be
 claimed yet**. The earlier "ASCA wins by 0.24" is retracted.
 
-What *is* measured and stable is cost. After a 3.08× CPU optimisation pass (see
-[`docs/PERF.md`](docs/PERF.md)) ASCA trains **4.53× faster** at matched total parameters
-(20,407 vs 4,503 tok/s) and **1.26× faster** at matched active parameters (20,679 vs
-16,370 tok/s), with a decode state of **2,048 floats that does not grow with context**,
-versus 32,768 for the dense KV cache. An earlier claim that ASCA was 2× *slower* at
-matched active parameters is retracted — that was unoptimised code, not the
-architecture; both paths were optimised before this comparison.
+What *is* measured is cost, and it keeps moving as the engine improves. After a 3.08×
+CPU optimisation pass and cross-sequence batching (see [`docs/PERF.md`](docs/PERF.md)),
+ASCA trains **3.33× faster** at matched total parameters (20,410 vs 6,130 tok/s) and at
+matched active parameters the two are **at parity** (20,320 vs 21,493 tok/s, ratio 0.95).
+
+Two earlier throughput claims are retracted: "ASCA is 2× slower at matched active
+parameters" (unoptimised code) and "ASCA is 1.26× faster at matched active parameters"
+(measured before batching — batching plus GPU offload lifted the dense baseline by 31%
+and left ASCA flat, because ASCA's cost is per-token MoE buckets and the delta scan,
+while dense's cost is large GEMMs that benefit from 512-row batches).
+
+What survives as an ASCA advantage on this axis is **decode state**: 2,048 floats that
+do not grow with context, versus 32,768 for the dense KV cache (262,144 at context
+1024).
 
 A bug in the baseline nearly made the first number look better than it was: `rope_apply`
 rotated only the first head's slice, so 3 of 4 heads had no positional information.

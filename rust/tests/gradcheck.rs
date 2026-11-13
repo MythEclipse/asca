@@ -4,7 +4,7 @@ use asca_rs::delta::{DeltaBlock, DeltaCfg};
 use asca_rs::tensor::{Mat, Rng};
 
 fn loss_of(block: &DeltaBlock, x: &Mat, dy: &Mat) -> f32 {
-    let (y, _) = block.forward(x);
+    let (y, _) = block.forward(x, 1);
     let mut l = 0.0f32;
     for r in 0..y.rows {
         for c in 0..y.cols {
@@ -19,7 +19,7 @@ fn check_param(name: &str, block: &mut DeltaBlock, x: &Mat, dy: &Mat, fails: &mu
     for p in block.params_mut() {
         p.zero_grad();
     }
-    let (_, cache) = block.forward(x);
+    let (_, cache) = block.forward(x, 1);
     let _dx = block.backward(&cache, dy);
 
     let eps = 1e-3f32;
@@ -90,7 +90,7 @@ fn main() {
     for p in block.params_mut() {
         p.zero_grad();
     }
-    let (_, cache) = block.forward(&x);
+    let (_, cache) = block.forward(&x, 1);
     let dx = block.backward(&cache, &dy);
     let eps = 1e-3f32;
     let mut worst = 0.0f32;

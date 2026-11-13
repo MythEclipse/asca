@@ -63,6 +63,7 @@ pub struct DenseCache {
     pub ids: Vec<u32>,
     pub layers: Vec<DenseLayerCache>,
     pub h_final: Mat,
+    pub batch: usize,
 }
 
 #[inline]
@@ -194,8 +195,15 @@ impl DenseModel {
         }
     }
 
-    pub fn forward(&self, ids: &[u32]) -> (Mat, DenseCache) {
+    /// `ids` berisi `batch` sekuens ditumpuk (`batch * seq`); attention dihitung
+    /// block-diagonal per sekuens, sedangkan semua GEMM memakai seluruh baris.
+    pub fn forward(&self, ids: &[u32], batch: usize) -> (Mat, DenseCache) {
         let t_len = ids.len();
+        assert!(
+            batch >= 1 && t_len % batch == 0,
+            "baris harus habis dibagi batch"
+        );
+        let seq = t_len / batch;
         let d = self.cfg.d_model;
         let h = self.cfg.n_heads;
         let dh = d / h;
@@ -229,38 +237,49 @@ impl DenseModel {
             rope_apply(&mut q, h, dh, 1.0);
             rope_apply(&mut k, h, dh, 1.0);
 
-            let mut probs = vec![0.0f32; h * t_len * t_len];
+            // attention block-diagonal: setiap sekuens punya jendela kausalnya sendiri
+            let mut probs = vec![0.0f32; h * t_len * seq];
             let mut o = Mat::zeros(t_len, d);
+            let mut scores = vec![0.0f32; seq];
             for hh in 0..h {
                 let off = hh * dh;
-                for t in 0..t_len {
-                    // skor kausal
-                    let mut row = vec![0.0f32; t + 1];
-                    for s in 0..=t {
-                        let mut acc = 0.0f32;
-                        for c in 0..dh {
-                            acc += q.at(t, off + c) * k.at(s, off + c);
-                        }
-                        row[s] = acc * scale;
-                    }
-                    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0f32;
-                    for z in row.iter_mut() {
-                        *z = (*z - max).exp();
-                        sum += *z;
-                    }
-                    for z in row.iter_mut() {
-                        *z /= sum;
-                    }
-                    for s in 0..=t {
-                        probs[(hh * t_len + t) * t_len + s] = row[s];
-                    }
-                    for c in 0..dh {
-                        let mut acc = 0.0f32;
+                for bi in 0..batch {
+                    let base = bi * seq;
+                    for t in 0..seq {
+                        let r = base + t;
+                        let qr = &q.row(r)[off..off + dh];
                         for s in 0..=t {
-                            acc += row[s] * v.at(s, off + c);
+                            let ks = &k.row(base + s)[off..off + dh];
+                            let mut acc = 0.0f32;
+                            for c in 0..dh {
+                                acc += qr[c] * ks[c];
+                            }
+                            scores[s] = acc * scale;
                         }
-                        o.set(t, off + c, acc);
+                        let max = scores[..=t]
+                            .iter()
+                            .cloned()
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum = 0.0f32;
+                        for z in scores[..=t].iter_mut() {
+                            *z = (*z - max).exp();
+                            sum += *z;
+                        }
+                        for z in scores[..=t].iter_mut() {
+                            *z /= sum;
+                        }
+                        let pb = (hh * t_len + r) * seq;
+                        for s in 0..=t {
+                            probs[pb + s] = scores[s];
+                        }
+                        let orow = o.row_mut(r);
+                        for c in 0..dh {
+                            let mut acc = 0.0f32;
+                            for s in 0..=t {
+                                acc += scores[s] * v.at(base + s, off + c);
+                            }
+                            orow[off + c] = acc;
+                        }
                     }
                 }
             }
@@ -312,12 +331,13 @@ impl DenseModel {
                 ids: ids.to_vec(),
                 layers: caches,
                 h_final,
+                batch,
             },
         )
     }
 
     pub fn loss(&self, ids: &[u32], targets: &[u32]) -> f32 {
-        let (logits, _) = self.forward(ids);
+        let (logits, _) = self.forward(ids, 1);
         let v = self.cfg.vocab;
         let mut loss = 0.0f32;
         for t in 0..logits.rows {
@@ -429,34 +449,45 @@ impl DenseModel {
             let mut dq = Mat::zeros(t_len, d);
             let mut dk = Mat::zeros(t_len, d);
             let mut dv = Mat::zeros(t_len, d);
+            let batch = cache.batch;
+            let seq = t_len / batch;
             for hh in 0..h {
                 let off = hh * dh;
-                let mut dp = vec![0.0f32; t_len];
-                let mut dscores = vec![0.0f32; t_len];
-                for t in 0..t_len {
-                    // dp[t,s] = dO_t . v_s ; slice baris diambil sekali per t
-                    let do_t = &d_o.row(t)[off..off + dh];
-                    let mut sum = 0.0f32;
-                    for s in 0..=t {
-                        let p = lc.attn.probs[(hh * t_len + t) * t_len + s];
-                        let vs = &lc.attn.v.row(s)[off..off + dh];
-                        let mut acc = 0.0f32;
-                        for c in 0..dh {
-                            acc += do_t[c] * vs[c];
+                let mut dp = vec![0.0f32; seq];
+                let mut dscores = vec![0.0f32; seq];
+                for bi in 0..batch {
+                    let base = bi * seq;
+                    for t in 0..seq {
+                        let r = base + t;
+                        // dp[t,s] = dO_t . v_s ; slice baris diambil sekali per t
+                        let do_t = &d_o.row(r)[off..off + dh];
+                        let mut sum = 0.0f32;
+                        for s in 0..=t {
+                            let p = lc.attn.probs[(hh * t_len + r) * seq + s];
+                            let vs = &lc.attn.v.row(base + s)[off..off + dh];
+                            let mut acc = 0.0f32;
+                            for c in 0..dh {
+                                acc += do_t[c] * vs[c];
+                            }
+                            dp[s] = acc;
+                            sum += p * acc;
                         }
-                        dp[s] = acc;
-                        sum += p * acc;
-                    }
-                    for s in 0..=t {
-                        let p = lc.attn.probs[(hh * t_len + t) * t_len + s];
-                        dscores[s] = p * (dp[s] - sum);
-                    }
-                    for s in 0..=t {
-                        for c in 0..dh {
-                            dv.row_mut(s)[off + c] +=
-                                lc.attn.probs[(hh * t_len + t) * t_len + s] * d_o.at(t, off + c);
-                            dq.row_mut(t)[off + c] += dscores[s] * lc.attn.k.at(s, off + c) * scale;
-                            dk.row_mut(s)[off + c] += dscores[s] * lc.attn.q.at(t, off + c) * scale;
+                        for s in 0..=t {
+                            let p = lc.attn.probs[(hh * t_len + r) * seq + s];
+                            dscores[s] = p * (dp[s] - sum);
+                        }
+                        let qt_head = lc.attn.q.row(r)[off..off + dh].to_vec();
+                        let dq_t = &mut dq.row_mut(r)[off..off + dh];
+                        for s in 0..=t {
+                            let p = lc.attn.probs[(hh * t_len + r) * seq + s];
+                            let ks = &lc.attn.k.row(base + s)[off..off + dh];
+                            let dv_s = &mut dv.row_mut(base + s)[off..off + dh];
+                            let dk_s = &mut dk.row_mut(base + s)[off..off + dh];
+                            for c in 0..dh {
+                                dv_s[c] += p * do_t[c];
+                                dq_t[c] += dscores[s] * ks[c] * scale;
+                                dk_s[c] += dscores[s] * qt_head[c] * scale;
+                            }
                         }
                     }
                 }
