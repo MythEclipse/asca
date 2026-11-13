@@ -40,6 +40,18 @@ impl Data {
     /// Simpan id token yang sudah di-encode, supaya proses berikutnya tidak perlu
     /// meng-encode ulang korpus (26 detik untuk 100 MB, dan itu dibayar setiap kali
     /// menjalankan sweep LR atau melanjutkan training).
+    /// Bits per byte: ukuran kualitas yang TIDAK bergantung tokenizer.
+    ///
+    /// `val_loss` adalah nats per token, jadi model dengan vocab berbeda tidak bisa
+    /// dibandingkan langsung - vocab besar otomatis punya loss per token lebih tinggi
+    /// walau kemampuannya sama. Membagi dengan byte/token dan ln(2) menghasilkan bits
+    /// per byte, satuan yang sama dipakai paper bahasa lain sehingga angkanya bisa
+    /// diletakkan berdampingan dengan hasil orang lain.
+    pub fn bits_per_byte(&self, val_loss: f32) -> f32 {
+        let bpt = self.raw_bytes as f32 / self.tokens.len() as f32;
+        val_loss / std::f32::consts::LN_2 / bpt
+    }
+
     pub fn save_tokens(&self, path: &str, vocab: usize) -> std::io::Result<()> {
         let mut f = fs::File::create(path)?;
         f.write_all(b"ASCATOK1")?;
@@ -249,10 +261,11 @@ where
         if cfg.eval_every > 0 && (step_i + 1) % cfg.eval_every == 0 {
             let vl = evaluate(model, data, &mut rng, cfg);
             println!(
-                "  eval step {}: val_loss {:.4}  ppl {:.2}",
+                "  eval step {}: val_loss {:.4}  ppl {:.2}  bpb {:.4}",
                 step_i + 1,
                 vl,
-                vl.exp()
+                vl.exp(),
+                data.bits_per_byte(vl)
             );
             // simpan berkala supaya run panjang tidak hilang kalau terputus
             on_save(model, &opt, step_i + 1)?;

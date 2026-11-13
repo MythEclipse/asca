@@ -289,7 +289,12 @@ fn cmd_train(args: &[String]) {
     )
     .expect("gagal training");
     let vl = train::evaluate(&mut model, &data, &mut rng, &tcfg);
-    println!("val_loss akhir: {:.4}  ppl {:.2}", vl, vl.exp());
+    println!(
+        "val_loss akhir: {:.4}  ppl {:.2}  bpb {:.4}",
+        vl,
+        vl.exp(),
+        data.bits_per_byte(vl)
+    );
     train::save_resume(&out, &model, tcfg.steps).expect("gagal simpan checkpoint");
     println!("checkpoint disimpan: {out}");
 }
@@ -315,12 +320,13 @@ fn cmd_eval(args: &[String]) {
     let mut rng = Rng::new(1234);
     let vl = train::evaluate(&mut model, &data, &mut rng, &tcfg);
     println!(
-        "ckpt d_model {} n_layers {} n_experts {}: val_loss {:.4}  ppl {:.2}",
+        "ckpt d_model {} n_layers {} n_experts {}: val_loss {:.4}  ppl {:.2}  bpb {:.4}",
         cfg.d_model,
         cfg.n_layers,
         cfg.n_experts,
         vl,
-        vl.exp()
+        vl.exp(),
+        data.bits_per_byte(vl)
     );
     let _ = Split::Train;
 }
