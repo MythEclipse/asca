@@ -249,6 +249,87 @@ impl DeltaBlock {
     }
 
     /// Backward. Mengembalikan `dx` dan mengakumulasi gradien ke parameter.
+    /// Satu langkah decode: `x` adalah (1, d_model), `states[hh]` adalah state
+    /// `dh x dh` per head yang dibawa antar token. Tidak ada cache yang tumbuh
+    /// terhadap panjang konteks — inilah klaim memori ASCA, dan `step` adalah
+    /// satu-satunya tempat yang membuktikannya bisa dijalankan.
+    pub fn step(&self, x: &Mat, states: &mut [Vec<f32>]) -> Mat {
+        let d = self.cfg.d_model;
+        let h = self.cfg.n_heads;
+        let dh = self.dh;
+        assert_eq!(x.rows, 1, "step hanya untuk satu token");
+        let mut qkv = x.matmul(&self.w_qkv.value);
+        qkv.add_row_bias(&self.b_qkv.value.d);
+        let mut gate = x.matmul(&self.w_gate.value);
+        gate.add_row_bias(&self.b_gate.value.d);
+        let qkv_row = qkv.row(0);
+        let gate_row = gate.row(0);
+        let mut o = Mat::zeros(1, d);
+        let orow = o.row_mut(0);
+        let mut sk = vec![0.0f32; dh];
+        let mut u = vec![0.0f32; dh];
+        for hh in 0..h {
+            let off = hh * dh;
+            let a = sigmoid(gate_row[hh]);
+            let b = sigmoid(gate_row[h + hh]);
+            // L2-normalize q dan k per head, sama seperti forward
+            let mut qn = [0.0f32; 64];
+            let mut kn = [0.0f32; 64];
+            let (mut qq, mut kk) = (0.0f32, 0.0f32);
+            for i in 0..dh {
+                let qv = qkv_row[off + i];
+                let kv = qkv_row[d + off + i];
+                qq += qv * qv;
+                kk += kv * kv;
+            }
+            // harus identik dengan forward: bagi dengan max(norm, 1e-8)
+            let qi = 1.0 / qq.sqrt().max(1e-8);
+            let ki = 1.0 / kk.sqrt().max(1e-8);
+            for i in 0..dh {
+                qn[i] = qkv_row[off + i] * qi;
+                kn[i] = qkv_row[d + off + i] * ki;
+            }
+            let s = &mut states[hh];
+            // Sk = S^T k
+            sk.iter_mut().for_each(|z| *z = 0.0);
+            for a_i in 0..dh {
+                let ka = kn[a_i];
+                if ka == 0.0 {
+                    continue;
+                }
+                crate::simd::axpy(&mut sk, ka, &s[a_i * dh..(a_i + 1) * dh]);
+            }
+            // u = beta*(v - alpha*Sk); S = alpha*S + k u^T
+            for i in 0..dh {
+                u[i] = b * (qkv_row[2 * d + off + i] - a * sk[i]);
+            }
+            for a_i in 0..dh {
+                let ka = kn[a_i];
+                if ka == 0.0 {
+                    crate::simd::scale(&mut s[a_i * dh..(a_i + 1) * dh], a);
+                    continue;
+                }
+                crate::simd::scale_axpy(&mut s[a_i * dh..(a_i + 1) * dh], a, ka, &u);
+            }
+            // o = S^T q
+            for i in 0..dh {
+                let mut acc = 0.0f32;
+                for a_i in 0..dh {
+                    acc += s[a_i * dh + i] * qn[a_i];
+                }
+                orow[off + i] = acc;
+            }
+        }
+        let mut y = o.matmul(&self.w_o.value);
+        y.add_row_bias(&self.b_o.value.d);
+        y
+    }
+
+    /// Berapa float state yang dibawa antar token: `n_heads * dh * dh`, konstan.
+    pub fn state_floats(&self) -> usize {
+        self.cfg.n_heads * self.dh * self.dh
+    }
+
     pub fn backward(&mut self, cache: &DeltaCache, dy: &Mat) -> Mat {
         let (t_len, d) = (cache.x.rows, self.cfg.d_model);
         let h = self.cfg.n_heads;

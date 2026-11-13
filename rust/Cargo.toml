@@ -29,6 +29,10 @@ harness = false
 name = "batch_parity"
 harness = false
 
+[[test]]
+name = "decode_parity"
+harness = false
+
 [dependencies]
 
 [profile.release]

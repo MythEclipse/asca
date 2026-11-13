@@ -172,6 +172,37 @@ impl HashMoe {
         )
     }
 
+    /// Satu langkah decode untuk satu token.
+    pub fn step(&self, x: &Mat, id: u32) -> Mat {
+        let d = x.cols;
+        let d_ff = self.d_ff;
+        let xn = rmsnorm_rows(x, EPS);
+        let e = hash_route(id, self.n_experts);
+        let xr = xn.row(0);
+        let mut pre = self.b1.value.d[e * d_ff..(e + 1) * d_ff].to_vec();
+        for c in 0..d {
+            let xc = xr[c];
+            if xc == 0.0 {
+                continue;
+            }
+            crate::simd::axpy(
+                &mut pre,
+                xc,
+                &self.w1.value.row(c)[e * d_ff..(e + 1) * d_ff],
+            );
+        }
+        for p in pre.iter_mut() {
+            *p = silu(*p);
+        }
+        let mut out = Mat::zeros(1, d);
+        let orow = out.row_mut(0);
+        orow.copy_from_slice(&self.b2.value.d);
+        for j in 0..d_ff {
+            crate::simd::axpy(orow, pre[j], self.w2.value.row(e * d_ff + j));
+        }
+        out
+    }
+
     pub fn backward(&mut self, cache: &MoeCache, dout: &Mat) -> Mat {
         let (t_len, d) = (cache.x.rows, cache.x.cols);
         let d_ff = self.d_ff;
@@ -258,6 +289,11 @@ pub struct LayerCache {
     pub x_out: Mat,
 }
 
+pub struct DecodeState {
+    /// per layer, per head: state `dh x dh`
+    pub delta: Vec<Vec<Vec<f32>>>,
+}
+
 pub struct ModelCache {
     pub ids: Vec<u32>,
     pub x0: Mat,
@@ -319,6 +355,40 @@ impl Model {
         for p in self.params_mut() {
             p.zero_grad();
         }
+    }
+
+    /// State decode ASCA: untuk setiap layer, satu matriks `dh x dh` per head.
+    /// Ukurannya tetap, berapa pun panjang konteksnya.
+    pub fn new_decode_state(&self) -> DecodeState {
+        DecodeState {
+            delta: self
+                .layers
+                .iter()
+                .map(|l| vec![vec![0.0f32; l.delta.dh * l.delta.dh]; self.cfg.n_heads])
+                .collect(),
+        }
+    }
+
+    /// Decode satu token: logits `(1, vocab)`, state diperbarui di tempat.
+    /// Paritasnya terhadap `forward` diuji di `tests/decode_parity.rs`.
+    pub fn step(&self, id: u32, st: &mut DecodeState) -> Mat {
+        let d = self.cfg.d_model;
+        let mut x = Mat::zeros(1, d);
+        x.row_mut(0)
+            .copy_from_slice(self.embed.value.row(id as usize));
+        for (li, layer) in self.layers.iter().enumerate() {
+            // Sama seperti forward: delta menerima input mentah (tidak menormalkan),
+            // MoE menormalkan sendiri di dalam.
+            let dy = layer.delta.step(&x, &mut st.delta[li]);
+            let mut x_mid = x.clone();
+            x_mid.axpy(1.0, &dy);
+            let dm = layer.moe.step(&x_mid, id);
+            let mut x_out = x_mid.clone();
+            x_out.axpy(1.0, &dm);
+            x = x_out;
+        }
+        let h_final = rmsnorm_rows(&x, EPS);
+        h_final.matmul(&self.head.value)
     }
 
     pub fn forward(&self, ids: &[u32], batch: usize) -> (Mat, ModelCache) {
