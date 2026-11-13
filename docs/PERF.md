@@ -178,6 +178,22 @@ Hasil (400 langkah, 3 seed, lr 6e-3, `ASCA_GPU_MIN=4e6`):
 
 Loss **tidak berubah sama sekali** (1,7343 / 1,9762 / 1,9778), jadi ini murni kecepatan.
 
+### A/B tanpa membangun ulang
+
+`ASCA_NO_SIMD=1` memaksa jalur skalar, jadi kontribusi SIMD bisa diukur pada binary yang
+sama dengan run bergantian (penting kalau mesin sedang dipakai proses lain):
+
+| run | SIMD | skalar | rasio |
+|---|---|---|---|
+| 1 | 27.285 tok/s | 19.894 tok/s | 1,37× |
+| 2 | 28.195 tok/s | 19.067 tok/s | 1,48× |
+| 3 | 26.799 tok/s | 18.130 tok/s | 1,48× |
+
+> **Koreksi.** Sempat saya duga SIMD merugikan loop pendek (16 float) di scan delta,
+> karena `delta.scan` di profil naik 60 → 112 ms. Itu artefak: profil lama memakai
+> penyebut 240 forward 128 baris, yang baru 40 forward 512 baris. Setelah dinormalisasi
+> per token, dan dikonfirmasi A/B di atas, SIMD menguntungkan di semua loop.
+
 ### Kenapa dense tidak ikut naik
 
 Karena matmul dense sudah dilempar ke GPU (512×64×128 = 4,2e6 sudah di atas ambang 4e6),

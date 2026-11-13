@@ -98,8 +98,9 @@ is 2,048 floats constant versus 32,768 growing with context. Throughput figures 
 post-optimisation and post-batching — see `../docs/PERF.md`.
 
 Inner loops use hand-written AVX2/FMA kernels (`src/simd.rs`, runtime feature detection,
-scalar fallback). This is worth +58% end-to-end for ASCA and ~0% for the dense baseline,
-whose matmuls are already offloaded to the GPU.
+scalar fallback, `ASCA_NO_SIMD=1` to force the scalar path for A/B). This is worth +58%
+end-to-end for ASCA and ~0% for the dense baseline, whose matmuls are already offloaded to
+the GPU; measured A/B against the scalar path: 1.37-1.48x.
 
 Batching (`batch` sequences stacked into one `B*T` row block) is verified by
 `tests/batch_parity.rs`: one `batch=4` forward/backward matches four `batch=1` passes to

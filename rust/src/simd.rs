@@ -14,6 +14,12 @@ static AVX2: OnceLock<bool> = OnceLock::new();
 #[inline]
 pub fn has_avx2() -> bool {
     *AVX2.get_or_init(|| {
+        // `ASCA_NO_SIMD=1` memaksa jalur skalar tanpa membangun ulang. Dipakai untuk
+        // A/B: pada loop pendek (mis. dh=16 di scan delta) biaya cek fitur per panggilan
+        // bisa melebihi kerja vektornya, dan itu hanya bisa diketahui dengan mengukur.
+        if std::env::var("ASCA_NO_SIMD").ok().as_deref() == Some("1") {
+            return false;
+        }
         std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma")
     })
 }
@@ -90,18 +96,18 @@ pub fn scale_axpy(dst: &mut [f32], a: f32, b: f32, src: &[f32]) {
 unsafe fn scale_avx2(dst: &mut [f32], a: f32) {
     use std::arch::x86_64::*;
     unsafe {
-    let n = dst.len();
-    let mut i = 0;
-    let av = _mm256_set1_ps(a);
-    while i + 8 <= n {
-        let d = _mm256_loadu_ps(dst.as_ptr().add(i));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_mul_ps(d, av));
-        i += 8;
-    }
-    while i < n {
-        *dst.get_unchecked_mut(i) *= a;
-        i += 1;
-    }
+        let n = dst.len();
+        let mut i = 0;
+        let av = _mm256_set1_ps(a);
+        while i + 8 <= n {
+            let d = _mm256_loadu_ps(dst.as_ptr().add(i));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_mul_ps(d, av));
+            i += 8;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) *= a;
+            i += 1;
+        }
     }
 }
 
@@ -109,21 +115,21 @@ unsafe fn scale_avx2(dst: &mut [f32], a: f32) {
 unsafe fn scale_axpy_avx2(dst: &mut [f32], a: f32, b: f32, src: &[f32]) {
     use std::arch::x86_64::*;
     unsafe {
-    let n = dst.len();
-    let mut i = 0;
-    let av = _mm256_set1_ps(a);
-    let bv = _mm256_set1_ps(b);
-    while i + 8 <= n {
-        let d = _mm256_loadu_ps(dst.as_ptr().add(i));
-        let s = _mm256_loadu_ps(src.as_ptr().add(i));
-        let r = _mm256_fmadd_ps(bv, s, _mm256_mul_ps(av, d));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), r);
-        i += 8;
-    }
-    while i < n {
-        *dst.get_unchecked_mut(i) = a * *dst.get_unchecked(i) + b * *src.get_unchecked(i);
-        i += 1;
-    }
+        let n = dst.len();
+        let mut i = 0;
+        let av = _mm256_set1_ps(a);
+        let bv = _mm256_set1_ps(b);
+        while i + 8 <= n {
+            let d = _mm256_loadu_ps(dst.as_ptr().add(i));
+            let s = _mm256_loadu_ps(src.as_ptr().add(i));
+            let r = _mm256_fmadd_ps(bv, s, _mm256_mul_ps(av, d));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), r);
+            i += 8;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) = a * *dst.get_unchecked(i) + b * *src.get_unchecked(i);
+            i += 1;
+        }
     }
 }
 
@@ -131,19 +137,19 @@ unsafe fn scale_axpy_avx2(dst: &mut [f32], a: f32, b: f32, src: &[f32]) {
 unsafe fn axpy_avx2(dst: &mut [f32], a: f32, src: &[f32]) {
     use std::arch::x86_64::*;
     unsafe {
-    let n = dst.len();
-    let mut i = 0;
-    let av = _mm256_set1_ps(a);
-    while i + 8 <= n {
-        let d = _mm256_loadu_ps(dst.as_ptr().add(i));
-        let s = _mm256_loadu_ps(src.as_ptr().add(i));
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_fmadd_ps(av, s, d));
-        i += 8;
-    }
-    while i < n {
-        *dst.get_unchecked_mut(i) += a * *src.get_unchecked(i);
-        i += 1;
-    }
+        let n = dst.len();
+        let mut i = 0;
+        let av = _mm256_set1_ps(a);
+        while i + 8 <= n {
+            let d = _mm256_loadu_ps(dst.as_ptr().add(i));
+            let s = _mm256_loadu_ps(src.as_ptr().add(i));
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), _mm256_fmadd_ps(av, s, d));
+            i += 8;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) += a * *src.get_unchecked(i);
+            i += 1;
+        }
     }
 }
 
@@ -151,27 +157,27 @@ unsafe fn axpy_avx2(dst: &mut [f32], a: f32, src: &[f32]) {
 unsafe fn dot_avx2(dst: &[f32], src: &[f32]) -> f32 {
     use std::arch::x86_64::*;
     unsafe {
-    let n = dst.len();
-    let mut i = 0;
-    let mut acc = _mm256_setzero_ps();
-    while i + 8 <= n {
-        let a = _mm256_loadu_ps(dst.as_ptr().add(i));
-        let b = _mm256_loadu_ps(src.as_ptr().add(i));
-        acc = _mm256_fmadd_ps(a, b, acc);
-        i += 8;
-    }
-    // horizontal sum
-    let hi = _mm256_extractf128_ps(acc, 1);
-    let lo = _mm256_castps256_ps128(acc);
-    let mut s = _mm_add_ps(hi, lo);
-    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-    let mut total = _mm_cvtss_f32(s);
-    while i < n {
-        total += *dst.get_unchecked(i) * *src.get_unchecked(i);
-        i += 1;
-    }
-    total
+        let n = dst.len();
+        let mut i = 0;
+        let mut acc = _mm256_setzero_ps();
+        while i + 8 <= n {
+            let a = _mm256_loadu_ps(dst.as_ptr().add(i));
+            let b = _mm256_loadu_ps(src.as_ptr().add(i));
+            acc = _mm256_fmadd_ps(a, b, acc);
+            i += 8;
+        }
+        // horizontal sum
+        let hi = _mm256_extractf128_ps(acc, 1);
+        let lo = _mm256_castps256_ps128(acc);
+        let mut s = _mm_add_ps(hi, lo);
+        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+        s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+        let mut total = _mm_cvtss_f32(s);
+        while i < n {
+            total += *dst.get_unchecked(i) * *src.get_unchecked(i);
+            i += 1;
+        }
+        total
     }
 }
 
@@ -179,23 +185,23 @@ unsafe fn dot_avx2(dst: &[f32], src: &[f32]) -> f32 {
 unsafe fn axpy2_avx2(dst: &mut [f32], a: f32, src: &[f32], b: f32, src2: &[f32]) {
     use std::arch::x86_64::*;
     unsafe {
-    let n = dst.len();
-    let mut i = 0;
-    let av = _mm256_set1_ps(a);
-    let bv = _mm256_set1_ps(b);
-    while i + 8 <= n {
-        let d = _mm256_loadu_ps(dst.as_ptr().add(i));
-        let s = _mm256_loadu_ps(src.as_ptr().add(i));
-        let s2 = _mm256_loadu_ps(src2.as_ptr().add(i));
-        let mut acc = _mm256_fmadd_ps(av, s, d);
-        acc = _mm256_fmadd_ps(bv, s2, acc);
-        _mm256_storeu_ps(dst.as_mut_ptr().add(i), acc);
-        i += 8;
-    }
-    while i < n {
-        *dst.get_unchecked_mut(i) += a * *src.get_unchecked(i) + b * *src2.get_unchecked(i);
-        i += 1;
-    }
+        let n = dst.len();
+        let mut i = 0;
+        let av = _mm256_set1_ps(a);
+        let bv = _mm256_set1_ps(b);
+        while i + 8 <= n {
+            let d = _mm256_loadu_ps(dst.as_ptr().add(i));
+            let s = _mm256_loadu_ps(src.as_ptr().add(i));
+            let s2 = _mm256_loadu_ps(src2.as_ptr().add(i));
+            let mut acc = _mm256_fmadd_ps(av, s, d);
+            acc = _mm256_fmadd_ps(bv, s2, acc);
+            _mm256_storeu_ps(dst.as_mut_ptr().add(i), acc);
+            i += 8;
+        }
+        while i < n {
+            *dst.get_unchecked_mut(i) += a * *src.get_unchecked(i) + b * *src2.get_unchecked(i);
+            i += 1;
+        }
     }
 }
 
