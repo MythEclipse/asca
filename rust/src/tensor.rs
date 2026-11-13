@@ -10,6 +10,28 @@ pub struct Mat {
     pub d: Vec<f32>,
 }
 
+// ------------------------------------------------------------------ paralelisme
+
+/// Jumlah thread kerja. Bisa dikurangi lewat `ASCA_THREADS` untuk A/B.
+pub fn num_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        if let Ok(v) = std::env::var("ASCA_THREADS") {
+            if let Ok(n) = v.parse::<usize>() {
+                return n.max(1);
+            }
+        }
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    })
+}
+
+/// Ambang pekerjaan (MAC) sebelum baris dipecah ke beberapa thread. Di bawah ambang ini
+/// biaya membuat thread lebih besar daripada matmul-nya sendiri - dan langkah training
+/// punya banyak matmul kecil (per head, per expert) yang justru akan melambat.
+const PAR_MIN_MAC: usize = 1 << 18;
+
 impl Mat {
     pub fn zeros(rows: usize, cols: usize) -> Self {
         Self {
@@ -78,17 +100,46 @@ impl Mat {
         assert_eq!(self.cols, other.rows, "matmul: inner dim tidak cocok");
         let (n, k, m) = (self.rows, self.cols, other.cols);
         let mut out = Mat::zeros(n, m);
-        for i in 0..n {
-            let a = self.row(i);
-            let o = out.row_mut(i);
-            for p in 0..k {
-                let ap = a[p];
-                if ap == 0.0 {
-                    continue;
+        let (sd, od) = (&self.d, &other.d);
+        let nt = num_threads();
+        let mac = n.saturating_mul(m).saturating_mul(k);
+        if nt <= 1 || mac < PAR_MIN_MAC || n < nt * 2 {
+            for i in 0..n {
+                let a = &sd[i * k..(i + 1) * k];
+                let o = &mut out.d[i * m..(i + 1) * m];
+                for p in 0..k {
+                    let ap = a[p];
+                    if ap == 0.0 {
+                        continue;
+                    }
+                    crate::simd::axpy(o, ap, &od[p * m..(p + 1) * m]);
                 }
-                crate::simd::axpy(o, ap, other.row(p));
             }
+            return out;
         }
+        // `chunks_mut` membagi baris tanpa tumpang tindih, jadi setiap thread punya
+        // potongan keluaran sendiri - tidak perlu unsafe dan tidak ada aliasing.
+        let chunk = n.div_ceil(nt);
+        std::thread::scope(|s| {
+            for (ci, part) in out.d.chunks_mut(chunk * m).enumerate() {
+                let start = ci * chunk;
+                let len = part.len() / m;
+                s.spawn(move || {
+                    for i in 0..len {
+                        let gi = start + i;
+                        let a = &sd[gi * k..(gi + 1) * k];
+                        let o = &mut part[i * m..(i + 1) * m];
+                        for p in 0..k {
+                            let ap = a[p];
+                            if ap == 0.0 {
+                                continue;
+                            }
+                            crate::simd::axpy(o, ap, &od[p * m..(p + 1) * m]);
+                        }
+                    }
+                });
+            }
+        });
         out
     }
 
