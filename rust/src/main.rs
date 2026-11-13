@@ -219,11 +219,18 @@ fn cmd_bench(args: &[String]) {
                 cfg.n_layers,
                 seed ^ 0x5eed,
             );
-            let (rd, curve_d) = bench::run_curve("dense", &mut dense, &data, &bcfg, seed, eval_every);
+            let (rd, curve_d) =
+                bench::run_curve("dense", &mut dense, &data, &bcfg, seed, eval_every);
             if eval_every > 0 {
                 println!("    kurva (token, asca, dense):");
                 for ((tok, la), (_, ld)) in curve_a.iter().zip(curve_d.iter()) {
-                    println!("      {:>8}  {:.4}  {:.4}  delta {:+.4}", tok, la, ld, la - ld);
+                    println!(
+                        "      {:>8}  {:.4}  {:.4}  delta {:+.4}",
+                        tok,
+                        la,
+                        ld,
+                        la - ld
+                    );
                 }
             }
             println!(
