@@ -16,6 +16,7 @@ help:
 	@echo "make train  STEPS=400         # latih ASCA (checkpoint ke /tmp/asca.ckpt)"
 	@echo "make bench  STEPS=400         # ASCA vs dense di engine yang sama"
 	@echo "make curve  STEPS=2000        # kurva loss vs token"
+	@echo "make analyze LOG=log.txt      # mean +- std, delta berpasangan, t"
 
 corpus:
 	@./scripts/fetch_corpus.sh
@@ -40,6 +41,9 @@ bench: build
 curve: build
 	$(BIN) bench --data "$(DATA)" --steps $(STEPS) --seq-len 128 --batch 4 \
 		--lr $(LR) --seeds $(SEEDS) --eval-curve 250 --match total
+
+analyze:
+	awk -f scripts/analyze_curve.sh $(LOG)
 
 clean:
 	cd rust && $(CARGO) clean
