@@ -133,7 +133,12 @@ pub fn run_curve<T: Trainable>(
     let mut rng = Rng::new(seed);
     let mut opt = AdamW::new(cfg.lr);
     let t0 = std::time::Instant::now();
-    let mut eval_rng = Rng::new(seed ^ 0xE7A1);
+    // RNG evaluasi **tidak** bergantung pada seed training. Kalau bergantung, setiap seed
+    // dievaluasi pada batch validasi yang berbeda, sehingga noise evaluasi ikut masuk ke
+    // sebaran antar-seed dan membuat efek kecil (mis. delta -0.07) tidak bisa dipisahkan
+    // dari noise. Dengan RNG tetap, semua seed diuji pada data yang sama dan delta
+    // berpasangan menjadi jauh lebih tajam.
+    let mut eval_rng = Rng::new(0xE7A1_0001);
     for step_i in 0..cfg.steps {
         opt.lr = lr_at(step_i, cfg);
         model.zero_grads();
