@@ -274,41 +274,94 @@ fn cmd_eval(args: &[String]) {
 }
 
 fn cmd_sample(args: &[String]) {
+    use std::io::Write;
     let ckpt = arg(args, "--ckpt", "");
-    let (model, _cfg) = train::load(&ckpt, 0).expect("gagal load checkpoint");
+    let (model, cfg) = train::load(&ckpt, 0).expect("gagal load checkpoint");
+    let tok = arg(args, "--tokenizer", "");
+    let bpe = if tok.is_empty() {
+        None
+    } else {
+        Some(Bpe::load(&tok).expect("gagal muat tokenizer"))
+    };
     let prompt = arg(args, "--prompt", "Once upon a time");
     let n: usize = arg(args, "--tokens", "200").parse().unwrap();
-    let mut ctx: Vec<u32> = prompt.bytes().map(|b| b as u32).collect();
-    if ctx.is_empty() {
-        ctx.push(b'\n' as u32);
-    }
+    let temp: f32 = arg(args, "--temp", "0.8").parse().unwrap();
+    let top_k: usize = arg(args, "--top-k", "0").parse().unwrap();
+    let top_p: f32 = arg(args, "--top-p", "1.0").parse().unwrap();
     let mut rng = Rng::new(arg(args, "--seed", "0").parse().unwrap());
-    print!("{prompt}");
+
+    // prompt -> id token (subword kalau ada tokenizer, byte kalau tidak)
+    let mut ids: Vec<u32> = match &bpe {
+        Some(b) => b.encode(prompt.as_bytes()),
+        None => prompt.bytes().map(|c| c as u32).collect(),
+    };
+    if ids.is_empty() {
+        ids.push(b'\n' as u32);
+    }
+    if ids.iter().any(|&i| i as usize >= cfg.vocab) {
+        panic!("prompt berisi id di luar vocab {}", cfg.vocab);
+    }
+
+    // Decode inkremental: state dibawa antar token, jadi biaya per token konstan.
+    // Versi lama menjalankan ulang seluruh prefix setiap token -> kuadratik.
+    let mut st = model.new_decode_state();
+    let mut logits = None;
+    for &id in ids.iter() {
+        logits = Some(model.step(id, &mut st));
+    }
+    let mut out_ids: Vec<u32> = ids.clone();
     for _ in 0..n {
-        let (logits, _) = model.forward(&ctx, 1);
-        let last = logits.rows - 1;
-        let row = logits.row(last);
-        // sampling suhu 0.8
-        let temp = 0.8f32;
-        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = row.iter().map(|&v| ((v - max) / temp).exp()).collect();
-        let sum: f32 = exps.iter().sum();
+        let lg = logits.as_ref().unwrap();
+        let row = lg.row(0);
+        let mut idx: Vec<usize> = (0..row.len()).collect();
+        if top_k > 0 && top_k < row.len() {
+            idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+            idx.truncate(top_k);
+        }
+        let max = idx
+            .iter()
+            .map(|&i| row[i])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut probs: Vec<(usize, f32)> = idx
+            .iter()
+            .map(|&i| (i, ((row[i] - max) / temp).exp()))
+            .collect();
+        probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        // top-p (nucleus)
+        let total: f32 = probs.iter().map(|x| x.1).sum();
+        let mut acc = 0.0;
+        let mut cut = probs.len();
+        for (i, (_, p)) in probs.iter().enumerate() {
+            acc += p / total;
+            if acc >= top_p {
+                cut = i + 1;
+                break;
+            }
+        }
+        probs.truncate(cut);
+        let sum: f32 = probs.iter().map(|x| x.1).sum();
         let mut r = rng.uniform() * sum;
-        let mut pick = 0usize;
-        for (i, &e) in exps.iter().enumerate() {
-            r -= e;
+        let mut pick = probs[0].0;
+        for &(i, p) in probs.iter() {
+            r -= p;
             if r <= 0.0 {
                 pick = i;
                 break;
             }
         }
-        ctx.push(pick as u32);
-        print!("{}", pick as u8 as char);
-        if ctx.len() > 512 {
-            ctx.drain(0..ctx.len() - 512);
-        }
+        out_ids.push(pick as u32);
+        logits = Some(model.step(pick as u32, &mut st));
     }
-    println!();
+
+    // keluaran ditulis sebagai byte mentah supaya UTF-8 tidak rusak
+    let bytes = match &bpe {
+        Some(b) => b.decode(&out_ids),
+        None => out_ids.iter().map(|&i| i as u8).collect(),
+    };
+    let mut so = std::io::stdout();
+    let _ = so.write_all(&bytes);
+    let _ = so.write_all(b"\n");
+    let _ = so.flush();
 }
 
 fn cmd_gpu(args: &[String]) {
