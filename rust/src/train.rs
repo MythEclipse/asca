@@ -141,8 +141,27 @@ pub fn lr_at(step: usize, cfg: &TrainCfg) -> f32 {
 }
 
 pub fn train(model: &mut Model, data: &Data, cfg: &TrainCfg, seed: u64) {
+    train_resume(model, data, cfg, seed, AdamW::new(cfg.lr), 0, |_, _, _| {
+        Ok(())
+    })
+    .expect("gagal simpan checkpoint");
+}
+
+/// Training yang bisa dilanjutkan: mulai dari `start_step`, memakai optimizer yang sudah
+/// berisi momen, dan memanggil `on_save` secara berkala.
+pub fn train_resume<F>(
+    model: &mut Model,
+    data: &Data,
+    cfg: &TrainCfg,
+    seed: u64,
+    mut opt: AdamW,
+    start_step: usize,
+    mut on_save: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(&Model, &AdamW, usize) -> std::io::Result<()>,
+{
     let mut rng = Rng::new(seed);
-    let mut opt = AdamW::new(cfg.lr);
     println!(
         "params: {}  seq_len: {}  batch: {}  steps: {}",
         model.num_params(),
@@ -151,7 +170,7 @@ pub fn train(model: &mut Model, data: &Data, cfg: &TrainCfg, seed: u64) {
         cfg.steps
     );
     let t0 = std::time::Instant::now();
-    for step_i in 0..cfg.steps {
+    for step_i in start_step..cfg.steps {
         opt.lr = lr_at(step_i, cfg);
         let loss = train_step(model, data, &mut rng, cfg);
         step(model, &mut opt);
@@ -176,12 +195,106 @@ pub fn train(model: &mut Model, data: &Data, cfg: &TrainCfg, seed: u64) {
                 vl,
                 vl.exp()
             );
+            // simpan berkala supaya run panjang tidak hilang kalau terputus
+            on_save(model, &opt, step_i + 1)?;
         }
     }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ checkpoint
 const MAGIC: &[u8; 8] = b"ASCA2CK1";
+/// Checkpoint yang bisa dilanjutkan: bobot + momen AdamW + nomor langkah.
+const MAGIC_R: &[u8; 8] = b"ASCARSM1";
+
+/// Simpan bobot, momen AdamW, dan nomor langkah supaya training panjang bisa dilanjutkan
+/// persis, bukan diulang dari nol. Tanpa momen, lanjutan akan "kaget" dan loss melonjak.
+pub fn save_resume(path: &str, model: &Model, step: usize) -> std::io::Result<()> {
+    let mut f = fs::File::create(path)?;
+    f.write_all(MAGIC_R)?;
+    let c = &model.cfg;
+    for v in [
+        c.vocab,
+        c.d_model,
+        c.n_heads,
+        c.n_layers,
+        c.n_experts,
+        c.d_ff,
+    ] {
+        f.write_all(&(v as u64).to_le_bytes())?;
+    }
+    f.write_all(&(step as u64).to_le_bytes())?;
+    for p in model.params() {
+        f.write_all(&(p.numel() as u64).to_le_bytes())?;
+        for m in [&p.value, &p.m, &p.v] {
+            for v in m.d.iter() {
+                f.write_all(&v.to_le_bytes())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn load_resume(path: &str) -> std::io::Result<(Model, AdamW, usize)> {
+    let buf = fs::read(path)?;
+    if buf.len() < 64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint terlalu kecil",
+        ));
+    }
+    let magic = &buf[..8];
+    if magic != MAGIC_R {
+        // format lama (bobot saja): bisa dimuat, tapi mulai dari langkah 0
+        let (m, _c) = load(path, 0)?;
+        return Ok((m, AdamW::new(3e-3), 0));
+    }
+    let mut off = 8;
+    let mut nums = [0u64; 6];
+    for n in nums.iter_mut() {
+        *n = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        off += 8;
+    }
+    let step = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
+    off += 8;
+    let cfg = Config {
+        vocab: nums[0] as usize,
+        d_model: nums[1] as usize,
+        n_heads: nums[2] as usize,
+        n_layers: nums[3] as usize,
+        n_experts: nums[4] as usize,
+        d_ff: nums[5] as usize,
+    };
+    let mut rng = Rng::new(1);
+    let mut model = Model::new(cfg, &mut rng);
+    let n_params = model.params().len();
+    for i in 0..n_params {
+        let n = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
+        off += 8;
+        let mut vals: Vec<Vec<f32>> = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let mut v = vec![0.0f32; n];
+            for x in v.iter_mut() {
+                *x = f32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                off += 4;
+            }
+            vals.push(v);
+        }
+        let p = &mut model.params_mut()[i];
+        if p.numel() != n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("ukuran param {i} tidak cocok: {n} vs {}", p.numel()),
+            ));
+        }
+        p.value.d.copy_from_slice(&vals[0]);
+        p.m.d.copy_from_slice(&vals[1]);
+        p.v.d.copy_from_slice(&vals[2]);
+    }
+    let mut opt = AdamW::new(3e-3);
+    opt.step = step as u32;
+    Ok((model, opt, step))
+}
 
 pub fn save(path: &str, model: &Model) -> std::io::Result<()> {
     let mut f = fs::File::create(path)?;

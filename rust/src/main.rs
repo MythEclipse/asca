@@ -3,7 +3,7 @@
 use asca_rs::bpe::Bpe;
 use asca_rs::dense::{DenseCfg, DenseModel};
 use asca_rs::model::{Config, Model};
-use asca_rs::tensor::Rng;
+use asca_rs::tensor::{AdamW, Rng};
 use asca_rs::train::{self, Data, Split, TrainCfg};
 
 fn arg(args: &[String], name: &str, default: &str) -> String {
@@ -228,20 +228,36 @@ fn cmd_train(args: &[String]) {
     };
     let data = load_data(args);
     let mut rng = Rng::new(arg(args, "--seed", "0").parse().unwrap());
-    let mut model = Model::new(cfg.clone(), &mut rng);
+    // --resume melanjutkan bobot + momen AdamW + nomor langkah, jadi run panjang bisa
+    // dihentikan kapan saja tanpa kehilangan progres.
+    let resume = arg(args, "--resume", "");
+    let (mut model, mut opt, start_step) = if resume.is_empty() {
+        let m = Model::new(cfg.clone(), &mut rng);
+        (m, AdamW::new(tcfg.lr), 0usize)
+    } else {
+        let (m, o, s) = train::load_resume(&resume).expect("gagal load resume");
+        println!("resume: {resume} dari langkah {s}");
+        (m, o, s)
+    };
     println!(
         "ASCA v2: d_model {} n_heads {} n_layers {} n_experts {} d_ff {}",
         cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.n_experts, cfg.d_ff
     );
-    train::train(
+    opt.lr = tcfg.lr;
+    let out2 = out.clone();
+    train::train_resume(
         &mut model,
         &data,
         &tcfg,
         arg(args, "--seed", "0").parse().unwrap(),
-    );
+        opt,
+        start_step,
+        move |m, _o, s| train::save_resume(&out2, m, s),
+    )
+    .expect("gagal training");
     let vl = train::evaluate(&mut model, &data, &mut rng, &tcfg);
     println!("val_loss akhir: {:.4}  ppl {:.2}", vl, vl.exp());
-    train::save(&out, &model).expect("gagal simpan checkpoint");
+    train::save_resume(&out, &model, tcfg.steps).expect("gagal simpan checkpoint");
     println!("checkpoint disimpan: {out}");
 }
 
