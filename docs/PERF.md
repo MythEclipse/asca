@@ -208,28 +208,37 @@ dioptimasi, rasionya menyesatkan.
 | total params 331k | 32.174 tok/s | 5.933 tok/s | **5,42×** |
 | active params 99k | 33.844 tok/s | 21.219 tok/s | **1,59×** |
 
-## Decode: biaya per token datar terhadap konteks
+## Decode: ASCA datar, dense tumbuh O(T)
 
 `asca decode` mendekode satu token demi satu dan mengukur ms/token pada beberapa panjang
-konteks. Hasil pada model tiny (state 2.048 float):
+konteks. Kedua arsitektur memakai engine yang sama, f32, CPU, matmul dan RMSNorm yang sama.
 
-| konteks | ms/token | tok/s |
-|---|---|---|
-| 128 | 0,009 | 116.755 |
-| 512 | 0,009 | 116.328 |
-| 1.024 | 0,009 | 117.004 |
-| 2.048 | 0,010 | 103.265 |
+```bash
+./target/release/asca decode --ctx 128,512,1024,2048
+./target/release/asca decode --model dense --ctx 128,512,1024,2048
+```
 
-Datar. Ini konsekuensi langsung dari rekurensi: state `S` berukuran `dh x dh` per head
-diperbarui di tempat, jadi biaya per token tidak bergantung pada berapa token sudah
-dilihat. Dense harus menyimpan K dan V untuk setiap posisi: pada konteks 2.048 dengan
-model yang sama itu 2048 x 64 x 2 (K,V) x 2 layer = **524.288 float**, dan attention-nya
-membaca seluruh cache setiap token.
+| konteks | ASCA ms/token | dense ms/token | state ASCA | state dense |
+|---|---|---|---|---|
+| 128 | **0,008** | 0,022 | 2.048 | 43.008 |
+| 512 | **0,008** | 0,075 | 2.048 | 141.312 |
+| 1.024 | **0,009** | 0,141 | 2.048 | 272.384 |
+| 2.048 | **0,010** | 0,295 | 2.048 | 534.528 |
 
-Catatan jujur: angka dense belum diukur dengan jalur decode inkremental (KV cache) di
-engine ini, jadi tabel di atas hanya membuktikan properti ASCA (datar), bukan rasio
-terhadap dense. Yang bisa diklaim sekarang: **biaya decode ASCA tidak tumbuh terhadap
-konteks**, dan state-nya 2.048 float konstan.
+Pada konteks 2.048: **29× lebih cepat per token** dan **261× lebih kecil state-nya**.
+
+Mekanismenya bukan tuning. ASCA memperbarui `S` berukuran `dh x dh` per head di tempat,
+jadi biaya per token konstan. Dense harus membaca seluruh K dan V setiap token, jadi
+biayanya linear terhadap konteks — dan KV cache-nya tumbuh linear juga.
+
+Kapan keunggulan ini bertahan: state ASCA = `n_layers * n_heads * (d/h)^2 = n_layers * d^2/h`,
+KV dense = `n_layers * T * d * 2`. ASCA menang begitu `d/h < 2T`, yang untuk semua
+konteks realistis selalu benar. Yang berubah saat model diperbesar hanyalah besar
+keunggulannya, bukan arahnya.
+
+Batas klaim: model masih tiny (`d=64`, 2 layer, 4 head) dan ini CPU f32. Angka absolutnya
+tidak akan berlaku di model besar; yang berlaku adalah bentuk kurvanya (datar vs linear)
+dan rasio ukuran state.
 
 ## Yang belum dikerjakan
 

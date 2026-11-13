@@ -123,10 +123,18 @@ See `../docs/RESULTS_V2.md` for the full protocol and caveats.
 ```
 
 Measures ms/token at increasing context by decoding one token at a time with the carried
-state. The cost is flat (0.009 ms/token from ctx 128 to 2048) because the recurrent state
-is `dh x dh` per head and updated in place — no KV cache, nothing that grows with context.
-`tests/decode_parity.rs` checks that stepping token-by-token reproduces the full-sequence
-forward to 4.7e-7 relative.
+state, for ASCA and for the dense baseline (`--model dense`, KV cache):
+
+| ctx | ASCA ms/tok | dense ms/tok | ASCA state | dense state |
+|---|---|---|---|---|
+| 128 | 0.008 | 0.022 | 2,048 | 43,008 |
+| 512 | 0.008 | 0.075 | 2,048 | 141,312 |
+| 1,024 | 0.009 | 0.141 | 2,048 | 272,384 |
+| 2,048 | 0.010 | 0.295 | 2,048 | 534,528 |
+
+ASCA is flat because the recurrent state is `dh x dh` per head updated in place; dense pays
+O(T) per token and its cache grows O(T). `tests/decode_parity.rs` checks that stepping
+token-by-token reproduces the full-sequence forward for both models (4.7e-7 and 3.6e-7).
 
 ## GPU (optional)
 

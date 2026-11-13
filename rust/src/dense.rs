@@ -59,6 +59,13 @@ pub struct DenseLayerCache {
     pub x_out: Mat,
 }
 
+pub struct DenseDecodeState {
+    /// per layer: K dan V untuk semua posisi (tumbuh O(T))
+    pub k: Vec<Vec<f32>>,
+    pub v: Vec<Vec<f32>>,
+    pub pos: usize,
+}
+
 pub struct DenseCache {
     pub ids: Vec<u32>,
     pub layers: Vec<DenseLayerCache>,
@@ -75,6 +82,25 @@ fn silu(x: f32) -> f32 {
 fn dsilu(x: f32) -> f32 {
     let s = 1.0 / (1.0 + (-x).exp());
     s * (1.0 + x * (1.0 - s))
+}
+
+/// Rotasi RoPE untuk satu baris dengan posisi eksplisit — dipakai jalur decode, di mana
+/// posisi tidak lagi sama dengan indeks baris.
+fn rope_apply_row(row: &mut [f32], pos: usize, n_heads: usize, dh: usize) {
+    for hh in 0..n_heads {
+        let off = hh * dh;
+        let mut i = 0;
+        while i + 1 < dh {
+            let freq = 1.0 / 10000f32.powf(2.0 * i as f32 / dh as f32);
+            let ang = pos as f32 * freq;
+            let (c, s) = (ang.cos(), ang.sin());
+            let a = row[off + i];
+            let b = row[off + i + 1];
+            row[off + i] = a * c - b * s;
+            row[off + i + 1] = a * s + b * c;
+            i += 2;
+        }
+    }
 }
 
 fn rope_apply(x: &mut Mat, n_heads: usize, dh: usize, sign: f32) {
@@ -334,6 +360,97 @@ impl DenseModel {
                 batch,
             },
         )
+    }
+
+    /// State decode dense: KV cache yang **tumbuh** O(T) — 2 x n_layers x T x d_model
+    /// float, ditambah posisi. Ini pembanding langsung terhadap state konstan ASCA.
+    pub fn new_decode_state(&self) -> DenseDecodeState {
+        DenseDecodeState {
+            k: vec![Vec::new(); self.layers.len()],
+            v: vec![Vec::new(); self.layers.len()],
+            pos: 0,
+        }
+    }
+
+    pub fn decode_state_floats(st: &DenseDecodeState) -> usize {
+        st.k.iter().map(|x| x.len()).sum::<usize>() + st.v.iter().map(|x| x.len()).sum::<usize>()
+    }
+
+    /// Decode satu token dengan KV cache; paritasnya terhadap `forward` diuji di
+    /// `tests/decode_parity.rs`.
+    pub fn step(&self, id: u32, st: &mut DenseDecodeState) -> Mat {
+        let d = self.cfg.d_model;
+        let h = self.cfg.n_heads;
+        let dh = d / h;
+        let scale = 1.0 / (dh as f32).sqrt();
+        let pos = st.pos;
+        let mut x = Mat::zeros(1, d);
+        x.row_mut(0)
+            .copy_from_slice(self.embed.value.row(id as usize));
+        for (li, layer) in self.layers.iter().enumerate() {
+            let x_in = x.clone();
+            let xn = rmsnorm_rows(&x_in, EPS);
+            let mut qkv = xn.matmul(&layer.w_qkv.value);
+            qkv.add_row_bias(&layer.b_qkv.value.d);
+            let src = qkv.row(0);
+            let mut q = vec![0.0f32; d];
+            let mut k = vec![0.0f32; d];
+            let mut v = vec![0.0f32; d];
+            q.copy_from_slice(&src[..d]);
+            k.copy_from_slice(&src[d..2 * d]);
+            v.copy_from_slice(&src[2 * d..3 * d]);
+            rope_apply_row(&mut q, pos, h, dh);
+            rope_apply_row(&mut k, pos, h, dh);
+            st.k[li].extend_from_slice(&k);
+            st.v[li].extend_from_slice(&v);
+            let t_len = pos + 1;
+            let mut o = Mat::zeros(1, d);
+            let orow = o.row_mut(0);
+            let mut scores = vec![0.0f32; t_len];
+            for hh in 0..h {
+                let off = hh * dh;
+                let qh = &q[off..off + dh];
+                for s in 0..t_len {
+                    let kk = &st.k[li][s * d + off..s * d + off + dh];
+                    scores[s] = crate::simd::dot(qh, kk) * scale;
+                }
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for z in scores.iter_mut() {
+                    *z = (*z - max).exp();
+                    sum += *z;
+                }
+                for z in scores.iter_mut() {
+                    *z /= sum;
+                }
+                for c in 0..dh {
+                    let mut acc = 0.0f32;
+                    for s in 0..t_len {
+                        acc += scores[s] * st.v[li][s * d + off + c];
+                    }
+                    orow[off + c] = acc;
+                }
+            }
+            let mut attn_out = o.matmul(&layer.w_o.value);
+            attn_out.add_row_bias(&layer.b_o.value.d);
+            let mut x_mid = x_in.clone();
+            x_mid.axpy(1.0, &attn_out);
+            let xn2 = rmsnorm_rows(&x_mid, EPS);
+            let mut pre = xn2.matmul(&layer.w1.value);
+            pre.add_row_bias(&layer.b1.value.d);
+            let prow = pre.row_mut(0);
+            for z in prow.iter_mut() {
+                *z = silu(*z);
+            }
+            let mut ff = pre.matmul(&layer.w2.value);
+            ff.add_row_bias(&layer.b2.value.d);
+            let mut x_out = x_mid.clone();
+            x_out.axpy(1.0, &ff);
+            x = x_out;
+        }
+        st.pos += 1;
+        let h_final = rmsnorm_rows(&x, EPS);
+        h_final.matmul(&self.head.value)
     }
 
     pub fn loss(&self, ids: &[u32], targets: &[u32]) -> f32 {

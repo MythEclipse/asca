@@ -1,5 +1,6 @@
 //! CLI ASCA v2: train / eval / sample / inspect.
 
+use asca_rs::dense::{DenseCfg, DenseModel};
 use asca_rs::model::{Config, Model};
 use asca_rs::tensor::Rng;
 use asca_rs::train::{self, Data, Split, TrainCfg};
@@ -54,8 +55,11 @@ fn main() {
 /// Decode autoregresif satu token demi satu, mengukur ms/token pada beberapa panjang
 /// konteks. Kalau state benar-benar konstan, biayanya harus datar terhadap konteks —
 /// inilah beda mendasar dengan KV cache yang tumbuh O(T).
+/// Decode autoregresif satu token demi satu, mengukur ms/token pada beberapa panjang
+/// konteks. ASCA membawa state `dh x dh` per head yang konstan; dense membawa KV cache
+/// yang tumbuh O(T). Perbandingan ini yang membuat klaim memori punya isi.
 fn cmd_decode(args: &[String]) {
-    let cfg = build_cfg(args);
+    let which = arg(args, "--model", "asca");
     let ctxs: Vec<usize> = arg(args, "--ctx", "128,512,1024,2048")
         .split(',')
         .filter_map(|s| s.trim().parse().ok())
@@ -63,37 +67,61 @@ fn cmd_decode(args: &[String]) {
     let steps: usize = arg(args, "--steps", "32").parse().unwrap_or(32);
     let warmup: usize = arg(args, "--warmup", "8").parse().unwrap_or(8);
     let mut rng = Rng::new(7);
-    let model = Model::new(cfg, &mut rng);
-    let mut st = model.new_decode_state();
-    let floats: usize = st.delta.iter().flatten().map(|v| v.len()).sum();
-    println!(
-        "ASCA decode: {} param total, {} aktif/token, state {} float (konstan)",
-        model.num_params(),
-        <Model as asca_rs::bench::Trainable>::active_params(&model),
-        floats
-    );
-    println!("| konteks | ms/token | tok/s |");
-    println!("|---|---|---|");
-    for &ctx in ctxs.iter() {
-        // panaskan state sepanjang `ctx` token, lalu ukur `steps` langkah berikutnya
-        let mut st = model.new_decode_state();
-        for _ in 0..ctx {
-            let id = rng.below(256) as u32;
-            let _ = model.step(id, &mut st);
+    println!("| konteks | ms/token | tok/s | state float |");
+    println!("|---|---|---|---|");
+    match which.as_str() {
+        "dense" => {
+            let d_ff: usize = arg(args, "--d-ff", "128").parse().unwrap_or(128);
+            let cfg = DenseCfg {
+                vocab: 256,
+                d_model: 64,
+                n_heads: 4,
+                n_layers: 2,
+                d_ff,
+            };
+            let model = DenseModel::new(cfg, &mut rng);
+            for &ctx in ctxs.iter() {
+                let mut st = model.new_decode_state();
+                for _ in 0..ctx + warmup {
+                    let id = rng.below(256) as u32;
+                    let _ = model.step(id, &mut st);
+                }
+                let t0 = std::time::Instant::now();
+                for _ in 0..steps {
+                    let id = rng.below(256) as u32;
+                    let _ = model.step(id, &mut st);
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+                let kv = DenseModel::decode_state_floats(&st);
+                println!("| {ctx} | {ms:.3} | {:.0} | {kv} |", 1e3 / ms);
+            }
         }
-        for _ in 0..warmup {
-            let id = rng.below(256) as u32;
-            let _ = model.step(id, &mut st);
+        _ => {
+            let cfg = build_cfg(args);
+            let model = Model::new(cfg, &mut rng);
+            let floats: usize = model
+                .new_decode_state()
+                .delta
+                .iter()
+                .flatten()
+                .map(|v| v.len())
+                .sum();
+            for &ctx in ctxs.iter() {
+                let mut st = model.new_decode_state();
+                for _ in 0..ctx + warmup {
+                    let id = rng.below(256) as u32;
+                    let _ = model.step(id, &mut st);
+                }
+                let t0 = std::time::Instant::now();
+                for _ in 0..steps {
+                    let id = rng.below(256) as u32;
+                    let _ = model.step(id, &mut st);
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
+                println!("| {ctx} | {ms:.3} | {:.0} | {floats} |", 1e3 / ms);
+            }
         }
-        let t0 = std::time::Instant::now();
-        for _ in 0..steps {
-            let id = rng.below(256) as u32;
-            let _ = model.step(id, &mut st);
-        }
-        let ms = t0.elapsed().as_secs_f64() * 1e3 / steps as f64;
-        println!("| {ctx} | {ms:.3} | {:.0} |", 1e3 / ms);
     }
-    let _ = &mut st;
 }
 
 fn build_cfg(args: &[String]) -> Config {

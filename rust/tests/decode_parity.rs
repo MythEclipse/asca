@@ -5,6 +5,7 @@
 //! decode bisa saja diam-diam membuang informasi (mis. state tidak diperbarui, atau
 //! gate alpha/beta tertukar) dan tetap menghasilkan teks yang terlihat wajar.
 
+use asca_rs::dense::{DenseCfg, DenseModel};
 use asca_rs::model::{Config, Model};
 use asca_rs::tensor::Rng;
 
@@ -41,5 +42,35 @@ fn main() {
         .map(|v| v.len())
         .sum::<usize>();
     println!("state decode: {floats} float, konstan terhadap panjang konteks");
+    // ---- dense dengan KV cache
+    let dcfg = DenseCfg {
+        vocab: 256,
+        d_model: 16,
+        n_heads: 2,
+        n_layers: 1,
+        d_ff: 24,
+    };
+    let dm = DenseModel::new(dcfg, &mut Rng::new(19));
+    let (dl, _) = dm.forward(&ids, 1);
+    let mut dst = dm.new_decode_state();
+    let mut worst_d = 0.0f32;
+    let mut scale_d = 1e-9f32;
+    for (t, &id) in ids.iter().enumerate() {
+        let sl = dm.step(id, &mut dst);
+        for c in 0..dl.cols {
+            worst_d = worst_d.max((dl.at(t, c) - sl.at(0, c)).abs());
+            scale_d = scale_d.max(dl.at(t, c).abs());
+        }
+    }
+    let rel_d = worst_d / scale_d;
+    println!("paritas decode dense: galat relatif {rel_d:.3e}");
+    if rel_d > 1e-4 {
+        println!("PARITAS DECODE DENSE GAGAL");
+        std::process::exit(1);
+    }
+    let kv = DenseModel::decode_state_floats(&dst);
+    println!(
+        "state decode: ASCA {floats} float konstan | dense {kv} float (KV cache, tumbuh O(T))"
+    );
     println!("Paritas decode cocok.");
 }

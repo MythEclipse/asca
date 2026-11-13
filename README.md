@@ -67,9 +67,21 @@ The lesson is recorded in `docs/PERF.md`: a ratio measured before a shared optim
 is not a result. Note also that GPU offload partly *masks* CPU gains on the dense
 baseline, so optimising only one path flatters the other.
 
-What survives as an ASCA advantage on this axis is **decode state**: 2,048 floats that
-do not grow with context, versus 32,768 for the dense KV cache (262,144 at context
-1024).
+What survives — and it is the strongest result in this repository — is **decode cost**.
+Decoding one token at a time in the same engine, same f32 CPU path:
+
+| context | ASCA ms/token | dense ms/token | ASCA state | dense state |
+|---|---|---|---|---|
+| 128 | **0.008** | 0.022 | 2,048 | 43,008 |
+| 512 | **0.008** | 0.075 | 2,048 | 141,312 |
+| 1,024 | **0.009** | 0.141 | 2,048 | 272,384 |
+| 2,048 | **0.010** | 0.295 | 2,048 | 534,528 |
+
+At context 2,048 that is **29× faster per token with 261× smaller state**. This is not
+tuning: the recurrent state is `dh x dh` per head and updated in place, while attention
+must read the whole KV cache every token and the cache grows linearly. Both paths are
+verified against their full-sequence forward pass to ~4e-7 (`tests/decode_parity.rs`), so
+the comparison is between two correct implementations.
 
 A bug in the baseline nearly made the first number look better than it was: `rope_apply`
 rotated only the first head's slice, so 3 of 4 heads had no positional information.
