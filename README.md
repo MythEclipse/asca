@@ -57,12 +57,15 @@ claimed yet**. The earlier "ASCA wins by 0.24" is retracted.
 
 What *is* measured is cost, and it keeps moving as the engine improves. After a 3.08×
 CPU optimisation pass and cross-sequence batching (see [`docs/PERF.md`](docs/PERF.md)),
-ASCA trains **5.42× faster** at matched total parameters (32,174 vs 5,933 tok/s) and
-**1.59× faster** at matched active parameters (33,844 vs 21,219 tok/s).
+ASCA trains **2.26× faster** at matched total parameters (29,696 vs 13,131 tok/s) and
+**1.10× faster** at matched active parameters (29,195 vs 26,430 tok/s).
 
 Throughput ratios have moved a lot as the engine improved, and every earlier figure is
 superseded: "ASCA is 2× slower at matched active parameters" (unoptimised code), then
-"1.26× faster" (before batching), then "at parity" (before SIMD). The latest is 1.59×.
+"1.26× faster" (before batching), then "at parity" (before SIMD), then "1.59×" — and that
+last one is **retracted**: the dense baseline was still running unoptimised code, so the
+ratio measured the engine, not the architecture. After fixing the baseline the honest
+numbers are 2.26× (total) and 1.10× (active). See `docs/PERF.md`.
 The lesson is recorded in `docs/PERF.md`: a ratio measured before a shared optimisation
 is not a result. Note also that GPU offload partly *masks* CPU gains on the dense
 baseline, so optimising only one path flatters the other.

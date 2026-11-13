@@ -92,8 +92,8 @@ Result (TinyStories bytes, 3 seeds). Short run first, then the long one that cor
 | 1.02M | total (331k) | 1.297 | 1.369 | **−0.072** | 6,580¹ | 3,973¹ |
 
 The advantage **shrinks 69%** between 128k and 1M tokens and is **not significant** at
-1M (t = −4.0, df 2, p ≈ 0.058). What holds: at matched total params ASCA trains 5.42×
-faster, and 1.59× at matched active params. Its decode state
+1M (t = −4.0, df 2, p ≈ 0.058). What holds: at matched total params ASCA trains 2.26×
+faster, and 1.10× at matched active params. Its decode state
 is 2,048 floats constant versus 32,768 growing with context. Throughput figures are
 post-optimisation and post-batching — see `../docs/PERF.md`.
 

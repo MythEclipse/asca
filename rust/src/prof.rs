@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-pub const NAMES: [&str; 10] = [
+pub const NAMES: [&str; 14] = [
     "delta.qkv",
     "delta.scan",
     "delta.out",
@@ -17,10 +17,18 @@ pub const NAMES: [&str; 10] = [
     "head",
     "embed",
     "other",
+    "dense.attn",
+    "dense.attn.bwd",
+    "dense.mlp",
+    "dense.mlp.bwd",
 ];
 
 pub static ENABLED: AtomicBool = AtomicBool::new(false);
-static NS: [AtomicU64; 10] = [
+static NS: [AtomicU64; 14] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

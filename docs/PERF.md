@@ -205,8 +205,36 @@ dioptimasi, rasionya menyesatkan.
 
 | pencocokan | ASCA | dense | rasio |
 |---|---|---|---|
-| total params 331k | 32.174 tok/s | 5.933 tok/s | **5,42×** |
-| active params 99k | 33.844 tok/s | 21.219 tok/s | **1,59×** |
+| total params 331k | 29.696 tok/s | 13.131 tok/s | **2,26×** |
+| active params 99k | 29.195 tok/s | 26.430 tok/s | **1,10×** |
+
+> Angka 5,42× / 1,59× yang sempat ditulis di sini **dicabut**. Keduanya diukur saat
+> baseline dense masih memakai kode yang belum dioptimasi (lihat bagian berikut).
+
+## Baseline dense juga harus dioptimasi
+
+Rasio throughput hanya bermakna kalau kedua sisi memakai engine yang sama-sama dirawat.
+Setelah ASCA dioptimasi 3×, baseline dense tertinggal di 5.933 tok/s — dan itu bukan
+sifat arsitekturnya, melainkan dua bug performa di `dense.rs`:
+
+1. **Akumulasi nilai attention** memakai `v.at(base + s, off + c)` di loop terdalam:
+   `dh x t` akses ber-bounds-check untuk setiap token. Diganti pembacaan slice + `axpy`.
+2. **`d_pre` merekonstruksi pra-aktivasi** dengan loop `.at()` (`t_len x d_ff x d` akses)
+   padahal nilainya **sudah tersimpan di `DenseLayerCache.pre`** sejak forward. Diganti
+   pembacaan slice. Ini pola yang sama persis dengan bug MoE sebelumnya: nilai ada di
+   cache, tapi dihitung ulang.
+
+Hasil: dense **4.825 → 13.131 tok/s (2,7×)**, loss identik sampai digit terakhir
+(2,2135 pada 200 langkah, 1,9764 pada 400 langkah/3 seed).
+
+### Jebakan `matmul_ta`
+
+Sempat saya ganti enam situs `a.transpose().matmul(b)` menjadi `a.matmul_ta(b)` di
+backward dense. Hasilnya **lebih lambat**: 12.313 → 9.430 tok/s. Sebabnya `matmul_ta`
+tidak punya jalur GPU, jadi matmul besar yang tadinya di-offload jatuh ke CPU. Guard
+hybrid sudah ditambahkan ke `matmul_ta` (bentuk besar didelegasikan ke `matmul`), tetapi
+untuk pola-pola ini transpose + `matmul` tetap lebih cepat (pola akses lebih ramah cache),
+jadi penggantiannya dibatalkan. `matmul_t` bahkan tidak punya jalur GPU sama sekali.
 
 ## Decode: ASCA datar, dense tumbuh O(T)
 

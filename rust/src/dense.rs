@@ -276,11 +276,7 @@ impl DenseModel {
                         let qr = &q.row(r)[off..off + dh];
                         for s in 0..=t {
                             let ks = &k.row(base + s)[off..off + dh];
-                            let mut acc = 0.0f32;
-                            for c in 0..dh {
-                                acc += qr[c] * ks[c];
-                            }
-                            scores[s] = acc * scale;
+                            scores[s] = crate::simd::dot(qr, ks) * scale;
                         }
                         let max = scores[..=t]
                             .iter()
@@ -298,13 +294,14 @@ impl DenseModel {
                         for s in 0..=t {
                             probs[pb + s] = scores[s];
                         }
+                        // Akumulasi nilai per baris: baca slice V sekali per posisi dan
+                        // pakai axpy, bukan `v.at(s, c)` di loop terdalam. Versi lama
+                        // melakukan dh x t akses ber-bounds-check untuk setiap token.
                         let orow = o.row_mut(r);
-                        for c in 0..dh {
-                            let mut acc = 0.0f32;
-                            for s in 0..=t {
-                                acc += scores[s] * v.at(base + s, off + c);
-                            }
-                            orow[off + c] = acc;
+                        let seg = &mut orow[off..off + dh];
+                        seg.iter_mut().for_each(|z| *z = 0.0);
+                        for s in 0..=t {
+                            crate::simd::axpy(seg, scores[s], &v.row(base + s)[off..off + dh]);
                         }
                     }
                 }
@@ -523,19 +520,15 @@ impl DenseModel {
                 }
             }
             let d_hidden = d_ff_out.matmul(&layer.w2.value.transpose());
+            // `pre` sudah ada di cache sejak forward. Versi lama merekonstruksinya dengan
+            // loop .at() ber-bounds-check (t_len x d_ff x d akses) padahal nilainya ada.
             let mut d_pre = Mat::zeros(t_len, self.cfg.d_ff);
             for r in 0..t_len {
+                let prow = lc.pre.row(r);
+                let dhrow = d_hidden.row(r);
+                let drow = d_pre.row_mut(r);
                 for c in 0..self.cfg.d_ff {
-                    let pre = {
-                        // rekonstruksi pra-aktivasi dari hidden: silu tidak invertibel,
-                        // jadi simpan lewat hidden -> gunakan nilai dari cache xn2/w1
-                        let mut acc = layer.b1.value.at(0, c);
-                        for cc in 0..d {
-                            acc += lc.xn2.at(r, cc) * layer.w1.value.at(cc, c);
-                        }
-                        acc
-                    };
-                    d_pre.set(r, c, d_hidden.at(r, c) * dsilu(pre));
+                    drow[c] = dhrow[c] * dsilu(prow[c]);
                 }
             }
             let d_w1 = lc.xn2.transpose().matmul(&d_pre);

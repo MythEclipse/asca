@@ -53,8 +53,10 @@ State decode pada konteks 128: **ASCA 2.048 float (konstan)** vs **dense 32.768 
 
 - Pada **total params sama**: ASCA menang kualitas ~0,24 dan **4,5× lebih cepat**,
   dengan state decode 16× lebih kecil dan tidak tumbuh terhadap konteks.
-- Pada **active params sama**: ASCA masih menang kualitas ~0,24 dan **1,59× lebih cepat**
-  sesudah kernel SIMD (rasio bergerak 0,48 → 1,26 → 0,95 → 1,59 seiring engine berubah;
+- Pada **active params sama**: ASCA masih menang kualitas ~0,24 dan **1,10× lebih cepat**
+  sesudah baseline dense ikut dioptimasi (rasio bergerak 0,48 → 1,26 → 0,95 → 1,59 → 1,10
+  seiring engine berubah; angka 1,59 dicabut karena baseline dense saat itu belum
+  dioptimasi;
   angka terakhir yang berlaku). Dua klaim sebelumnya dicabut di sini: "ASCA 2× lebih lambat"
   (artefak kode belum dioptimasi) dan "ASCA 1,26× lebih cepat" (diukur sebelum batching;
   batching + offload GPU menaikkan dense 31%, ASCA tidak). Yang tersisa sebagai keunggulan

@@ -96,6 +96,16 @@ impl Mat {
     /// Sama hasilnya dengan `self.transpose().matmul(other)`, tetapi tanpa
     /// mengalokasi dan menyalin matriks transpose lebih dulu.
     pub fn matmul_ta(&self, other: &Mat) -> Mat {
+        // Jalur CPU di bawah tidak punya versi GPU. Untuk bentuk besar, transpose lalu
+        // serahkan ke `matmul` supaya offload GPU tetap terpakai — tanpa ini, mengganti
+        // `a.transpose().matmul(b)` dengan `a.matmul_ta(b)` justru memperlambat matmul
+        // besar (terukur: dense 12.313 -> 9.430 tok/s).
+        if crate::cuda::available()
+            && crate::cuda::worth_offload(self.rows, self.cols, other.cols)
+            && self.rows * self.cols >= 1024
+        {
+            return self.transpose().matmul(other);
+        }
         assert_eq!(self.rows, other.rows, "matmul_ta: dim tidak cocok");
         let (k, m, n) = (self.rows, self.cols, other.cols);
         let mut out = Mat::zeros(m, n);
