@@ -71,11 +71,37 @@ TinyStories bytes, `d_model=64 n_heads=4 n_layers=2 n_experts=8 d_ff=128`:
 | val_loss | 2.96 → 1.379 (ppl 3.97) |
 | Decode state | 2 × 4 × 16² = 2,048 floats, constant in context |
 
+## Baseline comparison (`asca bench`)
+
+`src/dense.rs` is a causal Transformer baseline living in the same crate: same `Mat`,
+`Param`, `Rng`, RMSNorm, AdamW, data and training loop, with RoPE and softmax
+attention. Its gradients are verified by finite differences too
+(`tests/gradcheck_dense.rs`).
+
+```bash
+./target/release/asca bench --data /path/to/text.txt --steps 400 --batch 4 \
+    --seq-len 128 --lr 6e-3 --seeds 0,1,2
+```
+
+Result (TinyStories bytes, 400 steps × 4 × 128 = 205k tokens, 3 seeds):
+
+| matching | ASCA val loss | dense val loss | ASCA tok/s | dense tok/s |
+|---|---|---|---|---|
+| total params (331k) | **1.735** | 1.976 | 6,810 | 4,243 |
+| active params (99k) | **1.735** | 1.978 | 7,019 | 14,529 |
+
+Decode state at context 128: 2,048 floats constant (ASCA) vs 32,768 growing with
+context (dense KV cache).
+
+See `../docs/RESULTS_V2.md` for the caveats — this is a small-scale result, not an
+architecture claim.
+
 ## Not done yet
 
-- **No dense baseline in this crate yet.** Without it there is no legitimate
-  efficiency comparison — the same mistake v1 made. This is the next step.
-- No CUDA kernels; matmuls are naive scalar loops.
-- No loss-vs-tokens curve against a baseline.
+- No loss-vs-tokens curve out to millions of tokens; dense may catch up.
+- No long-range recall test (where attention usually beats a compressed state).
+- No CUDA kernels; matmuls are naive scalar loops, so absolute tok/s means nothing
+  outside this crate.
+- Only 3 seeds; a strong claim needs 5+ and a measured noise floor.
 - `w_gate` / `b_gate` receive very small gradients (scale 4.6e-4 vs 1.3e0 for
   `b_qkv`); whether the gates actually learn needs checking.

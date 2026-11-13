@@ -37,9 +37,30 @@ compute and memory efficiency through adaptive and sparse mechanisms.
 > reaches **val loss 1.379 / ppl 3.97** in 614k tokens. See
 > [`docs/SPEC_V2.md`](docs/SPEC_V2.md) and [`rust/`](rust/README.md).
 >
-> **No efficiency claim is made yet.** The decisive next step is a dense baseline
-> implemented *in the same Rust crate with the same kernels* — otherwise the comparison
-> repeats exactly the mistake v1 made. The full v1 research record follows below.
+> **First same-engine comparison is in** (`asca bench`, both models in this crate, same
+> matmul, optimizer, data, seeds; TinyStories bytes, 400 steps × batch 4 × seq 128,
+> 3 seeds, two learning rates):
+>
+> | matching | ASCA val loss | dense val loss | Δ | ASCA tok/s | dense tok/s |
+> |---|---|---|---|---|---|
+> | total params (331k) | **1.735** | 1.976 | **−0.242** | 6,810 | 4,243 |
+> | active params (99k) | **1.735** | 1.978 | **−0.244** | 7,019 | 14,529 |
+>
+> (lr 6e-3; lr 3e-3 gives the same picture, Δ −0.235 / −0.259.) At equal **total**
+> parameters ASCA wins on quality *and* is **1.6× faster**, with a decode state of
+> **2,048 floats that does not grow with context** versus 32,768 for the dense KV cache.
+> At equal **active** parameters ASCA still wins on quality but is **2× slower**.
+>
+> A bug in the baseline nearly made this look better than it is: `rope_apply` rotated
+> only the first head's slice, so 3 of 4 heads had no positional information at all.
+> Fixing it shrank the gap from −0.35 to −0.24. **When the baseline loses, check the
+> baseline first.**
+>
+> **This is not yet an architecture claim.** 331k params, 205k tokens, context 128 —
+> v1 was fooled at exactly this scale (synthetic said "wins", real text said "loses").
+> Still missing: a loss-vs-tokens curve out to millions of tokens, a long-range recall
+> test, more seeds, and CUDA kernels. Full detail in
+> [`docs/RESULTS_V2.md`](docs/RESULTS_V2.md); v1 research record follows below.
 
 > **Status: v0.8 — the earlier negative result is retracted; it was mostly a learning-rate artifact.**
 >

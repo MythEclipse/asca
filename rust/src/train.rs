@@ -15,7 +15,10 @@ impl Data {
     pub fn load(path: &str, val_frac: f32) -> std::io::Result<Self> {
         let bytes = fs::read(path)?;
         if bytes.len() < 1024 {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file terlalu kecil"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file terlalu kecil",
+            ));
         }
         let train_end = ((bytes.len() as f32) * (1.0 - val_frac)) as usize;
         Ok(Self { bytes, train_end })
@@ -29,8 +32,14 @@ impl Data {
         };
         let span = hi.saturating_sub(lo).saturating_sub(seq_len + 1).max(1);
         let start = lo + rng.below(span);
-        let ids = self.bytes[start..start + seq_len].iter().map(|&b| b as u32).collect();
-        let tgts = self.bytes[start + 1..start + 1 + seq_len].iter().map(|&b| b as u32).collect();
+        let ids = self.bytes[start..start + seq_len]
+            .iter()
+            .map(|&b| b as u32)
+            .collect();
+        let tgts = self.bytes[start + 1..start + 1 + seq_len]
+            .iter()
+            .map(|&b| b as u32)
+            .collect();
         (ids, tgts)
     }
 }
@@ -88,7 +97,8 @@ pub fn lr_at(step: usize, cfg: &TrainCfg) -> f32 {
     if step < cfg.warmup {
         cfg.lr * (step as f32 + 1.0) / cfg.warmup as f32
     } else {
-        let progress = (step - cfg.warmup) as f32 / (cfg.steps.max(cfg.warmup + 1) - cfg.warmup) as f32;
+        let progress =
+            (step - cfg.warmup) as f32 / (cfg.steps.max(cfg.warmup + 1) - cfg.warmup) as f32;
         // cosine decay ke 10% lr
         let min_lr = cfg.lr * 0.1;
         min_lr + 0.5 * (cfg.lr - min_lr) * (1.0 + (std::f32::consts::PI * progress).cos())
@@ -125,7 +135,12 @@ pub fn train(model: &mut Model, data: &Data, cfg: &TrainCfg, seed: u64) {
         }
         if cfg.eval_every > 0 && (step_i + 1) % cfg.eval_every == 0 {
             let vl = evaluate(model, data, &mut rng, cfg);
-            println!("  eval step {}: val_loss {:.4}  ppl {:.2}", step_i + 1, vl, vl.exp());
+            println!(
+                "  eval step {}: val_loss {:.4}  ppl {:.2}",
+                step_i + 1,
+                vl,
+                vl.exp()
+            );
         }
     }
 }
@@ -137,7 +152,14 @@ pub fn save(path: &str, model: &Model) -> std::io::Result<()> {
     let mut f = fs::File::create(path)?;
     f.write_all(MAGIC)?;
     let c = &model.cfg;
-    for v in [c.vocab, c.d_model, c.n_heads, c.n_layers, c.n_experts, c.d_ff] {
+    for v in [
+        c.vocab,
+        c.d_model,
+        c.n_heads,
+        c.n_layers,
+        c.n_experts,
+        c.d_ff,
+    ] {
         f.write_all(&(v as u64).to_le_bytes())?;
     }
     for p in model.params() {
@@ -154,7 +176,10 @@ pub fn load(path: &str, seq_hint: usize) -> std::io::Result<(Model, Config)> {
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
     if &magic != MAGIC {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bukan checkpoint ASCA v2"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bukan checkpoint ASCA v2",
+        ));
     }
     let mut nums = [0u64; 6];
     for n in nums.iter_mut() {

@@ -25,7 +25,14 @@ pub struct Config {
 
 impl Config {
     pub fn tiny() -> Self {
-        Self { vocab: 256, d_model: 64, n_heads: 4, n_layers: 2, n_experts: 8, d_ff: 128 }
+        Self {
+            vocab: 256,
+            d_model: 64,
+            n_heads: 4,
+            n_layers: 2,
+            n_experts: 8,
+            d_ff: 128,
+        }
     }
 }
 
@@ -111,7 +118,15 @@ impl HashMoe {
                 out.set(t, c, acc);
             }
         }
-        (out, MoeCache { x: x.clone(), xn, hidden, route })
+        (
+            out,
+            MoeCache {
+                x: x.clone(),
+                xn,
+                hidden,
+                route,
+            },
+        )
     }
 
     pub fn backward(&mut self, cache: &MoeCache, dout: &Mat) -> Mat {
@@ -125,7 +140,9 @@ impl HashMoe {
                 let h = cache.hidden[t * self.d_ff + j];
                 let row = e * self.d_ff + j;
                 for c in 0..d {
-                    self.w2.grad.set(row, c, self.w2.grad.at(row, c) + h * dout.at(t, c));
+                    self.w2
+                        .grad
+                        .set(row, c, self.w2.grad.at(row, c) + h * dout.at(t, c));
                 }
             }
             for c in 0..d {
@@ -151,7 +168,9 @@ impl HashMoe {
                 let dh = dhidden[t * self.d_ff + j] * (s * (1.0 + pre * (1.0 - s)));
                 self.b1.grad.d[col] += dh;
                 for c in 0..d {
-                    self.w1.grad.set(c, col, self.w1.grad.at(c, col) + xr[c] * dh);
+                    self.w1
+                        .grad
+                        .set(c, col, self.w1.grad.at(c, col) + xr[c] * dh);
                     dxn.row_mut(t)[c] += dh * self.w1.value.at(c, col);
                 }
             }
@@ -198,13 +217,21 @@ impl Model {
         for _ in 0..cfg.n_layers {
             layers.push(Layer {
                 delta: DeltaBlock::new(
-                    DeltaCfg { d_model: cfg.d_model, n_heads: cfg.n_heads },
+                    DeltaCfg {
+                        d_model: cfg.d_model,
+                        n_heads: cfg.n_heads,
+                    },
                     rng,
                 ),
                 moe: HashMoe::new(cfg.d_model, cfg.d_ff, cfg.n_experts, rng),
             });
         }
-        Self { cfg, embed: Param::new("embed", embed), layers, head: Param::new("head", head) }
+        Self {
+            cfg,
+            embed: Param::new("embed", embed),
+            layers,
+            head: Param::new("head", head),
+        }
     }
 
     pub fn num_params(&self) -> usize {
@@ -256,13 +283,25 @@ impl Model {
             let mut x_out = x_mid.clone();
             x_out.axpy(1.0, &dm);
             x = x_out.clone();
-            layer_caches.push(LayerCache { x_in, delta_cache, x_mid, moe_cache, x_out });
+            layer_caches.push(LayerCache {
+                x_in,
+                delta_cache,
+                x_mid,
+                moe_cache,
+                x_out,
+            });
         }
         let h_final = rmsnorm_rows(&x, EPS);
         let logits = h_final.matmul(&self.head.value);
         (
             logits,
-            ModelCache { ids: ids.to_vec(), x0, layers: layer_caches, h_final, logits: Mat::zeros(t_len, self.cfg.vocab) },
+            ModelCache {
+                ids: ids.to_vec(),
+                x0,
+                layers: layer_caches,
+                h_final,
+                logits: Mat::zeros(t_len, self.cfg.vocab),
+            },
         )
     }
 
@@ -303,7 +342,11 @@ impl Model {
                 let p = (row[c] - lse).exp();
                 dlogits.set(t, c, p);
             }
-            dlogits.set(t, targets[t] as usize, dlogits.at(t, targets[t] as usize) - 1.0);
+            dlogits.set(
+                t,
+                targets[t] as usize,
+                dlogits.at(t, targets[t] as usize) - 1.0,
+            );
         }
         loss /= t_len as f32;
         for x in dlogits.d.iter_mut() {
@@ -313,7 +356,7 @@ impl Model {
         // head
         let d_head = cache.h_final.transpose().matmul(&dlogits);
         self.head.grad.axpy(1.0, &d_head);
-        let mut dh = dlogits.matmul(&self.head.value.transpose());
+        let dh = dlogits.matmul(&self.head.value.transpose());
 
         let mut dx = rmsnorm_rows_backward(&cache.layers.last().unwrap().x_out, &dh, EPS);
         for (li, layer) in self.layers.iter_mut().enumerate().rev() {
@@ -331,7 +374,11 @@ impl Model {
         // embedding
         for (t, &id) in cache.ids.iter().enumerate() {
             for c in 0..self.cfg.d_model {
-                self.embed.grad.set(id as usize, c, self.embed.grad.at(id as usize, c) + dx.at(t, c));
+                self.embed.grad.set(
+                    id as usize,
+                    c,
+                    self.embed.grad.at(id as usize, c) + dx.at(t, c),
+                );
             }
         }
         let _ = &cache.x0;

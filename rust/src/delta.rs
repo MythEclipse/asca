@@ -49,7 +49,10 @@ pub struct DeltaCache {
 
 impl DeltaBlock {
     pub fn new(cfg: DeltaCfg, rng: &mut Rng) -> Self {
-        assert!(cfg.d_model % cfg.n_heads == 0, "d_model harus habis dibagi n_heads");
+        assert!(
+            cfg.d_model % cfg.n_heads == 0,
+            "d_model harus habis dibagi n_heads"
+        );
         let d = cfg.d_model;
         let h = cfg.n_heads;
         let dh = d / h;
@@ -89,7 +92,14 @@ impl DeltaBlock {
     }
 
     pub fn params(&self) -> Vec<&Param> {
-        vec![&self.w_qkv, &self.b_qkv, &self.w_gate, &self.b_gate, &self.w_o, &self.b_o]
+        vec![
+            &self.w_qkv,
+            &self.b_qkv,
+            &self.w_gate,
+            &self.b_gate,
+            &self.w_o,
+            &self.b_o,
+        ]
     }
 
     /// Forward. `x`: (T, d_model) -> `(y, cache)` dengan `y`: (T, d_model).
@@ -197,7 +207,20 @@ impl DeltaBlock {
         let mut y = o.matmul(&self.w_o.value);
         y.add_row_bias(&self.b_o.value.d);
 
-        let cache = DeltaCache { x: x.clone(), qkv, q, k, v, gate, alpha, beta, qn, kn, o, s_pre };
+        let cache = DeltaCache {
+            x: x.clone(),
+            qkv,
+            q,
+            k,
+            v,
+            gate,
+            alpha,
+            beta,
+            qn,
+            kn,
+            o,
+            s_pre,
+        };
         (y, cache)
     }
 
@@ -381,7 +404,6 @@ impl DeltaBlock {
         dx.axpy(1.0, &d_gate.matmul(&self.w_gate.value.transpose()));
         dx
     }
-
 }
 
 /// Backward L2-normalize per segmen head: `dx = (dy - y (y.dy)) / s`.

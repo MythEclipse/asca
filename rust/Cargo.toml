@@ -21,6 +21,10 @@ harness = false
 name = "gradcheck_model"
 harness = false
 
+[[test]]
+name = "gradcheck_dense"
+harness = false
+
 [dependencies]
 
 [profile.release]

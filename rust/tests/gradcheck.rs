@@ -50,7 +50,9 @@ fn check_param(name: &str, block: &mut DeltaBlock, x: &Mat, dy: &Mat, fails: &mu
             worst = worst.max(rel);
             checked += 1;
             if rel > 1.0 {
-                println!("  GAGAL {name}[{i}]: analitik {analytic:.6e} vs numerik {numeric:.6e} (rel {rel:.2e})");
+                println!(
+                    "  GAGAL {name}[{i}]: analitik {analytic:.6e} vs numerik {numeric:.6e} (rel {rel:.2e})"
+                );
                 *fails += 1;
             }
         }
@@ -60,7 +62,10 @@ fn check_param(name: &str, block: &mut DeltaBlock, x: &Mat, dy: &Mat, fails: &mu
 
 fn main() {
     let mut rng = Rng::new(7);
-    let cfg = DeltaCfg { d_model: 16, n_heads: 2 };
+    let cfg = DeltaCfg {
+        d_model: 16,
+        n_heads: 2,
+    };
     let mut block = DeltaBlock::new(cfg, &mut rng);
     let t_len = 12;
     let mut x = Mat::zeros(t_len, 16);
@@ -102,11 +107,17 @@ fn main() {
         let rel = (dx.d[i] - numeric).abs() / tol;
         worst = worst.max(rel);
         if rel > 1.0 {
-            println!("  GAGAL dx[{i}]: analitik {:.6e} vs numerik {numeric:.6e}", dx.d[i]);
+            println!(
+                "  GAGAL dx[{i}]: analitik {:.6e} vs numerik {numeric:.6e}",
+                dx.d[i]
+            );
             fails += 1;
         }
     }
-    println!("  dx: {} entri, galat relatif terburuk {worst:.2e}", x.d.len());
+    println!(
+        "  dx: {} entri, galat relatif terburuk {worst:.2e}",
+        x.d.len()
+    );
 
     if fails > 0 {
         println!("\n{fails} entri GAGAL");

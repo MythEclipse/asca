@@ -12,7 +12,11 @@ pub struct Mat {
 
 impl Mat {
     pub fn zeros(rows: usize, cols: usize) -> Self {
-        Self { rows, cols, d: vec![0.0; rows * cols] }
+        Self {
+            rows,
+            cols,
+            d: vec![0.0; rows * cols],
+        }
     }
 
     pub fn from_vec(rows: usize, cols: usize, d: Vec<f32>) -> Self {
@@ -48,6 +52,11 @@ impl Mat {
 
     pub fn fill_const(&mut self, v: f32) {
         self.d.fill(v);
+    }
+
+    #[inline]
+    pub fn numel(&self) -> usize {
+        self.d.len()
     }
 
     pub fn zero_grad_like(&self) -> Self {
@@ -234,7 +243,13 @@ pub struct Param {
 impl Param {
     pub fn new(name: impl Into<String>, value: Mat) -> Self {
         let grad = Mat::zeros(value.rows, value.cols);
-        Self { name: name.into(), m: grad.clone(), v: grad.clone(), value, grad }
+        Self {
+            name: name.into(),
+            m: grad.clone(),
+            v: grad.clone(),
+            value,
+            grad,
+        }
     }
 
     pub fn zero_grad(&mut self) {
@@ -258,7 +273,14 @@ pub struct AdamW {
 
 impl AdamW {
     pub fn new(lr: f32) -> Self {
-        Self { lr, beta1: 0.9, beta2: 0.95, eps: 1e-8, wd: 0.01, step: 0 }
+        Self {
+            lr,
+            beta1: 0.9,
+            beta2: 0.95,
+            eps: 1e-8,
+            wd: 0.01,
+            step: 0,
+        }
     }
 
     pub fn update(&mut self, p: &mut Param) {

@@ -6,7 +6,14 @@ use asca_rs::tensor::Rng;
 
 fn main() {
     let mut rng = Rng::new(11);
-    let cfg = Config { vocab: 256, d_model: 16, n_heads: 2, n_layers: 1, n_experts: 2, d_ff: 16 };
+    let cfg = Config {
+        vocab: 256,
+        d_model: 16,
+        n_heads: 2,
+        n_layers: 1,
+        n_experts: 2,
+        d_ff: 16,
+    };
     let mut model = Model::new(cfg, &mut rng);
     let ids: Vec<u32> = (0..10).map(|_| rng.below(256) as u32).collect();
     let tgts: Vec<u32> = (0..10).map(|_| rng.below(256) as u32).collect();

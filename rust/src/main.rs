@@ -23,15 +23,24 @@ fn main() {
         "eval" => cmd_eval(&args),
         "sample" => cmd_sample(&args),
         "inspect" => cmd_inspect(&args),
+        "bench" => cmd_bench(&args),
         _ => {
             println!("asca — ASCA v2 (tanpa attention, state konstan, Rust murni)");
             println!("pakai:");
-            println!("  asca train   --data FILE [--steps 2000] [--seq-len 128] [--batch 8] [--lr 3e-3]");
+            println!(
+                "  asca train   --data FILE [--steps 2000] [--seq-len 128] [--batch 8] [--lr 3e-3]"
+            );
             println!("               [--d-model 64] [--n-heads 4] [--n-layers 2] [--n-experts 8]");
             println!("               [--d-ff 128] [--out ckpt.bin] [--eval-every 200]");
             println!("  asca eval    --ckpt FILE --data FILE [--batches 20] [--seq-len 128]");
             println!("  asca sample  --ckpt FILE [--prompt TEXT] [--tokens 200]");
             println!("  asca inspect --ckpt FILE");
+            println!(
+                "  asca bench   --data FILE [--steps 400] [--seeds 0,1,2] [--batch 4] [--seq-len 128]"
+            );
+            println!(
+                "               [--lr 3e-3] [--d-model 64] [--n-layers 2] [--n-experts 8] [--d-ff 128]"
+            );
         }
     }
 }
@@ -69,7 +78,12 @@ fn cmd_train(args: &[String]) {
         "ASCA v2: d_model {} n_heads {} n_layers {} n_experts {} d_ff {}",
         cfg.d_model, cfg.n_heads, cfg.n_layers, cfg.n_experts, cfg.d_ff
     );
-    train::train(&mut model, &data, &tcfg, arg(args, "--seed", "0").parse().unwrap());
+    train::train(
+        &mut model,
+        &data,
+        &tcfg,
+        arg(args, "--seed", "0").parse().unwrap(),
+    );
     let vl = train::evaluate(&mut model, &data, &mut rng, &tcfg);
     println!("val_loss akhir: {:.4}  ppl {:.2}", vl, vl.exp());
     train::save(&out, &model).expect("gagal simpan checkpoint");
@@ -142,6 +156,105 @@ fn cmd_sample(args: &[String]) {
     println!();
 }
 
+fn cmd_bench(args: &[String]) {
+    use asca_rs::bench::{self, BenchCfg, Trainable};
+    use asca_rs::dense::dense_matched_to;
+
+    let data_path = arg(args, "--data", "");
+    assert!(!data_path.is_empty(), "butuh --data FILE");
+    let cfg = build_cfg(args);
+    let bcfg = BenchCfg {
+        steps: arg(args, "--steps", "400").parse().unwrap(),
+        seq_len: arg(args, "--seq-len", "128").parse().unwrap(),
+        batch: arg(args, "--batch", "4").parse().unwrap(),
+        lr: arg(args, "--lr", "3e-3").parse().unwrap(),
+        warmup: arg(args, "--warmup", "40").parse().unwrap(),
+        eval_batches: arg(args, "--eval-batches", "8").parse().unwrap(),
+    };
+    let seeds: Vec<u64> = arg(args, "--seeds", "0,1,2")
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let data = Data::load(&data_path, 0.05).expect("gagal baca data");
+    println!(
+        "bench: steps {} seq {} batch {} lr {} seeds {:?}",
+        bcfg.steps, bcfg.seq_len, bcfg.batch, bcfg.lr, seeds
+    );
+    println!("data: {} byte ({} train)", data.bytes.len(), data.train_end);
+
+    // acuan: ASCA seed pertama, untuk menentukan target pencocokan parameter
+    let mut rng0 = Rng::new(seeds[0]);
+    let asca_ref = Model::new(cfg.clone(), &mut rng0);
+    let asca_total = asca_ref.num_params();
+    let asca_active = asca_ref.active_params();
+    println!(
+        "ASCA: total {} params, aktif/token {}",
+        asca_total, asca_active
+    );
+
+    // Dua perbandingan yang sah: total params sama, dan active params sama.
+    for (mode, target) in [("total", asca_total), ("active", asca_active)] {
+        println!("\n=== pencocokan {mode} params (target {target}) ===");
+        let mut a_losses = Vec::new();
+        let mut d_losses = Vec::new();
+        let mut a_tps = Vec::new();
+        let mut d_tps = Vec::new();
+        let (mut dp, mut da, mut ds) = (0usize, 0usize, 0usize);
+        let mut d_ff_used = 0usize;
+        for &seed in seeds.iter() {
+            let mut rng = Rng::new(seed);
+            let mut asca = Model::new(cfg.clone(), &mut rng);
+            let r = bench::run("asca", &mut asca, &data, &bcfg, seed);
+            let mut dense = dense_matched_to(
+                target,
+                cfg.vocab,
+                cfg.d_model,
+                cfg.n_heads,
+                cfg.n_layers,
+                seed ^ 0x5eed,
+            );
+            let rd = bench::run("dense", &mut dense, &data, &bcfg, seed);
+            println!(
+                "  seed {seed}: asca {:.4} ({:.0} tok/s) | dense d_ff={} {:.4} ({:.0} tok/s)",
+                r.val_loss, r.tok_per_sec, dense.cfg.d_ff, rd.val_loss, rd.tok_per_sec
+            );
+            a_losses.push(r.val_loss);
+            d_losses.push(rd.val_loss);
+            a_tps.push(r.tok_per_sec);
+            d_tps.push(rd.tok_per_sec);
+            dp = rd.params;
+            da = rd.active_params;
+            ds = rd.decode_floats;
+            d_ff_used = dense.cfg.d_ff;
+        }
+        let (am, asd) = bench::mean_std(&a_losses);
+        let (dm, dsd) = bench::mean_std(&d_losses);
+        let (at, _) = bench::mean_std(&a_tps);
+        let (dt, _) = bench::mean_std(&d_tps);
+        println!();
+        println!("| model | params | aktif/token | val_loss | tok/s | state decode |");
+        println!("|---|---|---|---|---|---|");
+        println!(
+            "| ASCA v2 | {} | {} | {:.4} ± {:.4} | {:.0} | {} float |",
+            asca_total,
+            asca_active,
+            am,
+            asd,
+            at,
+            asca_ref.decode_state_floats(bcfg.seq_len)
+        );
+        println!(
+            "| dense (d_ff={}) | {} | {} | {:.4} ± {:.4} | {:.0} | {} float |",
+            d_ff_used, dp, da, dm, dsd, dt, ds
+        );
+        println!(
+            "delta val_loss (asca - dense) = {:+.4}   throughput asca/dense = {:.2}x",
+            am - dm,
+            at / dt
+        );
+    }
+}
+
 fn cmd_inspect(args: &[String]) {
     let ckpt = arg(args, "--ckpt", "");
     let (model, cfg) = train::load(&ckpt, 0).expect("gagal load checkpoint");
@@ -152,6 +265,12 @@ fn cmd_inspect(args: &[String]) {
     );
     println!("params: {}", model.num_params());
     for p in model.params() {
-        println!("  {:<16} {:>8} x {:<8} = {}", p.name, p.value.rows, p.value.cols, p.numel());
+        println!(
+            "  {:<16} {:>8} x {:<8} = {}",
+            p.name,
+            p.value.rows,
+            p.value.cols,
+            p.numel()
+        );
     }
 }
