@@ -168,60 +168,85 @@ impl DeltaBlock {
             }
         }
 
+        // Scan maju juga terpisah per head: tiap head menulis kolom `off..off+dh` miliknya
+        // sendiri di `o`, dan state-nya disimpan per (head, batch). Sebelumnya loop ini
+        // memakai 1 core (17% waktu training).
         let (o, s_pre) = crate::prof::time(1, || {
+            struct Job {
+                off: usize,
+                o: Vec<f32>,
+                states: Vec<Vec<f32>>,
+            }
+            let mut jobs: Vec<Job> = (0..h)
+                .map(|hh| Job {
+                    off: hh * dh,
+                    o: vec![0.0f32; t_len * dh],
+                    states: Vec::with_capacity(batch),
+                })
+                .collect();
+            std::thread::scope(|sc| {
+                for job in jobs.iter_mut() {
+                    let off = job.off;
+                    let (oh, states_out) = (&mut job.o, &mut job.states);
+                    let (qr, kr, vr, ar, br) = (&q, &k, &v, &alpha, &beta);
+                    sc.spawn(move || {
+                        for bi in 0..batch {
+                            let mut s = vec![0.0f32; dh * dh];
+                            let mut states = Vec::with_capacity((seq + 1) * dh * dh);
+                            // `sk` dan `u` dialokasikan sekali per head, bukan per timestep.
+                            let mut sk = vec![0.0f32; dh];
+                            let mut u = vec![0.0f32; dh];
+                            for t in 0..seq {
+                                let r = bi * seq + t;
+                                states.extend_from_slice(&s);
+                                let kt = &kr.row(r)[off..off + dh];
+                                let vt = &vr.row(r)[off..off + dh];
+                                let a = ar.at(r, off / dh);
+                                let b = br.at(r, off / dh);
+                                sk.iter_mut().for_each(|z| *z = 0.0);
+                                for a_i in 0..dh {
+                                    let ka = kt[a_i];
+                                    if ka == 0.0 {
+                                        continue;
+                                    }
+                                    let srow = &s[a_i * dh..(a_i + 1) * dh];
+                                    for i in 0..dh {
+                                        sk[i] += srow[i] * ka;
+                                    }
+                                }
+                                for i in 0..dh {
+                                    u[i] = b * (vt[i] - a * sk[i]);
+                                }
+                                for a_i in 0..dh {
+                                    for i in 0..dh {
+                                        s[a_i * dh + i] = a * s[a_i * dh + i] + kt[a_i] * u[i];
+                                    }
+                                }
+                                let qt = &qr.row(r)[off..off + dh];
+                                for i in 0..dh {
+                                    let mut acc = 0.0;
+                                    for a_i in 0..dh {
+                                        acc += s[a_i * dh + i] * qt[a_i];
+                                    }
+                                    oh[r * dh + i] = acc;
+                                }
+                            }
+                            states.extend_from_slice(&s);
+                            states_out.push(states);
+                        }
+                    });
+                }
+            });
             let mut o = Mat::zeros(t_len, d);
             let mut s_pre: Vec<Vec<f32>> = Vec::with_capacity(h * batch);
-            for hh in 0..h {
-                let off = hh * dh;
-                for bi in 0..batch {
-                    let mut s = vec![0.0f32; dh * dh];
-                    let mut states = Vec::with_capacity((seq + 1) * dh * dh);
-                    // `sk` dan `u` dialokasikan sekali per head, bukan per timestep: versi
-                    // sebelumnya membuat 2 Vec x T x H per layer-forward.
-                    let mut sk = vec![0.0f32; dh];
-                    let mut u = vec![0.0f32; dh];
-                    for t in 0..seq {
-                        let r = bi * seq + t;
-                        states.extend_from_slice(&s);
-                        let kt = &k.row(r)[off..off + dh];
-                        let vt = &v.row(r)[off..off + dh];
-                        let a = alpha.at(r, hh);
-                        let b = beta.at(r, hh);
-                        // Sk = S^T k  (Sk[i] = sum_a S[a][i] k[a])
-                        sk.iter_mut().for_each(|z| *z = 0.0);
-                        for a_i in 0..dh {
-                            let ka = kt[a_i];
-                            if ka == 0.0 {
-                                continue;
-                            }
-                            let srow = &s[a_i * dh..(a_i + 1) * dh];
-                            for i in 0..dh {
-                                sk[i] += srow[i] * ka;
-                            }
-                        }
-                        // u = beta*(v - alpha*Sk); S = alpha*S + k u^T
-                        for i in 0..dh {
-                            u[i] = b * (vt[i] - a * sk[i]);
-                        }
-                        for a_i in 0..dh {
-                            for i in 0..dh {
-                                s[a_i * dh + i] = a * s[a_i * dh + i] + kt[a_i] * u[i];
-                            }
-                        }
-                        // o_t = S^T q
-                        let qt = &q.row(r)[off..off + dh];
-                        let orow = o.row_mut(r);
-                        for i in 0..dh {
-                            let mut acc = 0.0;
-                            for a_i in 0..dh {
-                                acc += s[a_i * dh + i] * qt[a_i];
-                            }
-                            orow[off + i] = acc;
-                        }
-                    }
-                    states.extend_from_slice(&s);
-                    s_pre.push(states);
+            // `into_iter` supaya state dipindahkan, bukan di-clone: menyalin 24 buffer
+            // state (25 MB per layer) menghabiskan seluruh keuntungan paralelnya.
+            for job in jobs.into_iter() {
+                let off = job.off;
+                for r in 0..t_len {
+                    o.row_mut(r)[off..off + dh].copy_from_slice(&job.o[r * dh..(r + 1) * dh]);
                 }
+                s_pre.extend(job.states.into_iter());
             }
             (o, s_pre)
         });
