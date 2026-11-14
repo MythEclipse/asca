@@ -98,15 +98,21 @@ rotated only the first head's slice, so 3 of 4 heads had no positional informati
 Fixing it shrank the gap from −0.35 to −0.24. **When the baseline loses, audit the
 baseline first.** Full detail in [`docs/RESULTS_V2.md`](docs/RESULTS_V2.md).
 
-### CUDA: kernels verified, no end-to-end speedup yet
+### CUDA: the delta block pays off, the rest still doesn't
 
-Tiled GEMM, transposed-A GEMM, RMSNorm fwd/bwd, elementwise, and the delta-rule scan as
-one block per head with the whole time loop inside the kernel. Parity with CPU is
-≤ 2.6e-7 relative and training loss is identical; GEMM is **22× faster** at
-4096×1024×1024. It does **not** speed up training yet — 6,856 tok/s CPU vs 6,829 tok/s
-GPU — because a step is 74.7 ms while its matmuls are only ~13 ms (~18%); the rest is
-elementwise work, the delta scan, and one H2D/D2H copy plus sync per op. See
-[`docs/CUDA.md`](docs/CUDA.md) for measurements and the fix list.
+Tiled GEMM, transposed-A GEMM, RMSNorm fwd/bwd, elementwise, cross-entropy, AdamW,
+gather/scatter, and the delta rule **both ways** — forward and hand-written BPTT — as one
+block per (head, sequence) with the whole time loop inside the kernel. Parity with CPU is
+≤ 2.6e-7 relative, gradients match the verified CPU BPTT to 8.0e-7, and training loss is
+identical.
+
+Moving the delta block to the GPU is worth **+12.4%** (3,530 → 3,967 tok/s, 12.7M
+parameters) — but only after the state history stopped crossing PCIe. The first attempt
+moved *just* the scan and was **slower** (3,265 tok/s): the BPTT was still on the CPU, so
+313 MB of state had to be downloaded every step. Device-resident state plus a BPTT kernel
+fixed it. The same instrumentation now says where the remaining 1.6 GB/step of traffic
+is: the output head and AdamW still round-trip `logits` (100 MB) and 12.7M optimizer
+states on every step. See [`docs/CUDA.md`](docs/CUDA.md).
 
 ## Repository layout
 

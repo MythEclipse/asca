@@ -154,18 +154,23 @@ Parity against CPU: GEMM and delta_fwd both ≤ 2.6e-7 relative, and training lo
 identical. GEMM speedup: 0.97× at 128×64×192 (copy overhead), **4.1×** at 512×64×1024,
 **20.5×** at 4096×1024×1024.
 
-**It does not speed up training yet**: 6,856 tok/s (CPU) vs 6,829 tok/s (GPU) on ASCA.
-One step is 74.7 ms while the matmuls in it are only ~13 ms (~18%) — the rest is
-RMSNorm, elementwise work, the delta scan and per-op allocations, and every call pays a
-full H2D/D2H copy plus a sync. `docs/CUDA.md` has the measurements and the fix list
-(device-resident tensors, fused elementwise, cross-sequence batching, GPU delta backward).
+**The delta block is now faster on the GPU**: 3,530 → 3,967 tok/s (+12.4%, 12.7M params,
+batch 8 x seq 256), with loss identical. The state history never leaves VRAM — the scan
+writes it to a device buffer and the BPTT kernel reads it there. Moving *only* the scan was
+measurably **slower** (3,265 tok/s) because 313 MB of state had to come back for a CPU
+backward. Everything else still round-trips per op (1.6 GB/step: output head + AdamW).
+`docs/CUDA.md` has the numbers and what is left.
+
+`ASCA_PROF=1` now also prints device traffic (H2D/D2H/kernel per step), and
+`ASCA_GPU_OFF=scan,moe` turns individual components off for A/B on the same binary.
 
 ## Not done yet
 
 - No loss-vs-tokens curve out to millions of tokens; dense may catch up.
 - No long-range recall test (where attention usually beats a compressed state).
-- GPU kernels exist and are verified, but per-op offload gives no end-to-end speedup
-  yet; tensors still live on the host. Absolute tok/s means nothing outside this crate.
+- Only the delta block is device-resident. The output head, cross-entropy and AdamW
+  still copy tensors per op, which is where most of the remaining 1.6 GB/step goes.
+  Absolute tok/s means nothing outside this crate.
 - Only 3 seeds; a strong claim needs 5+ and a measured noise floor.
 - `w_gate` / `b_gate` receive very small gradients (scale 4.6e-4 vs 1.3e0 for
   `b_qkv`); whether the gates actually learn needs checking.

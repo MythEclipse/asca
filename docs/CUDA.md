@@ -1,7 +1,8 @@
 # Kernel CUDA v2
 
-Status: **infrastruktur dan kernel benar, tetapi belum mempercepat training.** Angka di
-bawah menjelaskan kenapa, dan apa yang harus dikerjakan supaya benar-benar cepat.
+Status: **blok delta sudah mempercepat training (3.530 → 3.967 tok/s); sisanya belum.**
+Angka di bawah menjelaskan apa yang sudah jalan, apa yang gagal, dan apa yang harus
+dikerjakan berikutnya.
 
 ## 1. Yang dibangun
 
@@ -12,12 +13,12 @@ di-embed ke binary, driver API diikat langsung lewat `#[link(name = "cuda")]`.
 |---|---|
 | `build.rs` | kompilasi `kernels/asca.cu` → PTX (`-O3`, `-arch=sm_89`), tulis `gpu_build.rs` berisi PTX + daftar kernel + versi nvcc. Tanpa `nvcc` crate tetap terbangun, jalur GPU dilaporkan tidak tersedia |
 | `src/cuda/sys.rs` | binding driver API: context, modul PTX, buffer device, `cuLaunchKernel`, `cuFuncSetAttribute` |
-| `src/cuda/mod.rs` | `Gpu` (lazy `OnceLock`), `matmul`, `matmul_ta`, `rmsnorm`, `delta_fwd`; `ASCA_GPU=0` mematikan jalur GPU tanpa rebuild |
-| `kernels/asca.cu` | 8 kernel: `matmul_f32`, `matmul_ta_f32`, `add_bias_f32`, `axpy_f32`, `scale_f32`, `rmsnorm_f32`, `rmsnorm_bwd_f32`, `delta_fwd_f32` |
+| `src/cuda/mod.rs` | `Gpu` (lazy `OnceLock`), `matmul`, `matmul_ta`, `rmsnorm`, `delta_scan` + `delta_bwd_dev`, `DevBuf` (alokator caching), penghitung lalu lintas H2D/D2H; `ASCA_GPU=0` mematikan jalur GPU, `ASCA_GPU_OFF=scan,moe` mematikan per komponen tanpa rebuild |
+| `kernels/asca.cu` | 15 kernel: `matmul_f32`, `matmul_ta_f32`, `add_bias_f32`, `axpy_f32`, `scale_f32`, `rmsnorm_f32`, `rmsnorm_bwd_f32`, `delta_fwd_batch_f32`, `delta_bwd_f32`, `cross_entropy_bwd_f32`, `adamw_f32`, `gather_rows_f32`, `scatter_rows_f32`, `silu_f32` |
 
 `asca gpu` mencetak paritas dan benchmark. Kernel delta rule dipetakan **satu blok per
-head**, state `dh×dh` di shared memory, seluruh loop waktu di dalam kernel — tanpa
-keluaran antara ke memori global.
+(head, sekuens)**, state `dh×dh` di shared memory, seluruh loop waktu di dalam kernel —
+tanpa keluaran antara ke memori global.
 
 ## 2. Paritas (RTX 4050 Laptop, sm_89, CUDA 13.4)
 
@@ -25,7 +26,9 @@ keluaran antara ke memori global.
 |---|---|
 | `matmul` (64×64@64×192, 128×64@64×512, 37×53@53×91, 256³) | ≤ 2,6e-7 |
 | `matmul_ta` (A^T @ B) | ≤ 2,6e-7 |
-| `delta_fwd` (T=24, H=4, dh=16) vs referensi CPU | 1,4e-7 |
+| `delta_fwd_batch_f32` (B=3, seq=24, H=4, dh=16) vs referensi CPU | 1,5e-7 (o), 1,1e-7 (state) |
+| isolasi sekuens: `batch=3` vs 3× `batch=1` | **0,0** (bit-identik) |
+| `delta_bwd_f32` vs BPTT Rust (B=8, seq=128, d=192, H=6) | ≤ 8,0e-7 relatif di semua parameter + `dx` |
 
 End-to-end: loss training **identik** dengan jalur CPU (`2,0615` pada seed 0, 100 langkah),
 jadi offload matmul tidak mengubah matematika.
@@ -41,6 +44,72 @@ jadi offload matmul tidak mengubah matematika.
 
 Kernel GEMM-nya masih naif (tile 32×32, f32, tanpa tensor core), jadi 478 GFLOPS itu
 sekitar 4% puncak f32 kartu ini — masih ada ruang besar, tapi bukan itu hambatannya.
+
+## 3b. Blok delta pindah ke GPU: 3.530 → 3.967 tok/s
+
+Ini hasil pertama di repo ini yang membuat GPU benar-benar mempercepat training — dan
+jalan ke sana dimulai dari satu percobaan yang terukur **lebih lambat**.
+
+### Percobaan pertama: scan saja — LEBIH LAMBAT
+
+Rencana awalnya hanya memindahkan `delta.scan` (15% langkah di profil Colab), karena
+kernelnya sudah ada dan sudah lolos paritas. A/B pada binary yang sama
+(`ASCA_GPU_OFF=scan`), 12,7M params, batch 8 × seq 256, RTX 4050:
+
+| | scan CPU | scan GPU |
+|---|---|---|
+| tok/s | **3.516** | 3.265 |
+| `delta.scan` | 44,5 ms/langkah | 92,5 ms/langkah |
+| D2H per langkah | 589 MB | **902 MB** |
+
+Sebabnya bukan kernelnya: BPTT masih di CPU, jadi riwayat state `(seq+1)·dh²` per
+(head, sekuens) harus diunduh — **+313 MB per langkah**. Itu kesalahan yang sama persis
+dengan `scatter_rows` di MoE: memindahkan hitungan ke GPU tapi tetap pulang-pergi data
+hanya memindahkan biayanya. Offload scan per operasi **dicabut**, bukan dioptimasi.
+
+### Perbaikan: state tinggal di VRAM, BPTT ikut pindah
+
+`delta_fwd_batch_f32` menulis riwayat state ke buffer device yang hidup di `DeltaDev`,
+dan `delta_bwd_f32` membacanya langsung — tidak ada satu byte state pun yang menyeberang
+ke host. Yang naik ke host hanya `o`, `d_qkv`, dan `d_gate`.
+
+| | sebelum | sesudah |
+|---|---|---|
+| tok/s | 3.530 | **3.967** (+12,4%) |
+| `delta.scan` | 40,6 ms/langkah | **12,4** |
+| `delta.bwd` | 106,9 ms/langkah | **93,6** |
+| D2H per langkah | 589 MB | 627 MB |
+
+Loss identik sampai digit terakhir (6,1714 pada 20 langkah). Gate paritas: `o` 1,5e-7,
+state 1,1e-7, isolasi sekuens bit-identik, gradien ≤ 8,0e-7 relatif.
+
+Catatan jujur: `delta.bwd` hanya turun 13 ms karena BPTT CPU bukan bagian terbesar di
+dalamnya — sisanya matmul dan akumulasi bias di host. Kernel BPTT-nya sendiri
+~12 ms/langkah (48 blok, 256 langkah sekuensial, ~10 `__syncthreads` per langkah) ditambah
+~10 ms transfer; BPTT CPU yang digantikannya ~35 ms.
+
+### Bug yang ditemukan gate-nya sendiri
+
+Kernel `delta_bwd_f32` versi pertama menghasilkan galat **0,87 relatif** — bukan beda
+pembulatan, tapi salah. Sebabnya: `q` dan `k` yang dikirim ke kernel **sudah**
+dinormalisasi L2 di `forward`, dan kernel mengalikannya dengan `1/norma` sekali lagi.
+Tanpa gate gradien GPU-vs-CPU di `asca gpu`, ini akan lolos: loss tetap turun, hanya lebih
+buruk, dan tidak ada yang gagal.
+
+### Ke mana sisa 1,6 GB per langkah
+
+Penghitung di `DevBuf` membuat lalu lintas device bisa dibaca langsung (`ASCA_PROF=1`):
+
+| arah | per langkah | penyumbang terbesar |
+|---|---|---|
+| H2D | 975 MB | AdamW (4 × 50,9 MB state), logits/dlogits (100 MB per salinan) |
+| D2H | 627 MB | AdamW (3 × 50,9 MB), logits + dlogits (200 MB) |
+| kernel | 350 | — |
+
+Sisa pekerjaan terbesar karena itu bukan lagi MoE backward (96 ms/langkah CPU),
+melainkan **kepala output + AdamW yang masih pulang-pergi tiap langkah**: satu `logits`
+100 MB disalin ~4×, dan state optimizer 12,7M parameter disalin 7×. Itu ~900 MB/langkah
+yang bisa hilang tanpa satu kernel baru — cukup dengan menahan tensor di device.
 
 ## 4. Kenapa training belum cepat
 
@@ -69,14 +138,15 @@ matriks 128×64@64×192 salinan itu lebih mahal daripada matmul-nya (0,97×).
 
 Berurutan, dari yang paling menentukan:
 
-1. **Tensor tinggal di device.** Satu upload per langkah, satu download; semua
-   intermediate tetap di GPU. Ini menghapus ~90% salinan dan sinkronisasi.
+1. ~~**Tensor tinggal di device** untuk blok delta~~ **selesai** (§3b) — dan itu memang
+   yang membuatnya menang. Sisa: kepala output, cross-entropy, dan AdamW masih
+   pulang-pergi (975 MB + 627 MB per langkah).
 2. **Fusi elementwise.** RMSNorm + residual + sigmoid + gate dalam satu kernel per blok,
    bukan 6 peluncuran terpisah.
 3. **Batch lintas sekuens.** Gabungkan batch 4 menjadi 512 baris, sehingga GEMM jadi
    4× lebih besar — di situlah GPU mulai menang (4,14× pada 512 baris).
-4. **Backward delta di GPU** (`delta_bwd_f32`), termasuk BPTT yang sekarang ditulis tangan
-   di Rust.
+4. ~~**Backward delta di GPU** (`delta_bwd_f32`)~~ **selesai** (§3b), termasuk BPTT,
+   backward L2-normalisasi, dan backward sigmoid dalam satu kernel.
 5. Setelah itu baru tensor core f16 dan tile 64×64.
 
 Perkiraan realistis setelah langkah 1–4: 3–6× lebih cepat, artinya run 4M token × 5 seed
