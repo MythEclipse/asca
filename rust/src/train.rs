@@ -337,6 +337,36 @@ fn need(buf: &[u8], off: usize, n: usize) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Baca HANYA header checkpoint (nomor langkah + konfigurasi), tanpa memuat 76 MB bobot.
+pub fn peek_resume(path: &str) -> std::io::Result<(Config, usize)> {
+    use std::io::Read;
+    let mut f = fs::File::open(path)?;
+    let mut head = [0u8; 64];
+    f.read_exact(&mut head)?;
+    if &head[..8] != MAGIC_R {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bukan checkpoint format resume (tanpa header ASCARSM1); nomor langkah tidak diketahui",
+        ));
+    }
+    let mut nums = [0u64; 6];
+    for (i, n) in nums.iter_mut().enumerate() {
+        *n = u64::from_le_bytes(head[8 + i * 8..16 + i * 8].try_into().unwrap());
+    }
+    let step = u64::from_le_bytes(head[56..64].try_into().unwrap()) as usize;
+    Ok((
+        Config {
+            vocab: nums[0] as usize,
+            d_model: nums[1] as usize,
+            n_heads: nums[2] as usize,
+            n_layers: nums[3] as usize,
+            n_experts: nums[4] as usize,
+            d_ff: nums[5] as usize,
+        },
+        step,
+    ))
+}
+
 pub fn load_resume(path: &str) -> std::io::Result<(Model, AdamW, usize)> {
     let buf = fs::read(path)?;
     if buf.len() < 64 {

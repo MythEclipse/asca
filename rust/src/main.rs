@@ -33,6 +33,7 @@ fn main() {
         "tokenize" => cmd_tokenize(&args),
         "chat" => cmd_chat(&args),
         "genstat" => cmd_genstat(&args),
+        "ckptinfo" => cmd_ckptinfo(&args),
         _ => {
             println!("asca — ASCA v2 (tanpa attention, state konstan, Rust murni)");
             println!("pakai:");
@@ -440,6 +441,26 @@ fn utf8_prefix_len(b: &[u8]) -> usize {
 /// Penanda batas cerita di korpus. Model mempelajarinya dan akan menghasilkannya sendiri;
 /// tanpa ini, penanda itu ikut tercetak sebagai "<|endoftext|>" di tengah jawaban.
 const STOP_MARK: &[u8] = b"<|endoftext|>";
+
+/// Cetak isi header checkpoint tanpa memuat bobotnya: nomor langkah dan konfigurasi model.
+/// Dipakai `scripts/continue_training.sh` untuk menghitung learning rate sambungan.
+fn cmd_ckptinfo(args: &[String]) {
+    let path = arg(args, "--ckpt", "");
+    let (model, step) = match train::peek_resume(&path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("gagal membaca header checkpoint: {e}");
+            std::process::exit(1);
+        }
+    };
+    println!("step {step}");
+    println!("vocab {}", model.vocab);
+    println!("d_model {}", model.d_model);
+    println!("n_heads {}", model.n_heads);
+    println!("n_layers {}", model.n_layers);
+    println!("n_experts {}", model.n_experts);
+    println!("d_ff {}", model.d_ff);
+}
 
 fn cmd_chat(args: &[String]) {
     use std::io::{BufRead, Write};
