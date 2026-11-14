@@ -15,6 +15,14 @@
 
 use crate::tensor::{Mat, Param, Rng, sigmoid};
 
+/// Ambang pemakaian GPU untuk scan delta, dalam satuan `batch * seq * dh^2`
+/// (= jumlah elemen state yang harus bolak-balik ditambah kerja per langkah).
+///
+/// Diukur, bukan ditebak — lihat `docs/CUDA.md`: di bawah ambang ini salinan state
+/// (`(seq+1) * dh^2` float per head per sekuens) lebih mahal daripada scan CPU yang
+/// diparalelkan per head, jadi GPU justru merugikan.
+const SCAN_GPU_MIN: usize = 1 << 20;
+
 pub struct DeltaCfg {
     pub d_model: usize,
     pub n_heads: usize,
@@ -46,6 +54,8 @@ pub struct DeltaCache {
     /// indeks `hh * batch + b`: (seq+1) state per (head, sekuens),
     /// `s_pre[t]` = state sebelum langkah t, `s_pre[seq]` = state akhir
     pub s_pre: Vec<Vec<f32>>,
+    /// Kalau `Some`, riwayat state ada di VRAM dan BPTT berjalan di GPU. `s_pre` kosong.
+    pub dev: Option<crate::cuda::DeltaDev>,
     pub batch: usize,
     pub seq: usize,
 }
@@ -169,87 +179,9 @@ impl DeltaBlock {
         }
 
         // Scan maju juga terpisah per head: tiap head menulis kolom `off..off+dh` miliknya
-        // sendiri di `o`, dan state-nya disimpan per (head, batch). Sebelumnya loop ini
-        // memakai 1 core (17% waktu training).
-        let (o, s_pre) = crate::prof::time(1, || {
-            struct Job {
-                off: usize,
-                o: Vec<f32>,
-                states: Vec<Vec<f32>>,
-            }
-            let mut jobs: Vec<Job> = (0..h)
-                .map(|hh| Job {
-                    off: hh * dh,
-                    o: vec![0.0f32; t_len * dh],
-                    states: Vec::with_capacity(batch),
-                })
-                .collect();
-            std::thread::scope(|sc| {
-                for job in jobs.iter_mut() {
-                    let off = job.off;
-                    let (oh, states_out) = (&mut job.o, &mut job.states);
-                    let (qr, kr, vr, ar, br) = (&q, &k, &v, &alpha, &beta);
-                    sc.spawn(move || {
-                        for bi in 0..batch {
-                            let mut s = vec![0.0f32; dh * dh];
-                            let mut states = Vec::with_capacity((seq + 1) * dh * dh);
-                            // `sk` dan `u` dialokasikan sekali per head, bukan per timestep.
-                            let mut sk = vec![0.0f32; dh];
-                            let mut u = vec![0.0f32; dh];
-                            for t in 0..seq {
-                                let r = bi * seq + t;
-                                states.extend_from_slice(&s);
-                                let kt = &kr.row(r)[off..off + dh];
-                                let vt = &vr.row(r)[off..off + dh];
-                                let a = ar.at(r, off / dh);
-                                let b = br.at(r, off / dh);
-                                sk.iter_mut().for_each(|z| *z = 0.0);
-                                for a_i in 0..dh {
-                                    let ka = kt[a_i];
-                                    if ka == 0.0 {
-                                        continue;
-                                    }
-                                    let srow = &s[a_i * dh..(a_i + 1) * dh];
-                                    for i in 0..dh {
-                                        sk[i] += srow[i] * ka;
-                                    }
-                                }
-                                for i in 0..dh {
-                                    u[i] = b * (vt[i] - a * sk[i]);
-                                }
-                                for a_i in 0..dh {
-                                    for i in 0..dh {
-                                        s[a_i * dh + i] = a * s[a_i * dh + i] + kt[a_i] * u[i];
-                                    }
-                                }
-                                let qt = &qr.row(r)[off..off + dh];
-                                for i in 0..dh {
-                                    let mut acc = 0.0;
-                                    for a_i in 0..dh {
-                                        acc += s[a_i * dh + i] * qt[a_i];
-                                    }
-                                    oh[r * dh + i] = acc;
-                                }
-                            }
-                            states.extend_from_slice(&s);
-                            states_out.push(states);
-                        }
-                    });
-                }
-            });
-            let mut o = Mat::zeros(t_len, d);
-            let mut s_pre: Vec<Vec<f32>> = Vec::with_capacity(h * batch);
-            // `into_iter` supaya state dipindahkan, bukan di-clone: menyalin 24 buffer
-            // state (25 MB per layer) menghabiskan seluruh keuntungan paralelnya.
-            for job in jobs.into_iter() {
-                let off = job.off;
-                for r in 0..t_len {
-                    o.row_mut(r)[off..off + dh].copy_from_slice(&job.o[r * dh..(r + 1) * dh]);
-                }
-                s_pre.extend(job.states.into_iter());
-            }
-            (o, s_pre)
-        });
+        // sendiri di `o`, dan state-nya disimpan per (head, batch).
+        let (o, s_pre, dev) =
+            crate::prof::time(1, || self.scan(&q, &k, &v, &alpha, &beta, batch, seq));
 
         let mut y = crate::prof::time(2, || o.matmul(&self.w_o.value));
         y.add_row_bias(&self.b_o.value.d);
@@ -267,10 +199,138 @@ impl DeltaBlock {
             kn,
             o,
             s_pre,
+            dev,
             batch,
             seq,
         };
         (y, cache)
+    }
+
+    /// Scan maju: `o` (B*T, d_model) berisi `S^T q`, dan `s_pre[hh * batch + bi]` berisi
+    /// state sebelum tiap langkah plus state akhir (`(seq + 1) * dh * dh` float).
+    ///
+    /// Dua jalur, matematika sama; yang berbeda hanya di mana loop sekuensialnya jalan.
+    /// GPU memakai satu blok per (head, sekuens), CPU satu thread per head. Ambangnya
+    /// bukan tebakan: transfer state tumbuh seperti `T * dh^2` sedangkan kerja CPU
+    /// tumbuh seperti `B * seq^2 * dh^2`, jadi GPU menang begitu `seq` cukup panjang.
+    /// `ASCA_GPU_OFF=scan` memaksa jalur CPU pada binary yang sama untuk A/B.
+    fn scan(
+        &self,
+        q: &Mat,
+        k: &Mat,
+        v: &Mat,
+        alpha: &Mat,
+        beta: &Mat,
+        batch: usize,
+        seq: usize,
+    ) -> (Mat, Vec<Vec<f32>>, Option<crate::cuda::DeltaDev>) {
+        if crate::cuda::offload("scan") && batch * seq * self.dh * self.dh >= SCAN_GPU_MIN {
+            if let Some(g) = crate::cuda::gpu() {
+                if let Ok((o, dev)) =
+                    g.delta_scan(q, k, v, alpha, beta, batch, seq, self.cfg.n_heads, self.dh)
+                {
+                    // `s_pre` sengaja kosong: riwayat state tetap di VRAM dan dipakai
+                    // langsung oleh kernel backward. Mengunduhnya ke sini adalah persis
+                    // kesalahan yang membuat offload scan lebih lambat daripada CPU
+                    // (terukur: +313 MB per langkah, 3.265 vs 3.516 tok/s).
+                    return (o, Vec::new(), Some(dev));
+                }
+            }
+        }
+        let (o, s_pre) = self.scan_cpu(q, k, v, alpha, beta, batch, seq);
+        (o, s_pre, None)
+    }
+
+    fn scan_cpu(
+        &self,
+        q: &Mat,
+        k: &Mat,
+        v: &Mat,
+        alpha: &Mat,
+        beta: &Mat,
+        batch: usize,
+        seq: usize,
+    ) -> (Mat, Vec<Vec<f32>>) {
+        let (t_len, d) = (q.rows, self.cfg.d_model);
+        let h = self.cfg.n_heads;
+        let dh = self.dh;
+        struct Job {
+            off: usize,
+            o: Vec<f32>,
+            states: Vec<Vec<f32>>,
+        }
+        let mut jobs: Vec<Job> = (0..h)
+            .map(|hh| Job {
+                off: hh * dh,
+                o: vec![0.0f32; t_len * dh],
+                states: Vec::with_capacity(batch),
+            })
+            .collect();
+        std::thread::scope(|sc| {
+            for job in jobs.iter_mut() {
+                let off = job.off;
+                let (oh, states_out) = (&mut job.o, &mut job.states);
+                let (qr, kr, vr, ar, br) = (&q, &k, &v, &alpha, &beta);
+                sc.spawn(move || {
+                    for bi in 0..batch {
+                        let mut s = vec![0.0f32; dh * dh];
+                        let mut states = Vec::with_capacity((seq + 1) * dh * dh);
+                        // `sk` dan `u` dialokasikan sekali per head, bukan per timestep.
+                        let mut sk = vec![0.0f32; dh];
+                        let mut u = vec![0.0f32; dh];
+                        for t in 0..seq {
+                            let r = bi * seq + t;
+                            states.extend_from_slice(&s);
+                            let kt = &kr.row(r)[off..off + dh];
+                            let vt = &vr.row(r)[off..off + dh];
+                            let a = ar.at(r, off / dh);
+                            let b = br.at(r, off / dh);
+                            sk.iter_mut().for_each(|z| *z = 0.0);
+                            for a_i in 0..dh {
+                                let ka = kt[a_i];
+                                if ka == 0.0 {
+                                    continue;
+                                }
+                                let srow = &s[a_i * dh..(a_i + 1) * dh];
+                                for i in 0..dh {
+                                    sk[i] += srow[i] * ka;
+                                }
+                            }
+                            for i in 0..dh {
+                                u[i] = b * (vt[i] - a * sk[i]);
+                            }
+                            for a_i in 0..dh {
+                                for i in 0..dh {
+                                    s[a_i * dh + i] = a * s[a_i * dh + i] + kt[a_i] * u[i];
+                                }
+                            }
+                            let qt = &qr.row(r)[off..off + dh];
+                            for i in 0..dh {
+                                let mut acc = 0.0;
+                                for a_i in 0..dh {
+                                    acc += s[a_i * dh + i] * qt[a_i];
+                                }
+                                oh[r * dh + i] = acc;
+                            }
+                        }
+                        states.extend_from_slice(&s);
+                        states_out.push(states);
+                    }
+                });
+            }
+        });
+        let mut o = Mat::zeros(t_len, d);
+        let mut s_pre: Vec<Vec<f32>> = Vec::with_capacity(h * batch);
+        // `into_iter` supaya state dipindahkan, bukan di-clone: menyalin buffer state
+        // (puluhan MB per layer) menghabiskan seluruh keuntungan paralelnya.
+        for job in jobs.into_iter() {
+            let off = job.off;
+            for r in 0..t_len {
+                o.row_mut(r)[off..off + dh].copy_from_slice(&job.o[r * dh..(r + 1) * dh]);
+            }
+            s_pre.extend(job.states.into_iter());
+        }
+        (o, s_pre)
     }
 
     /// Backward. Mengembalikan `dx` dan mengakumulasi gradien ke parameter.
@@ -355,29 +415,19 @@ impl DeltaBlock {
         self.cfg.n_heads * self.dh * self.dh
     }
 
-    pub fn backward(&mut self, cache: &DeltaCache, dy: &Mat) -> Mat {
+    /// BPTT delta rule di CPU: satu thread per (head, sekuens), memakai riwayat state
+    /// `s_pre` (dari scan CPU, atau diunduh dari GPU kalau jalur cepat gagal). Mengembalikan `(d_qkv, d_gate)` — gradien kolom q/k/v setelah
+    /// backward L2-normalisasi, dan gradien logit gate setelah backward sigmoid.
+    fn bptt_cpu(&self, cache: &DeltaCache, d_o: &Mat, s_pre: &[Vec<f32>]) -> (Mat, Mat) {
         let (t_len, d) = (cache.x.rows, self.cfg.d_model);
         let h = self.cfg.n_heads;
         let dh = self.dh;
-
-        // y = o @ w_o + b_o
-        let d_o = dy.matmul_t(&self.w_o.value);
-        // dW_o = o^T @ dy ; db_o = sum(dy)
-        let d_w_o = cache.o.matmul_ta(dy);
-        self.w_o.grad.axpy(1.0, &d_w_o);
-        for r in 0..dy.rows {
-            let src = dy.row(r);
-            for c in 0..dy.cols {
-                self.b_o.grad.d[c] += src[c];
-            }
-        }
-
+        let seq = cache.seq;
         let mut d_q = Mat::zeros(t_len, d);
         let mut d_k = Mat::zeros(t_len, d);
         let mut d_v = Mat::zeros(t_len, d);
         let mut d_alpha = Mat::zeros(t_len, h);
         let mut d_beta = Mat::zeros(t_len, h);
-
         // Setiap head menulis kolom `off..off+dh` yang berbeda, dan d_alpha/d_beta kolom
         // hh yang berbeda. Jadi loop ini dipecah per head: tiap head menghitung ke buffer
         // lokalnya sendiri, lalu digabung. Ini bagian terbesar dari backward (36,5% waktu
@@ -393,7 +443,6 @@ impl DeltaBlock {
             la: Vec<f32>,
             lb: Vec<f32>,
         }
-        let seq = cache.seq;
         let mut jobs: Vec<Job> = Vec::with_capacity(h * cache.batch);
         for hh in 0..h {
             for bi in 0..cache.batch {
@@ -424,7 +473,7 @@ impl DeltaBlock {
                 let cache = &*cache;
                 let d_o = d_o_ref;
                 sc.spawn(move || {
-                    let states = &cache.s_pre[hh * cache.batch + bi];
+                    let states = &s_pre[hh * cache.batch + bi];
                     let mut ds = vec![0.0f32; dh * dh];
                     let mut sk = vec![0.0f32; dh];
                     let mut u = vec![0.0f32; dh];
@@ -550,14 +599,6 @@ impl DeltaBlock {
                 d_qkv.set(r, 2 * d + c, d_v.at(r, c));
             }
         }
-        let d_w_qkv = cache.x.transpose().matmul(&d_qkv);
-        self.w_qkv.grad.axpy(1.0, &d_w_qkv);
-        for r in 0..t_len {
-            for c in 0..d_qkv.cols {
-                self.b_qkv.grad.d[c] += d_qkv.at(r, c);
-            }
-        }
-
         // gate: alpha = sigmoid(g[:, :h]), beta = sigmoid(g[:, h:])
         let mut d_gate = Mat::zeros(t_len, 2 * h);
         for r in 0..t_len {
@@ -568,6 +609,54 @@ impl DeltaBlock {
                 d_gate.set(r, h + hh, d_beta.at(r, hh) * be * (1.0 - be));
             }
         }
+        (d_qkv, d_gate)
+    }
+
+    pub fn backward(&mut self, cache: &DeltaCache, dy: &Mat) -> Mat {
+        let t_len = cache.x.rows;
+
+        // y = o @ w_o + b_o
+        let d_o = dy.matmul_t(&self.w_o.value);
+        // dW_o = o^T @ dy ; db_o = sum(dy)
+        let d_w_o = cache.o.matmul_ta(dy);
+        self.w_o.grad.axpy(1.0, &d_w_o);
+        for r in 0..dy.rows {
+            let src = dy.row(r);
+            for c in 0..dy.cols {
+                self.b_o.grad.d[c] += src[c];
+            }
+        }
+
+        // Dua jalur BPTT. GPU memakai riwayat state yang tidak pernah meninggalkan VRAM
+        // (satu blok per head/sekuens, `delta_bwd_f32`); CPU dipakai kalau GPU tidak
+        // tersedia atau dimatikan lewat `ASCA_GPU_OFF=scan`. Keduanya menghasilkan
+        // (d_qkv, d_gate) yang sama, jadi sisa backward tidak tahu jalur mana yang jalan.
+        let (d_qkv, d_gate) = match cache.dev.as_ref() {
+            Some(dev) if crate::cuda::offload("scan") => {
+                let res =
+                    crate::cuda::gpu().map(|g| g.delta_bwd_dev(dev, &d_o, &cache.qn, &cache.kn));
+                match res {
+                    Some(Ok(r)) => r,
+                    // GPU gagal di tengah jalan: unduh state-nya lalu kerjakan di CPU.
+                    // Jangan panic hanya karena jalur cepat tidak tersedia — `s_pre`
+                    // memang kosong di jalur GPU.
+                    _ => {
+                        let s_pre = dev.download_states().expect("unduh state gagal");
+                        self.bptt_cpu(cache, &d_o, &s_pre)
+                    }
+                }
+            }
+            _ => self.bptt_cpu(cache, &d_o, &cache.s_pre),
+        };
+
+        let d_w_qkv = cache.x.transpose().matmul(&d_qkv);
+        self.w_qkv.grad.axpy(1.0, &d_w_qkv);
+        for r in 0..t_len {
+            for c in 0..d_qkv.cols {
+                self.b_qkv.grad.d[c] += d_qkv.at(r, c);
+            }
+        }
+
         let d_w_gate = cache.x.transpose().matmul(&d_gate);
         self.w_gate.grad.axpy(1.0, &d_w_gate);
         for r in 0..t_len {

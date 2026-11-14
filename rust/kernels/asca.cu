@@ -124,17 +124,29 @@ extern "C" __global__ void rmsnorm_bwd_f32(const float* __restrict__ X,
 }
 
 // ------------------------------------------------------- delta rule (scan waktu)
-// Satu blok per (head). State dh x dh di shared memory; loop waktu di dalam kernel.
-// Forward: q,k sudah dinormalisasi L2 per head, alpha/beta per (token, head).
-extern "C" __global__ void delta_fwd_f32(const float* __restrict__ q,  // (T, H*dh)
-                                         const float* __restrict__ k,
-                                         const float* __restrict__ v,
-                                         const float* __restrict__ alpha,  // (T, H)
-                                         const float* __restrict__ beta,
-                                         float* __restrict__ out,  // (T, H*dh)
-                                         int T, int H, int dh) {
+// Satu blok per (head, sekuens). State dh x dh di shared memory, loop waktu di dalam
+// kernel.
+//
+// Baris masukan ditumpuk `B * seq` (batching lintas sekuens), jadi tiap blok hanya
+// membaca baris `bi * seq + t` miliknya sendiri dan me-reset state di awal: tidak ada
+// token yang bocor antar sekuens. Versi sebelumnya memakai grid satu dimensi per head
+// dan menelusuri seluruh T baris sebagai satu sekuens — benar hanya kalau B = 1, dan
+// diam-diam salah (tanpa error) begitu batching dipakai.
+//
+// `states` (boleh nullptr) menyimpan state SEBELUM tiap langkah plus state akhir,
+// layout `((h * B) + bi) * (seq + 1) * dh * dh`, persis yang dibutuhkan BPTT.
+extern "C" __global__ void delta_fwd_batch_f32(const float* __restrict__ q,  // (B*seq, H*dh)
+                                               const float* __restrict__ k,
+                                               const float* __restrict__ v,
+                                               const float* __restrict__ alpha,  // (B*seq, H)
+                                               const float* __restrict__ beta,
+                                               float* __restrict__ out,  // (B*seq, H*dh)
+                                               float* __restrict__ states,
+                                               int H, int dh, int B, int seq) {
     const int h = blockIdx.x;
+    const int bi = blockIdx.y;
     const int off = h * dh;
+    const int row0 = bi * seq;
     extern __shared__ float sh[];  // dh*dh state + 3*dh temp
     float* S = sh;
     float* sk = sh + dh * dh;
@@ -142,12 +154,18 @@ extern "C" __global__ void delta_fwd_f32(const float* __restrict__ q,  // (T, H*
     float* kt = u + dh;
     for (int i = threadIdx.x; i < dh * dh; i += blockDim.x) S[i] = 0.0f;
     __syncthreads();
-    for (int t = 0; t < T; ++t) {
-        const float* qt = q + (long)t * H * dh + off;
-        const float* ktt = k + (long)t * H * dh + off;
-        const float* vt = v + (long)t * H * dh + off;
-        const float a = alpha[(long)t * H + h];
-        const float b = beta[(long)t * H + h];
+    float* st = states ? states + ((long)(h * B) + bi) * (long)(seq + 1) * dh * dh : nullptr;
+    for (int t = 0; t < seq; ++t) {
+        const long r = (long)row0 + t;
+        if (st) {
+            float* sdst = st + (long)t * dh * dh;
+            for (int i = threadIdx.x; i < dh * dh; i += blockDim.x) sdst[i] = S[i];
+        }
+        const float* qt = q + r * H * dh + off;
+        const float* ktt = k + r * H * dh + off;
+        const float* vt = v + r * H * dh + off;
+        const float a = alpha[r * H + h];
+        const float b = beta[r * H + h];
         for (int i = threadIdx.x; i < dh; i += blockDim.x) kt[i] = ktt[i];
         __syncthreads();
         // sk[i] = sum_a S[a][i] * k[a]
@@ -166,12 +184,184 @@ extern "C" __global__ void delta_fwd_f32(const float* __restrict__ q,  // (T, H*
             S[idx] = a * S[idx] + kt[a2] * u[i];
         }
         __syncthreads();
-        float* ot = out + (long)t * H * dh + off;
+        float* ot = out + r * H * dh + off;
         for (int i = threadIdx.x; i < dh; i += blockDim.x) {
             float acc = 0.0f;
             for (int a2 = 0; a2 < dh; ++a2) acc += S[a2 * dh + i] * qt[a2];
             ot[i] = acc;
         }
+        __syncthreads();
+    }
+    if (st) {
+        float* slast = st + (long)seq * dh * dh;
+        for (int i = threadIdx.x; i < dh * dh; i += blockDim.x) slast[i] = S[i];
+    }
+}
+
+// ------------------------------------------------- delta rule: backward (BPTT)
+// Satu blok per (head, sekuens), memakai state yang ditulis `delta_fwd_batch_f32` dan
+// TIDAK pernah menyeberang ke host. Ini bagian yang membuat offload scan masuk akal:
+// kalau state harus diunduh dulu supaya BPTT bisa jalan di CPU, biaya salinannya
+// (ratusan MB per langkah) lebih besar daripada scan CPU-nya sendiri.
+//
+// Turunannya sama persis dengan versi Rust di `src/delta.rs` (yang diverifikasi
+// gradcheck), termasuk urutan operasinya:
+//   dq_a   = dot(do_t, baris_a(S_t))
+//   ds    += q_a * do_t
+//   sk     = S_prev^T k          (dipakai untuk u)
+//   u      = beta * (v - alpha*sk)
+//   dalpha = <ds, S_prev> - beta*<du, sk>
+//   dbeta  = <du, v - alpha*sk>
+//   dk_a  += <ds_a, u> + <S_prev_a, dsk>
+//   du     = sum_a k_a * ds_a
+//   dsk    = -beta*alpha*du
+//   ds_prev = alpha*ds + k dsk^T
+//
+// Keluaran `d_qkv` (T, 3*d) sudah termasuk backward L2-normalisasi per head, dan
+// `d_gate` (T, 2H) sudah termasuk backward sigmoid — jadi tidak ada kernel tambahan.
+extern "C" __global__ void delta_bwd_f32(const float* __restrict__ states,
+                                         const float* __restrict__ q,  // (T, H*dh) mentah
+                                         const float* __restrict__ k,
+                                         const float* __restrict__ v,
+                                         const float* __restrict__ alpha,  // (T, H)
+                                         const float* __restrict__ beta,
+                                         const float* __restrict__ qnorm,  // (T, H)
+                                         const float* __restrict__ knorm,
+                                         const float* __restrict__ d_o,  // (T, H*dh)
+                                         float* __restrict__ d_qkv,      // (T, 3*H*dh)
+                                         float* __restrict__ d_gate,     // (T, 2*H)
+                                         int H, int dh, int B, int seq) {
+    const int h = blockIdx.x;
+    const int bi = blockIdx.y;
+    const int off = h * dh;
+    const int d = H * dh;
+    const int row0 = bi * seq;
+    extern __shared__ float sh[];
+    float* ds = sh;                  // dh*dh
+    float* dsprev = ds + dh * dh;    // dh*dh
+    float* sk = dsprev + dh * dh;    // dh
+    float* u = sk + dh;              // dh
+    float* dqv = u + dh;             // dh  (dq sementara)
+    float* dk = dqv + dh;            // dh
+    float* du = dk + dh;             // dh
+    float* dsk = du + dh;            // dh
+    float* qs = dsk + dh;            // dh  q ternormalisasi
+    float* ks = qs + dh;             // dh  k ternormalisasi
+    float* red = ks + dh;            // blockDim.x (reduksi)
+
+    const float* st = states + ((long)(h * B) + bi) * (long)(seq + 1) * dh * dh;
+    for (int i = threadIdx.x; i < dh * dh; i += blockDim.x) ds[i] = 0.0f;
+    __syncthreads();
+    for (int t = seq - 1; t >= 0; --t) {
+        const long r = (long)row0 + t;
+        const float* s_t = st + (long)(t + 1) * dh * dh;
+        const float* s_prev = st + (long)t * dh * dh;
+        const float* qt_raw = q + r * H * dh + off;
+        const float* kt_raw = k + r * H * dh + off;
+        const float* vt = v + r * H * dh + off;
+        const float* do_t = d_o + r * H * dh + off;
+        const float a = alpha[r * H + h];
+        const float b = beta[r * H + h];
+        // q dan k yang dikirim ke kernel SUDAH dinormalisasi L2 per head oleh
+        // `DeltaBlock::forward` (normalisasi terjadi in-place sebelum scan). Jadi di sini
+        // hanya disalin; `qn_inv`/`kn_inv` dipakai nanti untuk backward normalisasi.
+        const float qn_inv = 1.0f / fmaxf(qnorm[r * H + h], 1e-8f);
+        const float kn_inv = 1.0f / fmaxf(knorm[r * H + h], 1e-8f);
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) {
+            qs[i] = qt_raw[i];
+            ks[i] = kt_raw[i];
+            dk[i] = 0.0f;  // dk WAJIB direset tiap timestep
+        }
+        if (threadIdx.x < 2) red[threadIdx.x] = 0.0f;
+        __syncthreads();
+
+        // dq_a = dot(do_t, baris_a(S_t))
+        if (threadIdx.x < dh) {
+            const int a2 = threadIdx.x;
+            float acc = 0.0f;
+            for (int i = 0; i < dh; ++i) acc += do_t[i] * s_t[a2 * dh + i];
+            dqv[a2] = acc;
+        }
+        __syncthreads();
+        // ds += q do_t^T
+        for (int idx = threadIdx.x; idx < dh * dh; idx += blockDim.x) {
+            ds[idx] += qs[idx / dh] * do_t[idx % dh];
+        }
+        __syncthreads();
+        // sk_i = sum_a k_a S_prev[a][i]
+        if (threadIdx.x < dh) {
+            const int i = threadIdx.x;
+            float acc = 0.0f;
+            for (int a2 = 0; a2 < dh; ++a2) acc += ks[a2] * s_prev[a2 * dh + i];
+            sk[i] = acc;
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) u[i] = b * (vt[i] - a * sk[i]);
+        __syncthreads();
+        // dalpha = <ds, S_prev> ; dk_a += <ds_a, u> ; du_i = sum_a k_a ds[a][i]
+        float dalpha_l = 0.0f;
+        for (int idx = threadIdx.x; idx < dh * dh; idx += blockDim.x) {
+            dalpha_l += ds[idx] * s_prev[idx];
+        }
+        if (threadIdx.x < dh) {
+            const int a2 = threadIdx.x;
+            const int i = threadIdx.x;
+            float acc_u = 0.0f;
+            float acc_du = 0.0f;
+            for (int j = 0; j < dh; ++j) {
+                acc_u += ds[a2 * dh + j] * u[j];
+                acc_du += ks[j] * ds[j * dh + i];
+            }
+            dk[a2] += acc_u;
+            du[i] = acc_du;
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < dh * dh; idx += blockDim.x) dsprev[idx] = a * ds[idx];
+        // dbeta = <du, v - alpha*sk> ; dalpha -= beta*<du, sk> ; dv = beta*du
+        float dbeta_l = 0.0f;
+        float dalpha2_l = 0.0f;
+        for (int i = threadIdx.x; i < dh; i += blockDim.x) {
+            dbeta_l += du[i] * (vt[i] - a * sk[i]);
+            dalpha2_l += -b * du[i] * sk[i];
+            d_qkv[r * 3 * d + 2 * d + off + i] = b * du[i];
+            dsk[i] = -b * a * du[i];
+        }
+        __syncthreads();
+        atomicAdd(&red[0], dalpha_l + dalpha2_l);
+        atomicAdd(&red[1], dbeta_l);
+        // dk_a += <S_prev_a, dsk> ; ds_prev += k dsk^T
+        if (threadIdx.x < dh) {
+            const int a2 = threadIdx.x;
+            float acc = 0.0f;
+            for (int i = 0; i < dh; ++i) acc += s_prev[a2 * dh + i] * dsk[i];
+            dk[a2] += acc;
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < dh * dh; idx += blockDim.x) {
+            dsprev[idx] += ks[idx / dh] * dsk[idx % dh];
+        }
+        __syncthreads();
+        // d_gate: turunan sigmoid
+        if (threadIdx.x == 0) {
+            d_gate[r * 2 * H + h] = red[0] * a * (1.0f - a);
+            d_gate[r * 2 * H + H + h] = red[1] * b * (1.0f - b);
+        }
+        // backward L2-normalisasi: d_raw = (d_norm - q_hat <q_hat, d_norm>) / norma
+        // (norma di sini adalah norma sebelum normalisasi; q_hat = q_raw / norma)
+        if (threadIdx.x == 0) {
+            float dq_dot = 0.0f;
+            float dk_dot = 0.0f;
+            for (int i = 0; i < dh; ++i) {
+                dq_dot += qs[i] * dqv[i];
+                dk_dot += ks[i] * dk[i];
+            }
+            for (int i = 0; i < dh; ++i) {
+                d_qkv[r * 3 * d + off + i] = (dqv[i] - qs[i] * dq_dot) * qn_inv;
+                d_qkv[r * 3 * d + d + off + i] = (dk[i] - ks[i] * dk_dot) * kn_inv;
+            }
+        }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < dh * dh; idx += blockDim.x) ds[idx] = dsprev[idx];
         __syncthreads();
     }
 }

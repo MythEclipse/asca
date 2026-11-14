@@ -844,9 +844,15 @@ fn cmd_gpu(args: &[String]) {
     }
     println!("galat relatif terburuk: {worst:.3e}");
 
-    // --- paritas kernel delta rule terhadap referensi CPU
+    // --- paritas kernel delta rule terhadap referensi CPU (batched)
+    //
+    // Diuji dengan batch > 1 karena di situlah bug paling mudah terjadi: kalau satu blok
+    // menelusuri seluruh `B*seq` baris sebagai satu sekuens, hasilnya tetap "masuk akal"
+    // tapi state bocor antar sekuens. Referensi CPU di bawah me-reset state di awal tiap
+    // sekuens, jadi kebocoran itu akan terlihat sebagai galat besar.
     {
-        let (t_len, h, dh) = (24usize, 4usize, 16usize);
+        let (batch, seq, h, dh) = (3usize, 24usize, 4usize, 16usize);
+        let t_len = batch * seq;
         let d = h * dh;
         let mut q = Mat::zeros(t_len, d);
         q.fill_rand(&mut rng, 1.0);
@@ -870,57 +876,162 @@ fn cmd_gpu(args: &[String]) {
                 }
             }
         }
-        let alpha: Vec<f32> = (0..t_len * h).map(|_| 0.85 + 0.1 * rng.uniform()).collect();
-        let beta: Vec<f32> = (0..t_len * h).map(|_| 0.7 + 0.2 * rng.uniform()).collect();
-        // referensi CPU
-        let mut cpu_out = Mat::zeros(t_len, d);
-        let mut state = vec![0.0f32; h * dh * dh];
-        for t in 0..t_len {
+        let mut alpha = Mat::zeros(t_len, h);
+        let mut beta = Mat::zeros(t_len, h);
+        for r in 0..t_len {
             for hh in 0..h {
-                let off = hh * dh;
-                let a = alpha[t * h + hh];
-                let b = beta[t * h + hh];
-                let mut sk = vec![0.0f32; dh];
-                for i in 0..dh {
-                    let mut acc = 0.0f32;
-                    for a2 in 0..dh {
-                        acc += state[hh * dh * dh + a2 * dh + i] * k.at(t, off + a2);
-                    }
-                    sk[i] = acc;
-                }
-                let mut u = vec![0.0f32; dh];
-                for i in 0..dh {
-                    u[i] = b * (v.at(t, off + i) - a * sk[i]);
-                }
-                for a2 in 0..dh {
-                    for i in 0..dh {
-                        let idx = hh * dh * dh + a2 * dh + i;
-                        state[idx] = a * state[idx] + k.at(t, off + a2) * u[i];
-                    }
-                }
-                for i in 0..dh {
-                    let mut acc = 0.0f32;
-                    for a2 in 0..dh {
-                        acc += state[hh * dh * dh + a2 * dh + i] * q.at(t, off + a2);
-                    }
-                    cpu_out.set(t, off + i, acc);
-                }
+                alpha.set(r, hh, 0.85 + 0.1 * rng.uniform());
+                beta.set(r, hh, 0.7 + 0.2 * rng.uniform());
             }
         }
-        let gpu_out = cuda::gpu()
+        // referensi CPU: state di-reset per sekuens
+        let mut cpu_out = Mat::zeros(t_len, d);
+        let mut cpu_states: Vec<Vec<f32>> = Vec::with_capacity(h * batch);
+        for hh in 0..h {
+            for bi in 0..batch {
+                let off = hh * dh;
+                let mut state = vec![0.0f32; dh * dh];
+                let mut hist: Vec<f32> = Vec::with_capacity((seq + 1) * dh * dh);
+                for t in 0..seq {
+                    let r = bi * seq + t;
+                    hist.extend_from_slice(&state);
+                    let a = alpha.at(r, hh);
+                    let b = beta.at(r, hh);
+                    let mut sk = vec![0.0f32; dh];
+                    for i in 0..dh {
+                        let mut acc = 0.0f32;
+                        for a2 in 0..dh {
+                            acc += state[a2 * dh + i] * k.at(r, off + a2);
+                        }
+                        sk[i] = acc;
+                    }
+                    let mut u = vec![0.0f32; dh];
+                    for i in 0..dh {
+                        u[i] = b * (v.at(r, off + i) - a * sk[i]);
+                    }
+                    for a2 in 0..dh {
+                        for i in 0..dh {
+                            state[a2 * dh + i] = a * state[a2 * dh + i] + k.at(r, off + a2) * u[i];
+                        }
+                    }
+                    for i in 0..dh {
+                        let mut acc = 0.0f32;
+                        for a2 in 0..dh {
+                            acc += state[a2 * dh + i] * q.at(r, off + a2);
+                        }
+                        cpu_out.set(r, off + i, acc);
+                    }
+                }
+                hist.extend_from_slice(&state);
+                cpu_states.push(hist);
+            }
+        }
+        let (gpu_out, dev) = cuda::gpu()
             .unwrap()
-            .delta_fwd(&q, &k, &v, &alpha, &beta, t_len, h, dh)
-            .expect("delta_fwd gagal");
+            .delta_scan(&q, &k, &v, &alpha, &beta, batch, seq, h, dh)
+            .expect("delta_scan gagal");
+        let gpu_states = dev.download_states().expect("unduh state gagal");
         let mut e = 0.0f32;
         let mut sc = 1e-9f32;
         for i in 0..cpu_out.d.len() {
             e = e.max((cpu_out.d[i] - gpu_out.d[i]).abs());
             sc = sc.max(cpu_out.d[i].abs());
         }
+        let mut se = 0.0f32;
+        let mut ssc = 1e-9f32;
+        for (a, b) in cpu_states.iter().zip(gpu_states.iter()) {
+            for i in 0..a.len() {
+                se = se.max((a[i] - b[i]).abs());
+                ssc = ssc.max(a[i].abs());
+            }
+        }
         println!(
-            "  delta_fwd T={t_len} H={h} dh={dh}: galat maks {e:.3e} (relatif {:.3e})",
-            e / sc
+            "  delta_scan B={batch} seq={seq} H={h} dh={dh}: o galat {e:.3e} (relatif {:.3e}), states galat {se:.3e} (relatif {:.3e})",
+            e / sc,
+            se / ssc
         );
+
+        // Isolasi antar sekuens: hasil batch harus sama dengan memanggil tiap sekuens
+        // sendiri-sendiri. Ini yang membuktikan state tidak bocor.
+        let mut leak = 0.0f32;
+        for bi in 0..batch {
+            let lo = bi * seq;
+            let hi = lo + seq;
+            let sub = |m: &Mat| Mat::from_vec(seq, d, m.d[lo * d..hi * d].to_vec());
+            let (single, _) = cuda::gpu()
+                .unwrap()
+                .delta_scan(
+                    &sub(&q),
+                    &sub(&k),
+                    &sub(&v),
+                    &Mat::from_vec(seq, h, alpha.d[lo * h..hi * h].to_vec()),
+                    &Mat::from_vec(seq, h, beta.d[lo * h..hi * h].to_vec()),
+                    1,
+                    seq,
+                    h,
+                    dh,
+                )
+                .expect("delta_scan (batch=1) gagal");
+            for t in 0..seq {
+                for c in 0..d {
+                    leak = leak.max((single.at(t, c) - gpu_out.at(lo + t, c)).abs());
+                }
+            }
+        }
+        println!("  delta_scan isolasi sekuens: galat batch={batch} vs {batch}x batch=1 {leak:.3e}");
+    }
+
+    // --- paritas gradien blok delta: BPTT di GPU vs BPTT di CPU
+    //
+    // Ini gate yang sebenarnya untuk `delta_bwd_f32`: kernelnya harus menghasilkan
+    // gradien yang sama dengan versi Rust yang sudah diverifikasi beda hingga, termasuk
+    // backward L2-normalisasi dan backward sigmoid yang ikut di dalamnya.
+    {
+        use asca_rs::delta::{DeltaBlock, DeltaCfg};
+        let (batch, seq, d, h) = (8usize, 128usize, 192usize, 6usize);
+        let t_len = batch * seq;
+        let cfg = || DeltaCfg {
+            d_model: d,
+            n_heads: h,
+        };
+        // dua blok dari seed yang sama = bobot identik, satu dijalankan CPU satu di GPU
+        let mut rng_a = Rng::new(21);
+        let mut blk_cpu = DeltaBlock::new(cfg(), &mut rng_a);
+        let mut rng_b = Rng::new(21);
+        let mut blk_gpu = DeltaBlock::new(cfg(), &mut rng_b);
+        let mut x = Mat::zeros(t_len, d);
+        x.fill_rand(&mut rng, 0.5);
+        let mut dy = Mat::zeros(t_len, d);
+        dy.fill_rand(&mut rng, 0.1);
+
+        cuda::set_enabled(false);
+        let (_, c_cpu) = blk_cpu.forward(&x, batch);
+        let dx_cpu = blk_cpu.backward(&c_cpu, &dy);
+        cuda::set_enabled(true);
+        let (_, c_gpu) = blk_gpu.forward(&x, batch);
+        if c_gpu.dev.is_none() {
+            println!("  delta blok: jalur GPU tidak aktif (ambang/ASCA_GPU_OFF?) - dilewati");
+        } else {
+            let dx_gpu = blk_gpu.backward(&c_gpu, &dy);
+            let mut worst_rel = 0.0f32;
+            let cmp = |name: &str, a: &Mat, b: &Mat, worst: &mut f32| {
+                let mut e = 0.0f32;
+                let mut s = 1e-9f32;
+                for i in 0..a.d.len() {
+                    e = e.max((a.d[i] - b.d[i]).abs());
+                    s = s.max(a.d[i].abs());
+                }
+                *worst = worst.max(e / s);
+                println!("    {name:<14} galat {e:.3e} (relatif {:.3e})", e / s);
+            };
+            cmp("dx", &dx_cpu, &dx_gpu, &mut worst_rel);
+            let pc = blk_cpu.params();
+            let pg = blk_gpu.params();
+            for (a, b) in pc.iter().zip(pg.iter()) {
+                cmp(&a.name, &a.grad, &b.grad, &mut worst_rel);
+            }
+            println!("  delta blok gradien: galat relatif terburuk {worst_rel:.3e}");
+        }
     }
 
     // --- benchmark

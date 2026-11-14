@@ -10,10 +10,41 @@ pub mod sys;
 
 use std::ffi::{CString, c_void};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::tensor::Mat;
 
 include!(concat!(env!("OUT_DIR"), "/gpu_build.rs"));
+
+/// Berapa byte yang benar-benar menyeberangi PCIe, dan berapa kernel yang diluncurkan.
+///
+/// Ini bukan hiasan: keluhan "MoE forward sudah di GPU tapi masih makan 9%" punya satu
+/// sebab yang bisa dihitung — `scatter_rows` mengunggah dan mengunduh seluruh matriks
+/// keluaran untuk setiap expert. Tanpa penghitung ini, biaya transfer hanya bisa
+/// ditaksir; dengan ini ia menjadi angka yang bisa dibandingkan sebelum/sesudah.
+pub static H2D_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static D2H_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+
+pub fn reset_stats() {
+    H2D_BYTES.store(0, Ordering::Relaxed);
+    D2H_BYTES.store(0, Ordering::Relaxed);
+    LAUNCHES.store(0, Ordering::Relaxed);
+}
+
+/// Ringkasan lalu lintas device. `steps` dipakai untuk membagi rata-rata per langkah.
+pub fn stats_report(steps: u64) -> String {
+    let h2d = H2D_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
+    let d2h = D2H_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
+    let l = LAUNCHES.load(Ordering::Relaxed);
+    let s = steps.max(1) as f64;
+    format!(
+        "GPU lalu lintas: H2D {h2d:.1} MB, D2H {d2h:.1} MB, {l} kernel ({:.2} MB + {:.2} MB + {:.0} kernel per langkah)",
+        h2d / s,
+        d2h / s,
+        l as f64 / s
+    )
+}
 
 pub struct Gpu {
     pub name: String,
@@ -53,6 +84,7 @@ impl DevBuf {
         Ok(DevBuf(p, sz))
     }
     pub fn upload(&self, data: &[f32]) -> Result<(), String> {
+        H2D_BYTES.fetch_add(std::mem::size_of_val(data) as u64, Ordering::Relaxed);
         let rc = unsafe {
             sys::cuMemcpyHtoD_v2(
                 self.0,
@@ -67,6 +99,7 @@ impl DevBuf {
         }
     }
     pub fn download(&self, out: &mut [f32]) -> Result<(), String> {
+        D2H_BYTES.fetch_add(std::mem::size_of_val(out) as u64, Ordering::Relaxed);
         let rc = unsafe {
             sys::cuMemcpyDtoH_v2(
                 out.as_mut_ptr() as *mut c_void,
@@ -180,6 +213,7 @@ impl Gpu {
         mut args: Vec<*mut c_void>,
     ) -> Result<(), String> {
         let f = self.func(name)?;
+        LAUNCHES.fetch_add(1, Ordering::Relaxed);
         if shared > 48 * 1024 {
             unsafe {
                 sys::cuFuncSetAttribute(f, sys::FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED, shared as i32);
@@ -542,34 +576,49 @@ impl Gpu {
         Ok(())
     }
 
-    pub fn delta_fwd(
+    /// Delta rule forward untuk seluruh (head, sekuens) sekaligus, dengan state yang
+    /// **tetap di device**.
+    ///
+    /// Satu blok per (head, sekuens), jadi `batch` sekuens yang ditumpuk tidak saling
+    /// bocor. `q`, `k`, `v`, `alpha`, `beta`, dan riwayat state disimpan di VRAM dan
+    /// dipakai langsung oleh [`Gpu::delta_bwd_dev`]; yang kembali ke host hanya `o`.
+    /// Inilah bedanya dengan offload per operasi: kalau riwayat state harus diunduh
+    /// dulu, biayanya ratusan MB per langkah dan lebih lambat daripada scan CPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delta_scan(
         &self,
         q: &Mat,
         k: &Mat,
         v: &Mat,
-        alpha: &[f32],
-        beta: &[f32],
-        t_len: usize,
+        alpha: &Mat,
+        beta: &Mat,
+        batch: usize,
+        seq: usize,
         n_heads: usize,
         dh: usize,
-    ) -> Result<Mat, String> {
+    ) -> Result<(Mat, DeltaDev), String> {
         let d = n_heads * dh;
+        let t_len = batch * seq;
+        assert_eq!(q.rows, t_len, "delta_scan: q rows harus batch*seq");
         let dq = DevBuf::new(q.d.len() * 4)?;
         let dk = DevBuf::new(k.d.len() * 4)?;
         let dv = DevBuf::new(v.d.len() * 4)?;
-        let da = DevBuf::new(alpha.len() * 4)?;
-        let db = DevBuf::new(beta.len() * 4)?;
+        let da = DevBuf::new(alpha.d.len() * 4)?;
+        let db = DevBuf::new(beta.d.len() * 4)?;
         let dout = DevBuf::new(t_len * d * 4)?;
+        let n_state = n_heads * batch * (seq + 1) * dh * dh;
+        let dstates = DevBuf::new(n_state * 4)?;
         dq.upload(&q.d)?;
         dk.upload(&k.d)?;
         dv.upload(&v.d)?;
-        da.upload(alpha)?;
-        db.upload(beta)?;
-        let (mut t, mut h, mut dhv) = (t_len as i32, n_heads as i32, dh as i32);
+        da.upload(&alpha.d)?;
+        db.upload(&beta.d)?;
+        let (mut h_i, mut dh_i, mut b_i, mut seq_i) =
+            (n_heads as i32, dh as i32, batch as i32, seq as i32);
         let shared = ((dh * dh + 3 * dh) * 4) as u32;
         self.launch(
-            "delta_fwd_f32",
-            (n_heads as u32, 1, 1),
+            "delta_fwd_batch_f32",
+            (n_heads as u32, batch as u32, 1),
             (128, 1, 1),
             shared,
             vec![
@@ -579,15 +628,118 @@ impl Gpu {
                 &da.0 as *const _ as *mut c_void,
                 &db.0 as *const _ as *mut c_void,
                 &dout.0 as *const _ as *mut c_void,
-                &mut t as *mut _ as *mut c_void,
-                &mut h as *mut _ as *mut c_void,
-                &mut dhv as *mut _ as *mut c_void,
+                &dstates.0 as *const _ as *mut c_void,
+                &mut h_i as *mut _ as *mut c_void,
+                &mut dh_i as *mut _ as *mut c_void,
+                &mut b_i as *mut _ as *mut c_void,
+                &mut seq_i as *mut _ as *mut c_void,
             ],
         )?;
         unsafe { sys::cuCtxSynchronize() };
         let mut out = vec![0.0f32; t_len * d];
         dout.download(&mut out)?;
-        Ok(Mat::from_vec(t_len, d, out))
+        Ok((
+            Mat::from_vec(t_len, d, out),
+            DeltaDev {
+                q: dq,
+                k: dk,
+                v: dv,
+                alpha: da,
+                beta: db,
+                states: dstates,
+                batch,
+                seq,
+                n_heads,
+                dh,
+            },
+        ))
+    }
+
+    /// BPTT delta rule di device, memakai state dari [`Gpu::delta_scan`].
+    ///
+    /// Mengembalikan `(d_qkv, d_gate)`: gradien kolom q/k/v setelah backward
+    /// L2-normalisasi, dan gradien logit gate setelah backward sigmoid. Yang naik ke
+    /// host hanya dua matriks ini (T x 3d dan T x 2H), bukan riwayat state.
+    pub fn delta_bwd_dev(
+        &self,
+        dev: &DeltaDev,
+        d_o: &Mat,
+        qnorm: &Mat,
+        knorm: &Mat,
+    ) -> Result<(Mat, Mat), String> {
+        let (batch, seq, n_heads, dh) = (dev.batch, dev.seq, dev.n_heads, dev.dh);
+        let d = n_heads * dh;
+        let t_len = batch * seq;
+        assert_eq!(d_o.rows, t_len);
+        let ddo = DevBuf::new(d_o.d.len() * 4)?;
+        let dqn = DevBuf::new(qnorm.d.len() * 4)?;
+        let dkn = DevBuf::new(knorm.d.len() * 4)?;
+        let d_dqkv = DevBuf::new(t_len * 3 * d * 4)?;
+        let d_dgate = DevBuf::new(t_len * 2 * n_heads * 4)?;
+        ddo.upload(&d_o.d)?;
+        dqn.upload(&qnorm.d)?;
+        dkn.upload(&knorm.d)?;
+        let (mut h_i, mut dh_i, mut b_i, mut seq_i) =
+            (n_heads as i32, dh as i32, batch as i32, seq as i32);
+        let shared = ((2 * dh * dh + 9 * dh + 128) * 4) as u32;
+        self.launch(
+            "delta_bwd_f32",
+            (n_heads as u32, batch as u32, 1),
+            (128, 1, 1),
+            shared,
+            vec![
+                &dev.states.0 as *const _ as *mut c_void,
+                &dev.q.0 as *const _ as *mut c_void,
+                &dev.k.0 as *const _ as *mut c_void,
+                &dev.v.0 as *const _ as *mut c_void,
+                &dev.alpha.0 as *const _ as *mut c_void,
+                &dev.beta.0 as *const _ as *mut c_void,
+                &dqn.0 as *const _ as *mut c_void,
+                &dkn.0 as *const _ as *mut c_void,
+                &ddo.0 as *const _ as *mut c_void,
+                &d_dqkv.0 as *const _ as *mut c_void,
+                &d_dgate.0 as *const _ as *mut c_void,
+                &mut h_i as *mut _ as *mut c_void,
+                &mut dh_i as *mut _ as *mut c_void,
+                &mut b_i as *mut _ as *mut c_void,
+                &mut seq_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        unsafe { sys::cuCtxSynchronize() };
+        let mut dqkv = vec![0.0f32; t_len * 3 * d];
+        d_dqkv.download(&mut dqkv)?;
+        let mut dgate = vec![0.0f32; t_len * 2 * n_heads];
+        d_dgate.download(&mut dgate)?;
+        Ok((
+            Mat::from_vec(t_len, 3 * d, dqkv),
+            Mat::from_vec(t_len, 2 * n_heads, dgate),
+        ))
+    }
+}
+
+/// State delta rule yang tinggal di VRAM antara forward dan backward.
+pub struct DeltaDev {
+    q: DevBuf,
+    k: DevBuf,
+    v: DevBuf,
+    alpha: DevBuf,
+    beta: DevBuf,
+    states: DevBuf,
+    pub batch: usize,
+    pub seq: usize,
+    pub n_heads: usize,
+    pub dh: usize,
+}
+
+impl DeltaDev {
+    /// Unduh riwayat state. Hanya untuk uji paritas — jalur training memakai
+    /// [`Gpu::delta_bwd_dev`] dan tidak pernah menyalinnya ke host.
+    pub fn download_states(&self) -> Result<Vec<Vec<f32>>, String> {
+        let n = self.n_heads * self.batch * (self.seq + 1) * self.dh * self.dh;
+        let mut flat = vec![0.0f32; n];
+        self.states.download(&mut flat)?;
+        let per = (self.seq + 1) * self.dh * self.dh;
+        Ok(flat.chunks(per).map(|c| c.to_vec()).collect())
     }
 }
 
@@ -628,6 +780,27 @@ pub fn available() -> bool {
 
 pub fn set_enabled(v: bool) {
     ENABLED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Apakah komponen bernama boleh di-offload.
+///
+/// `ASCA_GPU=0` mematikan seluruh jalur GPU. `ASCA_GPU_OFF=scan,moe` mematikan
+/// komponen satu per satu, sehingga kontribusi tiap komponen bisa diukur A/B pada
+/// binary yang sama — tanpa itu, membandingkan "semua GPU" lawan "semua CPU" hanya
+/// memberi satu angka gabungan dan tidak bisa menyalahkan komponen mana pun.
+pub fn offload(component: &str) -> bool {
+    static OFF: OnceLock<Vec<String>> = OnceLock::new();
+    let off = OFF.get_or_init(|| {
+        std::env::var("ASCA_GPU_OFF")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    available() && !off.iter().any(|c| c == component)
 }
 
 /// Deskripsi singkat untuk log.

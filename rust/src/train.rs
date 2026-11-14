@@ -259,6 +259,17 @@ where
                 tok / el.max(1e-6),
                 el
             );
+            // Lalu lintas device per langkah. Tanpa ini, "sudah dipindah ke GPU tapi
+            // masih lambat" hanya bisa ditebak sebabnya; dengan ini biaya salinannya
+            // menjadi angka yang bisa dibandingkan antar perubahan.
+            if crate::prof::ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+                && crate::cuda::available()
+            {
+                println!(
+                    "  {}",
+                    crate::cuda::stats_report((step_i + 1 - start_step) as u64)
+                );
+            }
         }
         if cfg.eval_every > 0 && (step_i + 1) % cfg.eval_every == 0 {
             let vl = evaluate(model, data, &mut rng, cfg);
