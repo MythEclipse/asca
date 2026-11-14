@@ -521,6 +521,23 @@ fn cmd_chat(args: &[String]) {
         }
         // prompt masuk ke state, lalu jawaban mengalir keluar
         let mut logits = None;
+        // Pemisah dokumen antar giliran. Model dilatih dengan `<|endoftext|>` sebagai batas
+        // cerita; tanpa penanda ini, prompt baru dianggap lanjutan cerita sebelumnya dan
+        // model menjawab dengan mengulang tokoh lama (terlihat sebagai " Tom. He was so
+        // excited!" padahal promptnya tentang kotak di taman). Menyisipkan penanda yang
+        // sama seperti saat training membuat tiap giliran menjadi dokumen baru.
+        if !ctx_ids.is_empty() {
+            let sep = match &bpe {
+                Some(b) => b.encode(STOP_MARK),
+                None => STOP_MARK.iter().map(|&c| c as u32).collect(),
+            };
+            for &id in sep.iter() {
+                if (id as usize) < cfg.vocab {
+                    logits = Some(model.step(id, &mut st));
+                    ctx_ids.push(id);
+                }
+            }
+        }
         for &id in ctx_ids.iter().chain(ids.iter()) {
             logits = Some(model.step(id, &mut st));
         }
