@@ -125,6 +125,7 @@ impl DevBuf {
     }
     pub fn upload(&self, data: &[f32]) -> Result<(), String> {
         H2D_BYTES.fetch_add(std::mem::size_of_val(data) as u64, Ordering::Relaxed);
+        crate::prof::add_traffic(std::mem::size_of_val(data) as u64, false);
         let rc = unsafe {
             sys::cuMemcpyHtoD_v2(
                 self.0,
@@ -140,6 +141,7 @@ impl DevBuf {
     }
     pub fn download(&self, out: &mut [f32]) -> Result<(), String> {
         D2H_BYTES.fetch_add(std::mem::size_of_val(out) as u64, Ordering::Relaxed);
+        crate::prof::add_traffic(std::mem::size_of_val(out) as u64, true);
         let rc = unsafe {
             sys::cuMemcpyDtoH_v2(
                 out.as_mut_ptr() as *mut c_void,
@@ -393,6 +395,218 @@ impl Gpu {
                 &mut ni as *mut _ as *mut c_void,
             ],
         )
+    }
+
+    /// Gather baris di device: `dst[r] = src[idx[r]]`, tanpa transfer.
+    fn gather_raw(
+        &self,
+        src: &DevBuf,
+        idx: &DevBuf,
+        n: usize,
+        cols: usize,
+        dst: &DevBuf,
+    ) -> Result<(), String> {
+        let (mut nr, mut c) = (n as i32, cols as i32);
+        self.launch(
+            "gather_rows_f32",
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &src.0 as *const _ as *mut c_void,
+                &idx.0 as *const _ as *mut c_void,
+                &dst.0 as *const _ as *mut c_void,
+                &mut nr as *mut _ as *mut c_void,
+                &mut c as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// Scatter baris di device: `dst[idx[r]] = src[r]`, tanpa transfer.
+    fn scatter_raw(
+        &self,
+        src: &DevBuf,
+        idx: &DevBuf,
+        n: usize,
+        cols: usize,
+        dst: &DevBuf,
+    ) -> Result<(), String> {
+        let (mut nr, mut c) = (n as i32, cols as i32);
+        self.launch(
+            "scatter_rows_f32",
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &src.0 as *const _ as *mut c_void,
+                &idx.0 as *const _ as *mut c_void,
+                &dst.0 as *const _ as *mut c_void,
+                &mut nr as *mut _ as *mut c_void,
+                &mut c as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// SiLU di device, di tempat.
+    fn silu_raw(&self, buf: &DevBuf, n: usize) -> Result<(), String> {
+        let mut n_i = n as i32;
+        self.launch(
+            "silu_f32",
+            ((n as u32).div_ceil(256), 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &buf.0 as *const _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// Tambah bias kolom di device mulai `off` elemen (`X[i] += b[off + i % cols]`).
+    fn add_bias_raw(
+        &self,
+        buf: &DevBuf,
+        bias: &DevBuf,
+        off: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), String> {
+        let (mut r, mut c) = (rows as i32, cols as i32);
+        let biased = sys::DevicePtr(bias.0.0 + (off * 4) as u64);
+        self.launch(
+            "add_bias_f32",
+            (((rows * cols) as u32).div_ceil(256), 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &buf.0 as *const _ as *mut c_void,
+                &biased as *const _ as *mut c_void,
+                &mut r as *mut _ as *mut c_void,
+                &mut c as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// GEMM `C = A @ B[:, offb:offb+N]` dengan `B` berstride `ldb`, semua di device.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_ld_raw(
+        &self,
+        a: &DevBuf,
+        b: &DevBuf,
+        c: &DevBuf,
+        m: usize,
+        k: usize,
+        n: usize,
+        ldb: usize,
+        offb: usize,
+        b_off_elems: usize,
+    ) -> Result<(), String> {
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, n as i32);
+        let (mut ldb_i, mut offb_i) = (ldb as i32, offb as i32);
+        let bp = sys::DevicePtr(b.0.0 + (b_off_elems * 4) as u64);
+        self.launch(
+            "matmul_ld_f32",
+            (((n as u32).div_ceil(32)), ((m as u32).div_ceil(32)), 1),
+            (32, 32, 1),
+            0,
+            vec![
+                &a.0 as *const _ as *mut c_void,
+                &bp as *const _ as *mut c_void,
+                &c.0 as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut ldb_i as *mut _ as *mut c_void,
+                &mut offb_i as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// MoE forward dengan seluruh intermediate tetap di VRAM.
+    ///
+    /// Versi per operasi mengunggah `xn` untuk tiap expert, mengunduh keluarannya,
+    /// mengunggah lagi untuk GEMM kedua, lalu scatter dengan menyalin seluruh matriks
+    /// keluaran naik-turun. Terukur **382 MB per langkah** hanya untuk MoE forward — 49%
+    /// dari seluruh lalu lintas device. Di sini `xn`, `w1`, `w2`, `b1`, `b2` diunggah
+    /// sekali per layer; gather, GEMM, bias, SiLU, dan scatter berjalan di device.
+    ///
+    /// `w1` dipakai bersama semua expert lewat `matmul_ld_f32` (offset kolom), jadi tidak
+    /// ada lagi salinan kolom per expert di host. Yang turun hanya `out` dan `pre`
+    /// (`hidden` dihitung ulang di host dengan rumus yang sama persis dengan kernel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_forward_dev(
+        &self,
+        xn: &Mat,
+        w1: &Mat,
+        b1: &[f32],
+        w2: &Mat,
+        b2: &[f32],
+        buckets: &[Vec<usize>],
+        d_ff: usize,
+    ) -> Result<(Mat, Vec<Mat>, Vec<Mat>), String> {
+        let (t_len, d) = (xn.rows, xn.cols);
+        let w1_cols = w1.cols;
+        let dxn = DevBuf::new(t_len * d * 4)?;
+        let dw1 = DevBuf::new(w1.d.len() * 4)?;
+        let dw2 = DevBuf::new(w2.d.len() * 4)?;
+        let db1 = DevBuf::new(b1.len() * 4)?;
+        let db2 = DevBuf::new(b2.len() * 4)?;
+        let dout = DevBuf::new(t_len * d * 4)?;
+        dxn.upload(&xn.d)?;
+        dw1.upload(&w1.d)?;
+        dw2.upload(&w2.d)?;
+        db1.upload(b1)?;
+        db2.upload(b2)?;
+        let rc = unsafe { sys::cuMemsetD32_v2(dout.0, 0, t_len * d) };
+        if rc != sys::SUCCESS {
+            return Err(sys::err(rc));
+        }
+        let mut pre: Vec<Mat> = Vec::with_capacity(buckets.len());
+        let mut hidden: Vec<Mat> = Vec::with_capacity(buckets.len());
+        for (e, rows) in buckets.iter().enumerate() {
+            if rows.is_empty() {
+                pre.push(Mat::zeros(0, d_ff));
+                hidden.push(Mat::zeros(0, d_ff));
+                continue;
+            }
+            let n = rows.len();
+            let idx_i: Vec<i32> = rows.iter().map(|&r| r as i32).collect();
+            let didx = DevBuf::new(n * 4)?;
+            unsafe {
+                let rc =
+                    sys::cuMemcpyHtoD_v2(didx.0, idx_i.as_ptr() as *const c_void, n * 4);
+                if rc != sys::SUCCESS {
+                    return Err(sys::err(rc));
+                }
+            }
+            let dxe = DevBuf::new(n * d * 4)?;
+            let dpe = DevBuf::new(n * d_ff * 4)?;
+            let doe = DevBuf::new(n * d * 4)?;
+            self.gather_raw(&dxn, &didx, n, d, &dxe)?;
+            // pe = xe @ w1[:, e*d_ff : (e+1)*d_ff] + b1[e*d_ff..]
+            self.matmul_ld_raw(&dxe, &dw1, &dpe, n, d, d_ff, w1_cols, e * d_ff, 0)?;
+            self.add_bias_raw(&dpe, &db1, e * d_ff, n, d_ff)?;
+            unsafe { sys::cuCtxSynchronize() };
+            let mut pe = vec![0.0f32; n * d_ff];
+            dpe.download(&mut pe)?;
+            // he = silu(pe) di tempat ; oe = he @ w2[e*d_ff.., :] + b2
+            self.silu_raw(&dpe, n * d_ff)?;
+            // `hidden` diunduh dari device, bukan dihitung ulang di host: 4,7 juta `expf`
+            // single-thread per langkah lebih mahal daripada 30 MB salinan, dan hasilnya
+            // bit-identik dengan yang dipakai GEMM kedua.
+            unsafe { sys::cuCtxSynchronize() };
+            let mut he = vec![0.0f32; n * d_ff];
+            dpe.download(&mut he)?;
+            self.matmul_ld_raw(&dpe, &dw2, &doe, n, d_ff, d, d, 0, e * d_ff * d)?;
+            self.add_bias_raw(&doe, &db2, 0, n, d)?;
+            self.scatter_raw(&doe, &didx, n, d, &dout)?;
+            pre.push(Mat::from_vec(n, d_ff, pe));
+            hidden.push(Mat::from_vec(n, d_ff, he));
+        }
+        unsafe { sys::cuCtxSynchronize() };
+        let mut out = vec![0.0f32; t_len * d];
+        dout.download(&mut out)?;
+        Ok((Mat::from_vec(t_len, d, out), pre, hidden))
     }
 
     /// `h_final @ head` **tanpa mengunduh hasilnya**. Matriks (T x vocab) — 100 MB pada

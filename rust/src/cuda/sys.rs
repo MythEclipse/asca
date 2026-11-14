@@ -44,6 +44,7 @@ unsafe extern "C" {
     pub fn cuMemFree_v2(pointer: DevicePtr) -> i32;
     pub fn cuMemcpyHtoD_v2(dst: DevicePtr, src: *const c_void, bytes: usize) -> i32;
     pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: DevicePtr, bytes: usize) -> i32;
+    pub fn cuMemsetD32_v2(dst: DevicePtr, value: u32, n: usize) -> i32;
     pub fn cuModuleLoadData(module: *mut Module, image: *const c_void) -> i32;
     pub fn cuModuleGetFunction(function: *mut Function, module: Module, name: *const c_char)
     -> i32;

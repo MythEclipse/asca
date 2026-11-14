@@ -164,6 +164,59 @@ per langkah berasal dari parameter yang diunggah ulang oleh setiap operasi dan d
 aktivasi antar layer — keduanya baru bisa hilang dengan memindahkan seluruh model ke
 device, bukan per komponen.
 
+### 3d. MoE forward: gather/scatter pindah ke device
+
+Langkah ini dimulai dari instrumentasi baru: setiap byte H2D/D2H dibebankan ke scope
+`prof` yang sedang berjalan. Hasilnya langsung menunjuk satu tersangka.
+
+| komponen | MB naik/langkah | MB turun/langkah | waktu |
+|---|---|---|---|
+| **moe.fwd** | **245,3** | **137,4** | 89,9 ms |
+| delta.bwd | 124,7 | 63,2 | 94,0 ms |
+| norm | 29,9 | 20,5 | 11,7 ms |
+| delta.scan | 28,9 | 9,4 | 12,6 ms |
+| head.bwd | 13,2 | 14,9 | 39,2 ms |
+
+MoE forward sendirian menghabiskan **382,7 MB per langkah — 49% dari seluruh lalu lintas
+device**. Sebabnya rantai per expert: unggah `xn`, unduh `xe`, unggah `xe` untuk GEMM,
+unduh `pe`, unggah `pe` untuk GEMM kedua, unduh `oe`, lalu scatter yang mengunggah `oe`
+*dan* seluruh matriks keluaran dan mengunduhnya lagi. Ditambah salinan kolom bobot per
+expert di host (`expert_w1`/`expert_w2`).
+
+Sekarang `xn`, `w1`, `w2`, `b1`, `b2` diunggah sekali per layer, dan rantai
+gather → GEMM → bias → SiLU → GEMM → scatter berjalan di device. `w1` dipakai bersama
+semua expert lewat kernel baru `matmul_ld_f32` (leading dimension + offset kolom), jadi
+salinan kolom per expert hilang sama sekali. Yang turun hanya `out`, `pre`, `hidden`.
+
+| | sebelum | sesudah |
+|---|---|---|
+| lalu lintas `moe.fwd` | 382,7 MB/langkah | **79,4** (-79%) |
+| waktu `moe.fwd` | 89,9 ms/langkah | **41,5** |
+| tok/s laptop | 5.198 | **5.709** (+9,8%) |
+
+Di T4, A/B dalam satu sesi: **1.831 vs 1.582 tok/s** (MoE device vs MoE CPU) = **+15,7%**.
+Angka T4 lintas sesi tidak bisa dibandingkan langsung (VM berbeda, variasi ±5%), jadi
+untuk T4 yang diklaim hanya perbandingan dalam sesi yang sama.
+
+Satu keputusan kecil yang diukur, bukan ditebak: `hidden` (hasil SiLU) bisa dihitung ulang
+di host dari `pre` tanpa salinan tambahan, atau diunduh dari device. Menghitung ulang
+berarti 4,7 juta `expf` single-thread per langkah dan terukur **3,3 ms/langkah lebih mahal**
+daripada mengunduh 30 MB. Jadi `hidden` diunduh.
+
+Paritas: `out`, `pre`, `hidden` cocok dengan jalur CPU sampai 6,2e-7 relatif (beda urutan
+akumulasi GEMM, bukan beda rumus).
+
+### Total sejauh ini
+
+| | awal | sekarang | perubahan |
+|---|---|---|---|
+| laptop (12,7M, b8 x s256) | 3.530 tok/s | **5.709** | +62% |
+| T4 (config sama) | 1.010 tok/s | **1.831** | +81% |
+| lalu lintas per langkah | 1.602 MB | **460 MB** | -71% |
+| bench model kecil (ASCA) | 28.014 tok/s | **36.549** | rasio vs dense 1,77x -> 2,46x |
+
+Loss tidak berubah di semua konfigurasi (6,1714 / val 6,1422; bench 2,0200).
+
 ### Bug yang ditemukan gate-nya sendiri
 
 Kernel `delta_bwd_f32` versi pertama menghasilkan galat **0,87 relatif** — bukan beda

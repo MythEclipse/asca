@@ -59,6 +59,34 @@ extern "C" __global__ void matmul_ta_f32(const float* __restrict__ A,
     if (row < M && col < N) C[(long)row * N + col] = acc;
 }
 
+// GEMM dengan leading dimension + offset kolom pada B:
+//   C[M,N] = A[M,K] @ B[:, offb : offb+N],  B berpindah baris sejauh `ldb`.
+// Dipakai MoE: satu blok bobot `w1` (d x n_experts*d_ff) dipakai semua expert, tiap
+// expert hanya menggeser `offb`. Tanpa ini tiap expert butuh salinan kolom sendiri di
+// host (d x d_ff) yang lalu diunggah ulang — 8 salinan per layer.
+extern "C" __global__ void matmul_ld_f32(const float* __restrict__ A,
+                                         const float* __restrict__ B,
+                                         float* __restrict__ C, int M, int K, int N, int ldb,
+                                         int offb) {
+    __shared__ float As[TS][TS + 1];
+    __shared__ float Bs[TS][TS + 1];
+    const int row = blockIdx.y * TS + threadIdx.y;
+    const int col = blockIdx.x * TS + threadIdx.x;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TS) {
+        const int ka = k0 + threadIdx.x;
+        const int kb = k0 + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] = (row < M && ka < K) ? A[(long)row * K + ka] : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (kb < K && col < N) ? B[(long)kb * ldb + offb + col] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TS; ++i) acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < M && col < N) C[(long)row * N + col] = acc;
+}
+
 // ------------------------------------------------------------------ elementwise
 extern "C" __global__ void add_bias_f32(float* __restrict__ X, const float* __restrict__ b,
                                         int rows, int cols) {

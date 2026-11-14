@@ -981,6 +981,43 @@ fn cmd_gpu(args: &[String]) {
         println!("  delta_scan isolasi sekuens: galat batch={batch} vs {batch}x batch=1 {leak:.3e}");
     }
 
+    // --- paritas MoE device-resident vs jalur CPU
+    //
+    // Jalur MoE memakai gather -> GEMM (offset kolom) -> bias -> SiLU -> GEMM -> scatter
+    // di device. Yang mudah salah di situ: offset kolom `w1`, offset baris `w2`, dan
+    // bias per expert. Gate ini membandingkan keluaran blok plus cache-nya (`pre`,
+    // `hidden`) dengan jalur CPU yang sudah diverifikasi gradcheck.
+    {
+        use asca_rs::model::HashMoe;
+        let (t_len, d, d_ff, n_experts) = (1024usize, 192usize, 384usize, 8usize);
+        let mut rng_a = Rng::new(77);
+        let mut moe_cpu = HashMoe::new(d, d_ff, n_experts, &mut rng_a);
+        let mut rng_b = Rng::new(77);
+        let mut moe_gpu = HashMoe::new(d, d_ff, n_experts, &mut rng_b);
+        let mut x = Mat::zeros(t_len, d);
+        x.fill_rand(&mut rng, 0.5);
+        let ids: Vec<u32> = (0..t_len).map(|_| rng.below(4096) as u32).collect();
+        cuda::set_enabled(false);
+        let (out_cpu, c_cpu) = moe_cpu.forward(&x, &ids);
+        cuda::set_enabled(true);
+        let (out_gpu, c_gpu) = moe_gpu.forward(&x, &ids);
+        let rel = |a: &[f32], b: &[f32]| {
+            let mut e = 0.0f32;
+            let mut sc = 1e-9f32;
+            for i in 0..a.len() {
+                e = e.max((a[i] - b[i]).abs());
+                sc = sc.max(a[i].abs());
+            }
+            e / sc
+        };
+        println!(
+            "  moe device: out rel {:.3e}, pre rel {:.3e}, hidden rel {:.3e}",
+            rel(&out_cpu.d, &out_gpu.d),
+            rel(&c_cpu.pre, &c_gpu.pre),
+            rel(&c_cpu.hidden, &c_gpu.hidden)
+        );
+    }
+
     // --- paritas kepala output device-resident vs jalur host
     //
     // Yang diuji bukan cuma angkanya, tapi bahwa memindahkan logits ke VRAM tidak
