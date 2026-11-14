@@ -154,6 +154,54 @@ rust/target/release/asca train --data "$(./scripts/fetch_corpus.sh)" \
 ASCA_GPU=0 rust/target/release/asca bench ...   # force the CPU path
 ```
 
+## Training a language model from scratch
+
+One command, no Python anywhere in the loop:
+
+```bash
+scripts/train_llm.sh                    # download -> BPE -> encode -> train -> sample
+STEPS=100000 BATCH=8 scripts/train_llm.sh
+```
+
+The stages, and why each one exists:
+
+| stage | command | why |
+|---|---|---|
+| corpus | `scripts/fetch_corpus.sh tinystories-train` | 1.9 GB of real English text |
+| tokenizer | `asca bpe train --vocab 12288` | 4.22 bytes/token; a byte vocabulary forces the model to learn spelling instead of words |
+| encode once | `asca tokenize` | encoding 100 MB takes 26 s; caching it turns that into 5 s for every later run |
+| train | `asca train --tokenized ... --resume ...` | checkpoint holds weights **and** AdamW moments **and** the step, so an interrupted run continues instead of restarting |
+| talk to it | `asca chat --ckpt ... --tokenizer ...` | streaming REPL over the incremental decode path; per-token cost stays flat as context grows |
+
+Model used for the long run: 12.7M parameters total, ~6M active per token (hash-routed MoE,
+one of eight experts), vocab 12288, 6 layers, 6 heads, `d_ff` 384.
+
+Progress is tracked with **bits per byte**, not just loss, because `val_loss` is nats per
+token and therefore depends on the tokenizer:
+
+```
+bpb = val_loss / ln(2) / (bytes / tokens)
+```
+
+### Making it fast enough to be useful
+
+The engine started single-threaded on a 20-core machine with the GPU at 2%. Profiling found
+the cost was not in `matmul` (already offloaded) but in hand-written per-head and per-expert
+loops. Each one was split along its natural axis — heads, experts, (head x batch) — with
+per-worker buffers merged afterwards, never `unsafe`:
+
+| part | before | after | |
+|---|---|---|---|
+| `delta.bwd` | 8.383 ms | 3.679 ms | 2.28x |
+| `moe.fwd` | 3.344 ms | 1.682 ms | 1.99x |
+| `moe.bwd` | 6.040 ms | 2.456 ms | 2.46x |
+| AdamW | — | — | hoisted a `sqrt` called once per parameter (12.7M times a step) |
+| **training** | **1,051 tok/s** | **3,128 tok/s** | **2.98x** |
+
+Every step of that was gated on the five correctness tests, and the training loss had to
+stay **bit-identical** (5.0597) — a parallelisation that changes the loss is a bug, not a
+speedup.
+
 ## Evaluation protocol
 
 - **Language**: validation loss & perplexity on the same held-out corpus.
