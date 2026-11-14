@@ -283,8 +283,16 @@ const MAGIC_R: &[u8; 8] = b"ASCARSM1";
 
 /// Simpan bobot, momen AdamW, dan nomor langkah supaya training panjang bisa dilanjutkan
 /// persis, bukan diulang dari nol. Tanpa momen, lanjutan akan "kaget" dan loss melonjak.
+/// Tulis checkpoint secara ATOMIK: tulis ke `path.tmp`, paksa ke disk, lalu rename.
+///
+/// Versi lama memakai `File::create(path)` yang langsung memotong checkpoint lama dan
+/// menulis di tempatnya. Kalau proses mati atau mesin reboot di tengah penulisan, hasilnya
+/// adalah file setengah jadi DAN checkpoint sebelumnya sudah hilang - pada run 6 jam itu
+/// berarti seluruh progres lenyap. `rename` di POSIX bersifat atomik: pembaca melihat
+/// file lama atau file baru, tidak pernah campuran keduanya.
 pub fn save_resume(path: &str, model: &Model, step: usize) -> std::io::Result<()> {
-    let mut f = fs::File::create(path)?;
+    let tmp = format!("{path}.tmp");
+    let mut f = fs::File::create(&tmp)?;
     f.write_all(MAGIC_R)?;
     let c = &model.cfg;
     for v in [
@@ -306,6 +314,26 @@ pub fn save_resume(path: &str, model: &Model, step: usize) -> std::io::Result<()
             }
         }
     }
+    f.flush()?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Pastikan `n` byte pada `off` memang ada, supaya checkpoint terpotong menghasilkan
+/// error yang bisa dibaca, bukan panic "range end index out of range". Ini bukan kasus
+/// teoretis: `asca genstat` membaca checkpoint yang sedang ditulis proses training.
+fn need(buf: &[u8], off: usize, n: usize) -> std::io::Result<()> {
+    if off.saturating_add(n) > buf.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "checkpoint terpotong: butuh {n} byte di offset {off}, ukuran file {}",
+                buf.len()
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -326,9 +354,11 @@ pub fn load_resume(path: &str) -> std::io::Result<(Model, AdamW, usize)> {
     let mut off = 8;
     let mut nums = [0u64; 6];
     for n in nums.iter_mut() {
+        need(&buf, off, 8)?;
         *n = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
         off += 8;
     }
+    need(&buf, off, 8)?;
     let step = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
     off += 8;
     let cfg = Config {
@@ -343,10 +373,12 @@ pub fn load_resume(path: &str) -> std::io::Result<(Model, AdamW, usize)> {
     let mut model = Model::new(cfg, &mut rng);
     let n_params = model.params().len();
     for i in 0..n_params {
+        need(&buf, off, 8)?;
         let n = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap()) as usize;
         off += 8;
         let mut vals: Vec<Vec<f32>> = Vec::with_capacity(3);
         for _ in 0..3 {
+            need(&buf, off, n * 4)?;
             let mut v = vec![0.0f32; n];
             for x in v.iter_mut() {
                 *x = f32::from_le_bytes(buf[off..off + 4].try_into().unwrap());

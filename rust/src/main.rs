@@ -608,7 +608,7 @@ fn cmd_genstat(args: &[String]) {
         "Tom was sad because he lost his toy",
     ];
     let mut rng = Rng::new(7);
-    let mut all_words: Vec<String> = Vec::new();
+    let mut per_sample: Vec<Vec<String>> = Vec::new();
     for si in 0..n_samples {
         let prompt = prompts[si % prompts.len()];
         let mut ids = bpe.encode(prompt.as_bytes());
@@ -668,20 +668,28 @@ fn cmd_genstat(args: &[String]) {
             Some(p) => text[..p].to_string(),
             None => text,
         };
-        all_words.extend(
+        per_sample.push(
             text.split_whitespace()
                 .map(|w| {
                     w.trim_matches(|c: char| !c.is_alphanumeric())
                         .to_lowercase()
                 })
-                .filter(|w| !w.is_empty()),
+                .filter(|w| !w.is_empty())
+                .collect(),
         );
     }
-    let total = all_words.len() as f32;
-    let distinct = |n: usize| -> f32 {
+    // Dihitung PER SAMPEL lalu dirata-rata. Versi pertama menggabungkan semua sampel jadi
+    // satu daftar kata, sehingga akhir cerita yang formulaik ("they had a great time")
+    // yang muncul di banyak sampel terhitung sebagai pengulangan - padahal itu bukan
+    // model mengulang dalam satu cerita, melainkan korpusnya memang bertemplat. Metrik
+    // yang mencampur keduanya tidak bisa membedakan mode collapse dari gaya korpus.
+    let distinct_in = |words: &[String], n: usize| -> f32 {
+        if words.len() < n {
+            return 0.0;
+        }
         let mut set = std::collections::HashSet::new();
         let mut count = 0usize;
-        for w in all_words.windows(n) {
+        for w in words.windows(n) {
             set.insert(w.join(" "));
             count += 1;
         }
@@ -690,19 +698,27 @@ fn cmd_genstat(args: &[String]) {
         }
         set.len() as f32 / count as f32
     };
-    println!("genstat: {n_samples} sampel x {max_new} token (temp {temp}, top-p {top_p})");
-    println!("  kata total   : {:.0}", total);
-    println!("  distinct-1   : {:.4}", distinct(1));
-    println!("  distinct-2   : {:.4}", distinct(2));
-    println!("  distinct-3   : {:.4}", distinct(3));
-    println!("  rep-4        : {:.4}", 1.0 - distinct(4));
-    println!("  vocab unik   : {}", {
-        let mut s = std::collections::HashSet::new();
-        for w in all_words.iter() {
-            s.insert(w.clone());
+    let avg = |n: usize| -> f32 {
+        if per_sample.is_empty() {
+            return 0.0;
         }
-        s.len()
-    });
+        per_sample.iter().map(|w| distinct_in(w, n)).sum::<f32>() / per_sample.len() as f32
+    };
+    let total: usize = per_sample.iter().map(|w| w.len()).sum();
+    let mut vocab = std::collections::HashSet::new();
+    for w in per_sample.iter().flatten() {
+        vocab.insert(w.clone());
+    }
+    println!("genstat: {n_samples} sampel x {max_new} token (temp {temp}, top-p {top_p})");
+    println!(
+        "  kata total   : {total} (rata-rata {:.0}/sampel)",
+        total as f32 / n_samples as f32
+    );
+    println!("  distinct-1   : {:.4}", avg(1));
+    println!("  distinct-2   : {:.4}", avg(2));
+    println!("  distinct-3   : {:.4}", avg(3));
+    println!("  rep-4        : {:.4}", 1.0 - avg(4));
+    println!("  vocab unik   : {} (gabungan semua sampel)", vocab.len());
 }
 
 fn cmd_gpu(args: &[String]) {
