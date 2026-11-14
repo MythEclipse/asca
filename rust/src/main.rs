@@ -609,7 +609,9 @@ fn cmd_genstat(args: &[String]) {
     ];
     let mut rng = Rng::new(7);
     let mut per_sample: Vec<Vec<String>> = Vec::new();
+    let mut gen_ids: Vec<Vec<u32>> = Vec::new();
     for si in 0..n_samples {
+        let mut produced: Vec<u32> = Vec::new();
         let prompt = prompts[si % prompts.len()];
         let mut ids = bpe.encode(prompt.as_bytes());
         ids.retain(|&i| (i as usize) < cfg.vocab);
@@ -657,6 +659,7 @@ fn cmd_genstat(args: &[String]) {
                     break;
                 }
             }
+            produced.push(pick as u32);
             let chunk = bpe.decode(&[pick as u32]);
             if let Ok(s) = std::str::from_utf8(&chunk) {
                 text.push_str(s);
@@ -668,6 +671,7 @@ fn cmd_genstat(args: &[String]) {
             Some(p) => text[..p].to_string(),
             None => text,
         };
+        gen_ids.push(produced);
         per_sample.push(
             text.split_whitespace()
                 .map(|w| {
@@ -719,6 +723,30 @@ fn cmd_genstat(args: &[String]) {
     println!("  distinct-3   : {:.4}", avg(3));
     println!("  rep-4        : {:.4}", 1.0 - avg(4));
     println!("  vocab unik   : {} (gabungan semua sampel)", vocab.len());
+
+    // Self-bpb: seberapa mudah model memprediksi keluarannya SENDIRI.
+    //
+    // distinct-n dan rep-4 hanya mengukur keragaman, dan keragaman selalu naik kalau suhu
+    // dinaikkan - teks acak punya keragaman maksimal. Jadi angka itu tidak bisa dipakai
+    // memilih suhu. Self-bpb adalah pasangannya: teks yang runtut mudah ditebak model,
+    // teks ngawur tidak. Kualitas generasi adalah keduanya sekaligus, bukan salah satu.
+    let mut loss_sum = 0.0f64;
+    let mut tok_sum = 0usize;
+    for ids in gen_ids.iter() {
+        if ids.len() < 2 {
+            continue;
+        }
+        loss_sum += model.loss(&ids[..ids.len() - 1], &ids[1..]) as f64 * (ids.len() - 1) as f64;
+        tok_sum += ids.len() - 1;
+    }
+    if tok_sum > 0 {
+        let nats = loss_sum / tok_sum as f64;
+        println!(
+            "  self-bpb     : {:.4} (nats/token {:.4})",
+            nats / std::f64::consts::LN_2,
+            nats
+        );
+    }
 }
 
 fn cmd_gpu(args: &[String]) {
