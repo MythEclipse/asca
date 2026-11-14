@@ -174,10 +174,12 @@ pub struct TrainCfg {
 
 /// Satu langkah training: forward+backward `batch` sekuens, lalu update.
 pub fn train_step(model: &mut Model, data: &Data, rng: &mut Rng, cfg: &TrainCfg) -> f32 {
-    model.zero_grads();
-    let (ids, tgts) = data.batch_seqs(rng, cfg.seq_len, cfg.batch, Split::Train);
-    let (logits, cache) = model.forward(&ids, cfg.batch);
-    let loss = model.backward(&cache, &logits, &tgts);
+    crate::prof::time(15, || model.zero_grads());
+    let (ids, tgts) = crate::prof::time(16, || {
+        data.batch_seqs(rng, cfg.seq_len, cfg.batch, Split::Train)
+    });
+    let (logits, cache) = crate::prof::time(17, || model.forward(&ids, cfg.batch));
+    let loss = crate::prof::time(18, || model.backward(&cache, &logits, &tgts));
     // rata-rata gradien antar sekuens
     // loss dan gradien sudah dirata-ratakan per token di dalam backward
     loss
