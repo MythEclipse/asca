@@ -436,8 +436,7 @@ impl DeltaBlock {
                     for t in (0..seq).rev() {
                         // `dk` WAJIB direset tiap timestep: di versi asli vec ini dibuat
                         // di dalam loop, dan di sini diangkat keluar supaya tidak
-                        // mengalokasi T kali. Tanpa reset, nilainya terakumulasi antar
-                        // timestep dan gradien k jadi salah.
+                        // mengalokasi T kali.
                         dk.iter_mut().for_each(|z| *z = 0.0);
                         let r = bi * seq + t;
                         let s_t = &states[(t + 1) * dh * dh..(t + 2) * dh * dh];
@@ -449,56 +448,48 @@ impl DeltaBlock {
                         let b = cache.beta.at(r, hh);
                         let do_t = &d_o.row(r)[off..off + dh];
 
+                        // Semua loop dh x dh di bawah memakai simd::dot / simd::axpy.
+                        // Versi skalar sebelumnya adalah loop bersarang dengan
+                        // bounds-check per elemen, dan ini bagian terbesar backward.
                         // o_t = S_t^T q_t
                         for a_i in 0..dh {
-                            let mut acc = 0.0;
-                            for i in 0..dh {
-                                acc += do_t[i] * s_t[a_i * dh + i];
-                            }
-                            dq[a_i] = acc;
+                            let row = &s_t[a_i * dh..(a_i + 1) * dh];
+                            dq[a_i] = crate::simd::dot(do_t, row);
                         }
                         for a_i in 0..dh {
                             lq[t * dh + a_i] += dq[a_i];
-                        }
-                        for a_i in 0..dh {
-                            for i in 0..dh {
-                                ds[a_i * dh + i] += qt[a_i] * do_t[i];
-                            }
+                            crate::simd::axpy(&mut ds[a_i * dh..(a_i + 1) * dh], qt[a_i], do_t);
                         }
 
-                        // Sk = S_prev^T k ; u = beta*(v - alpha*Sk)
-                        for i in 0..dh {
-                            let mut acc = 0.0;
-                            for a_i in 0..dh {
-                                acc += s_prev[a_i * dh + i] * kt[a_i];
+                        // Sk = S_prev^T k  =>  sk = sum_a k[a] * baris_a(S_prev)
+                        sk.iter_mut().for_each(|z| *z = 0.0);
+                        for a_i in 0..dh {
+                            let ka = kt[a_i];
+                            if ka != 0.0 {
+                                crate::simd::axpy(
+                                    &mut sk[..],
+                                    ka,
+                                    &s_prev[a_i * dh..(a_i + 1) * dh],
+                                );
                             }
-                            sk[i] = acc;
                         }
                         for i in 0..dh {
                             u[i] = b * (vt[i] - a * sk[i]);
                         }
 
                         // S_t = alpha*S_prev + k u^T
-                        let mut dalpha = 0.0f32;
+                        let mut dalpha = crate::simd::dot(&ds, s_prev);
                         let mut dbeta = 0.0f32;
                         for a_i in 0..dh {
-                            for i in 0..dh {
-                                dalpha += ds[a_i * dh + i] * s_prev[a_i * dh + i];
-                            }
+                            dk[a_i] += crate::simd::dot(&ds[a_i * dh..(a_i + 1) * dh], &u);
                         }
+                        // du[i] = sum_a ds[a][i] * k[a]  =>  du = sum_a k[a] * baris_a(ds)
+                        du.iter_mut().for_each(|z| *z = 0.0);
                         for a_i in 0..dh {
-                            let mut acc = 0.0;
-                            for i in 0..dh {
-                                acc += ds[a_i * dh + i] * u[i];
+                            let ka = kt[a_i];
+                            if ka != 0.0 {
+                                crate::simd::axpy(&mut du[..], ka, &ds[a_i * dh..(a_i + 1) * dh]);
                             }
-                            dk[a_i] += acc;
-                        }
-                        for i in 0..dh {
-                            let mut acc = 0.0;
-                            for a_i in 0..dh {
-                                acc += ds[a_i * dh + i] * kt[a_i];
-                            }
-                            du[i] = acc;
                         }
                         for idx in 0..dh * dh {
                             ds_prev[idx] = a * ds[idx];
@@ -514,14 +505,13 @@ impl DeltaBlock {
 
                         // Sk = S_prev^T k
                         for a_i in 0..dh {
-                            let mut acc = 0.0;
-                            for i in 0..dh {
-                                acc += s_prev[a_i * dh + i] * dsk[i];
-                            }
-                            dk[a_i] += acc;
-                            for i in 0..dh {
-                                ds_prev[a_i * dh + i] += kt[a_i] * dsk[i];
-                            }
+                            let srow = &s_prev[a_i * dh..(a_i + 1) * dh];
+                            dk[a_i] += crate::simd::dot(srow, &dsk);
+                            crate::simd::axpy(
+                                &mut ds_prev[a_i * dh..(a_i + 1) * dh],
+                                kt[a_i],
+                                &dsk,
+                            );
                         }
 
                         for a_i in 0..dh {
