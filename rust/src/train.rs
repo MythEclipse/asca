@@ -241,7 +241,7 @@ where
     for step_i in start_step..cfg.steps {
         opt.lr = lr_at(step_i, cfg);
         let loss = train_step(model, data, &mut rng, cfg);
-        step(model, &mut opt);
+        crate::prof::time(14, || step(model, &mut opt));
         if cfg.log_every > 0 && (step_i + 1) % cfg.log_every == 0 {
             let el = t0.elapsed().as_secs_f32();
             // Setelah resume, `step_i` dimulai dari start_step. Menghitung token dari 0

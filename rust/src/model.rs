@@ -410,7 +410,10 @@ pub struct ModelCache {
     pub x0: Mat,
     pub layers: Vec<LayerCache>,
     pub h_final: Mat,
-    pub logits: Mat,
+    // Catatan: dulu ada field `logits: Mat` di sini yang diisi `Mat::zeros(t_len, vocab)`
+    // setiap forward tapi TIDAK PERNAH dibaca siapa pun. Pada batch 8 x seq 256 dengan
+    // vocab 12288 itu 100 MB yang dialokasi dan di-nol-kan setiap langkah, tanpa guna.
+    // Dihapus.
 }
 
 impl Model {
@@ -540,7 +543,6 @@ impl Model {
                 x0,
                 layers: layer_caches,
                 h_final,
-                logits: Mat::zeros(t_len, self.cfg.vocab),
             },
         )
     }
@@ -568,28 +570,50 @@ impl Model {
         let t_len = logits.rows;
         let v = self.cfg.vocab;
         let mut dlogits = Mat::zeros(t_len, v);
-        let mut loss = 0.0f32;
-        // Softmax atas vocab (bisa 8192) lewat slice baris, bukan `set()`/`at()` per
-        // elemen: versi lama melakukan 4,2 juta akses ber-bounds-check per langkah.
-        for t in 0..t_len {
-            let row = logits.row(t);
-            let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for c in 0..v {
-                sum += (row[c] - max).exp();
+        // Cross-entropy atas vocab adalah pekerjaan TERBESAR yang tidak terlihat di
+        // profil: t_len x vocab = 2048 x 12288 = 25 juta panggilan exp() per langkah,
+        // single-threaded, ditambah satu pass terpisah untuk membagi seluruh matriks
+        // dengan t_len. Diukur: 42,8% waktu dinding training tidak masuk scope mana pun,
+        // dan ini penyebab utamanya.
+        //
+        // Sekarang baris dipecah ke beberapa thread, dan pembagian dengan t_len dilipat
+        // ke dalam loop yang sama sehingga tidak ada pass kedua atas 25 juta elemen.
+        let nt = crate::tensor::num_threads();
+        let inv = 1.0 / t_len as f32;
+        let chunk = t_len.div_ceil(nt.max(1));
+        let mut loss_parts = vec![0.0f32; t_len.div_ceil(chunk).max(1)];
+        let lp = &mut loss_parts;
+        let mut it = lp.iter_mut();
+        std::thread::scope(|s| {
+            for (ci, dpart) in dlogits.d.chunks_mut(chunk * v).enumerate() {
+                let start = ci * chunk;
+                let len = dpart.len() / v;
+                let lslot = it.next().unwrap();
+                let lg = &*logits;
+                let tg = targets;
+                s.spawn(move || {
+                    let mut l = 0.0f32;
+                    for i in 0..len {
+                        let t = start + i;
+                        let row = &lg.d[t * v..(t + 1) * v];
+                        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum = 0.0f32;
+                        for c in 0..v {
+                            sum += (row[c] - max).exp();
+                        }
+                        let lse = max + sum.ln();
+                        l += lse - row[tg[t] as usize];
+                        let drow = &mut dpart[i * v..(i + 1) * v];
+                        for c in 0..v {
+                            drow[c] = (row[c] - lse).exp() * inv;
+                        }
+                        drow[tg[t] as usize] -= inv;
+                    }
+                    *lslot = l;
+                });
             }
-            let lse = max + sum.ln();
-            loss += lse - row[targets[t] as usize];
-            let drow = dlogits.row_mut(t);
-            for c in 0..v {
-                drow[c] = (row[c] - lse).exp();
-            }
-            drow[targets[t] as usize] -= 1.0;
-        }
-        loss /= t_len as f32;
-        for x in dlogits.d.iter_mut() {
-            *x /= t_len as f32;
-        }
+        });
+        let loss: f32 = loss_parts.iter().sum::<f32>() * inv;
 
         // head
         let d_head = crate::prof::time(9, || cache.h_final.matmul_ta(&dlogits));

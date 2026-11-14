@@ -601,9 +601,14 @@ fn cmd_genstat(args: &[String]) {
             let k = 40.min(v);
             idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
             idx.truncate(k);
-            let max = idx.iter().map(|&i| row[i]).fold(f32::NEG_INFINITY, f32::max);
-            let mut probs: Vec<(usize, f32)> =
-                idx.iter().map(|&i| (i, ((row[i] - max) / temp).exp())).collect();
+            let max = idx
+                .iter()
+                .map(|&i| row[i])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut probs: Vec<(usize, f32)> = idx
+                .iter()
+                .map(|&i| (i, ((row[i] - max) / temp).exp()))
+                .collect();
             probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             let total: f32 = probs.iter().map(|x| x.1).sum();
             let mut acc = 0.0;
@@ -634,7 +639,10 @@ fn cmd_genstat(args: &[String]) {
         }
         all_words.extend(
             text.split_whitespace()
-                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+                .map(|w| {
+                    w.trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase()
+                })
                 .filter(|w| !w.is_empty()),
         );
     }
@@ -651,9 +659,7 @@ fn cmd_genstat(args: &[String]) {
         }
         set.len() as f32 / count as f32
     };
-    println!(
-        "genstat: {n_samples} sampel x {max_new} token (temp {temp}, top-p {top_p})"
-    );
+    println!("genstat: {n_samples} sampel x {max_new} token (temp {temp}, top-p {top_p})");
     println!("  kata total   : {:.0}", total);
     println!("  distinct-1   : {:.4}", distinct(1));
     println!("  distinct-2   : {:.4}", distinct(2));
@@ -667,7 +673,6 @@ fn cmd_genstat(args: &[String]) {
         s.len()
     });
 }
-
 
 fn cmd_gpu(args: &[String]) {
     use asca_rs::cuda;
