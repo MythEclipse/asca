@@ -87,6 +87,96 @@ extern "C" __global__ void matmul_ld_f32(const float* __restrict__ A,
     if (row < M && col < N) C[(long)row * N + col] = acc;
 }
 
+// C[M,N] = A[K,M]^T @ B[K,N], ditulis ke kolom `offc` dari C yang berstride `ldc`.
+// Dipakai MoE backward: dW1 tiap expert menempati kolom [e*d_ff, (e+1)*d_ff) pada satu
+// buffer (d x n_experts*d_ff), jadi tidak perlu buffer per expert.
+extern "C" __global__ void matmul_ta_ld_f32(const float* __restrict__ A,
+                                            const float* __restrict__ B,
+                                            float* __restrict__ C, int M, int K, int N,
+                                            int ldc, int offc) {
+    __shared__ float As[TS][TS + 1];
+    __shared__ float Bs[TS][TS + 1];
+    const int row = blockIdx.y * TS + threadIdx.y;
+    const int col = blockIdx.x * TS + threadIdx.x;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TS) {
+        const int kb = k0 + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && (k0 + threadIdx.x) < K) ? A[(long)(k0 + threadIdx.x) * M + row] : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (kb < K && col < N) ? B[(long)kb * N + col] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TS; ++i) acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < M && col < N) C[(long)row * ldc + offc + col] = acc;
+}
+
+// C[M,N] = A[M,K] @ B[:, offb:offb+N]^T, B berstride `ldb` baris.
+// Dipakai MoE backward untuk dpre = dout @ w2[expert]^T dan dxn = dpre @ w1[:, expert]^T:
+// keduanya mengalikan dengan bobot yang sudah ada di device, tanpa salinan di host.
+extern "C" __global__ void matmul_tb_f32(const float* __restrict__ A,
+                                         const float* __restrict__ B,
+                                         float* __restrict__ C, int M, int K, int N, int ldb,
+                                         int offb) {
+    __shared__ float As[TS][TS + 1];
+    __shared__ float Bs[TS][TS + 1];
+    const int row = blockIdx.y * TS + threadIdx.y;
+    const int ncol = blockIdx.x * TS + threadIdx.x;
+    float acc = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += TS) {
+        const int ka = k0 + threadIdx.x;
+        const int kb = k0 + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && ka < K) ? A[(long)row * K + ka] : 0.0f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (ncol < N && kb < K) ? B[(long)ncol * ldb + offb + kb] : 0.0f;
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TS; ++i) acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < M && ncol < N) C[(long)row * N + ncol] = acc;
+}
+
+// Turunan SiLU di tempat: dpre *= sigmoid(pre) * (1 + pre * (1 - sigmoid(pre))).
+extern "C" __global__ void silu_bwd_f32(float* __restrict__ dpre, const float* __restrict__ pre,
+                                        int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float p = pre[i];
+        const float sg = 1.0f / (1.0f + expf(-p));
+        dpre[i] *= sg * (1.0f + p * (1.0f - sg));
+    }
+}
+
+// SiLU ke buffer lain (bukan di tempat), supaya `pre` tetap utuh untuk backward.
+extern "C" __global__ void silu_out_f32(float* __restrict__ dst, const float* __restrict__ src,
+                                        int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = src[i];
+        dst[i] = v / (1.0f + expf(-v));
+    }
+}
+
+// Jumlahkan tiap kolom: dst[j] = sum_i src[i*cols + j] (atau += kalau `acc`).
+// Satu thread per kolom; `acc` dipakai untuk menumpuk bias antar expert.
+extern "C" __global__ void colsum_f32(const float* __restrict__ src, float* __restrict__ dst,
+                                      int rows, int cols, int acc) {
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < cols) {
+        float s = 0.0f;
+        for (int i = 0; i < rows; ++i) s += src[(long)i * cols + j];
+        if (acc) {
+            dst[j] += s;
+        } else {
+            dst[j] = s;
+        }
+    }
+}
+
 // ------------------------------------------------------------------ elementwise
 extern "C" __global__ void add_bias_f32(float* __restrict__ X, const float* __restrict__ b,
                                         int rows, int cols) {

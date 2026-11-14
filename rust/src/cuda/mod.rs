@@ -447,20 +447,6 @@ impl Gpu {
         )
     }
 
-    /// SiLU di device, di tempat.
-    fn silu_raw(&self, buf: &DevBuf, n: usize) -> Result<(), String> {
-        let mut n_i = n as i32;
-        self.launch(
-            "silu_f32",
-            ((n as u32).div_ceil(256), 1, 1),
-            (256, 1, 1),
-            0,
-            vec![
-                &buf.0 as *const _ as *mut c_void,
-                &mut n_i as *mut _ as *mut c_void,
-            ],
-        )
-    }
 
     /// Tambah bias kolom di device mulai `off` elemen (`X[i] += b[off + i % cols]`).
     fn add_bias_raw(
@@ -543,7 +529,7 @@ impl Gpu {
         b2: &[f32],
         buckets: &[Vec<usize>],
         d_ff: usize,
-    ) -> Result<(Mat, Vec<Mat>, Vec<Mat>), String> {
+    ) -> Result<(Mat, MoeDev), String> {
         let (t_len, d) = (xn.rows, xn.cols);
         let w1_cols = w1.cols;
         let dxn = DevBuf::new(t_len * d * 4)?;
@@ -561,52 +547,280 @@ impl Gpu {
         if rc != sys::SUCCESS {
             return Err(sys::err(rc));
         }
-        let mut pre: Vec<Mat> = Vec::with_capacity(buckets.len());
-        let mut hidden: Vec<Mat> = Vec::with_capacity(buckets.len());
+        let mut experts: Vec<MoeExpertDev> = Vec::with_capacity(buckets.len());
         for (e, rows) in buckets.iter().enumerate() {
             if rows.is_empty() {
-                pre.push(Mat::zeros(0, d_ff));
-                hidden.push(Mat::zeros(0, d_ff));
+                let empty = DevBuf::new(4)?;
+                experts.push(MoeExpertDev {
+                    idx: empty,
+                    pre: DevBuf::new(4)?,
+                    hidden: DevBuf::new(4)?,
+                    n: 0,
+                });
                 continue;
             }
             let n = rows.len();
             let idx_i: Vec<i32> = rows.iter().map(|&r| r as i32).collect();
             let didx = DevBuf::new(n * 4)?;
             unsafe {
-                let rc =
-                    sys::cuMemcpyHtoD_v2(didx.0, idx_i.as_ptr() as *const c_void, n * 4);
+                let rc = sys::cuMemcpyHtoD_v2(didx.0, idx_i.as_ptr() as *const c_void, n * 4);
                 if rc != sys::SUCCESS {
                     return Err(sys::err(rc));
                 }
             }
             let dxe = DevBuf::new(n * d * 4)?;
             let dpe = DevBuf::new(n * d_ff * 4)?;
+            let dhe = DevBuf::new(n * d_ff * 4)?;
             let doe = DevBuf::new(n * d * 4)?;
             self.gather_raw(&dxn, &didx, n, d, &dxe)?;
             // pe = xe @ w1[:, e*d_ff : (e+1)*d_ff] + b1[e*d_ff..]
             self.matmul_ld_raw(&dxe, &dw1, &dpe, n, d, d_ff, w1_cols, e * d_ff, 0)?;
             self.add_bias_raw(&dpe, &db1, e * d_ff, n, d_ff)?;
-            unsafe { sys::cuCtxSynchronize() };
-            let mut pe = vec![0.0f32; n * d_ff];
-            dpe.download(&mut pe)?;
-            // he = silu(pe) di tempat ; oe = he @ w2[e*d_ff.., :] + b2
-            self.silu_raw(&dpe, n * d_ff)?;
-            // `hidden` diunduh dari device, bukan dihitung ulang di host: 4,7 juta `expf`
-            // single-thread per langkah lebih mahal daripada 30 MB salinan, dan hasilnya
-            // bit-identik dengan yang dipakai GEMM kedua.
-            unsafe { sys::cuCtxSynchronize() };
-            let mut he = vec![0.0f32; n * d_ff];
-            dpe.download(&mut he)?;
-            self.matmul_ld_raw(&dpe, &dw2, &doe, n, d_ff, d, d, 0, e * d_ff * d)?;
+            // he = silu(pe) ke buffer terpisah: `pre` dibutuhkan utuh di backward
+            self.silu_out_raw(&dhe, &dpe, n * d_ff)?;
+            // oe = he @ w2[e*d_ff.., :] + b2
+            self.matmul_ld_raw(&dhe, &dw2, &doe, n, d_ff, d, d, 0, e * d_ff * d)?;
             self.add_bias_raw(&doe, &db2, 0, n, d)?;
             self.scatter_raw(&doe, &didx, n, d, &dout)?;
-            pre.push(Mat::from_vec(n, d_ff, pe));
-            hidden.push(Mat::from_vec(n, d_ff, he));
+            experts.push(MoeExpertDev {
+                idx: didx,
+                pre: dpe,
+                hidden: dhe,
+                n,
+            });
         }
         unsafe { sys::cuCtxSynchronize() };
         let mut out = vec![0.0f32; t_len * d];
         dout.download(&mut out)?;
-        Ok((Mat::from_vec(t_len, d, out), pre, hidden))
+        Ok((
+            Mat::from_vec(t_len, d, out),
+            MoeDev {
+                xn: dxn,
+                w1: dw1,
+                w2: dw2,
+                experts,
+                t_len,
+                d,
+                d_ff,
+            },
+        ))
+    }
+
+    /// SiLU ke buffer lain di device.
+    fn silu_out_raw(&self, dst: &DevBuf, src: &DevBuf, n: usize) -> Result<(), String> {
+        let mut n_i = n as i32;
+        self.launch(
+            "silu_out_f32",
+            ((n as u32).div_ceil(256), 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &dst.0 as *const _ as *mut c_void,
+                &src.0 as *const _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// Turunan SiLU di tempat.
+    fn silu_bwd_raw(&self, dpre: &DevBuf, pre: &DevBuf, n: usize) -> Result<(), String> {
+        let mut n_i = n as i32;
+        self.launch(
+            "silu_bwd_f32",
+            ((n as u32).div_ceil(256), 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &dpre.0 as *const _ as *mut c_void,
+                &pre.0 as *const _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// Jumlah kolom; `acc` menumpuk ke `dst` (dipakai antar expert).
+    fn colsum_raw(
+        &self,
+        src: &DevBuf,
+        dst: &DevBuf,
+        dst_off: usize,
+        rows: usize,
+        cols: usize,
+        acc: bool,
+    ) -> Result<(), String> {
+        let (mut r, mut c) = (rows as i32, cols as i32);
+        let mut a = i32::from(acc);
+        let dp = sys::DevicePtr(dst.0.0 + (dst_off * 4) as u64);
+        self.launch(
+            "colsum_f32",
+            ((cols as u32).div_ceil(128), 1, 1),
+            (128, 1, 1),
+            0,
+            vec![
+                &src.0 as *const _ as *mut c_void,
+                &dp as *const _ as *mut c_void,
+                &mut r as *mut _ as *mut c_void,
+                &mut c as *mut _ as *mut c_void,
+                &mut a as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// `C[M,N] = A[K,M]^T @ B[K,N]`, ditulis ke kolom `offc` dari C berstride `ldc`.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_ta_ld_raw(
+        &self,
+        a: &DevBuf,
+        b: &DevBuf,
+        c: &DevBuf,
+        k: usize,
+        m: usize,
+        n: usize,
+        ldc: usize,
+        offc: usize,
+        c_off_elems: usize,
+    ) -> Result<(), String> {
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, n as i32);
+        let (mut ldc_i, mut offc_i) = (ldc as i32, offc as i32);
+        let cp = sys::DevicePtr(c.0.0 + (c_off_elems * 4) as u64);
+        self.launch(
+            "matmul_ta_ld_f32",
+            (((n as u32).div_ceil(32)), ((m as u32).div_ceil(32)), 1),
+            (32, 32, 1),
+            0,
+            vec![
+                &a.0 as *const _ as *mut c_void,
+                &b.0 as *const _ as *mut c_void,
+                &cp as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut ldc_i as *mut _ as *mut c_void,
+                &mut offc_i as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// `C[M,N] = A[M,K] @ B[:, offb:offb+N]^T`, B berstride `ldb` baris.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_tb_raw(
+        &self,
+        a: &DevBuf,
+        b: &DevBuf,
+        c: &DevBuf,
+        m: usize,
+        k: usize,
+        n: usize,
+        ldb: usize,
+        offb: usize,
+        b_off_elems: usize,
+    ) -> Result<(), String> {
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, n as i32);
+        let (mut ldb_i, mut offb_i) = (ldb as i32, offb as i32);
+        let bp = sys::DevicePtr(b.0.0 + (b_off_elems * 4) as u64);
+        self.launch(
+            "matmul_tb_f32",
+            (((n as u32).div_ceil(32)), ((m as u32).div_ceil(32)), 1),
+            (32, 32, 1),
+            0,
+            vec![
+                &a.0 as *const _ as *mut c_void,
+                &bp as *const _ as *mut c_void,
+                &c.0 as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+                &mut ldb_i as *mut _ as *mut c_void,
+                &mut offb_i as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// MoE backward seluruhnya di device.
+    ///
+    /// Per expert: gather dout -> dW2 = hidden^T dout -> db2 = jumlah dout ->
+    /// dpre = dout w2^T -> kali turunan SiLU -> db1 -> dW1 = xn^T dpre ->
+    /// dxn = dpre w1^T -> scatter. `pre`/`hidden`/bobot sudah ada di VRAM dari forward,
+    /// jadi tidak ada satu pun yang perlu naik lagi.
+    pub fn moe_bwd_dev(&self, dev: &MoeDev, dout: &Mat) -> Result<MoeBwd, String> {
+        let (t_len, d, d_ff) = (dev.t_len, dev.d, dev.d_ff);
+        let n_experts = dev.experts.len();
+        let w1_cols = d_ff * n_experts;
+        let ddout = DevBuf::new(t_len * d * 4)?;
+        ddout.upload(&dout.d)?;
+        let ddw1 = DevBuf::new(d * w1_cols * 4)?;
+        let ddw2 = DevBuf::new(n_experts * d_ff * d * 4)?;
+        let ddb1 = DevBuf::new(n_experts * d_ff * 4)?;
+        let ddb2 = DevBuf::new(d * 4)?;
+        let ddxn = DevBuf::new(t_len * d * 4)?;
+        for buf in [&ddw1, &ddw2, &ddb1, &ddb2, &ddxn] {
+            let rc = unsafe { sys::cuMemsetD32_v2(buf.0, 0, buf.1 / 4) };
+            if rc != sys::SUCCESS {
+                return Err(sys::err(rc));
+            }
+        }
+        for (e, ex) in dev.experts.iter().enumerate() {
+            let n = ex.n;
+            if n == 0 {
+                continue;
+            }
+            let ddhe = DevBuf::new(n * d * 4)?;
+            self.gather_raw(&ddout, &ex.idx, n, d, &ddhe)?;
+            // dW2_e = hidden^T dhe -> baris e*d_ff .. (e+1)*d_ff
+            self.matmul_ta_ld_raw(
+                &ex.hidden,
+                &ddhe,
+                &ddw2,
+                n,
+                d_ff,
+                d,
+                d,
+                0,
+                e * d_ff * d,
+            )?;
+            self.colsum_raw(&ddhe, &ddb2, 0, n, d, true)?;
+            // dpre = dhe @ w2[e*d_ff..]^T lalu dikali turunan SiLU
+            let ddpre = DevBuf::new(n * d_ff * 4)?;
+            self.matmul_tb_raw(&ddhe, &dev.w2, &ddpre, n, d, d_ff, d, 0, e * d_ff * d)?;
+            self.silu_bwd_raw(&ddpre, &ex.pre, n * d_ff)?;
+            self.colsum_raw(&ddpre, &ddb1, e * d_ff, n, d_ff, true)?;
+            // dW1_e = xn^T dpre -> kolom e*d_ff
+            let dxe = DevBuf::new(n * d * 4)?;
+            self.gather_raw(&dev.xn, &ex.idx, n, d, &dxe)?;
+            self.matmul_ta_ld_raw(&dxe, &ddpre, &ddw1, n, d, d_ff, w1_cols, e * d_ff, 0)?;
+            // dxn_e = dpre @ w1[:, e*d_ff..]^T
+            let ddxn_e = DevBuf::new(n * d * 4)?;
+            self.matmul_tb_raw(
+                &ddpre,
+                &dev.w1,
+                &ddxn_e,
+                n,
+                d_ff,
+                d,
+                w1_cols,
+                e * d_ff,
+                0,
+            )?;
+            self.scatter_raw(&ddxn_e, &ex.idx, n, d, &ddxn)?;
+        }
+        unsafe { sys::cuCtxSynchronize() };
+        let mut w1v = vec![0.0f32; d * w1_cols];
+        let mut w2v = vec![0.0f32; n_experts * d_ff * d];
+        let mut b1v = vec![0.0f32; n_experts * d_ff];
+        let mut b2v = vec![0.0f32; d];
+        let mut xnv = vec![0.0f32; t_len * d];
+        ddw1.download(&mut w1v)?;
+        ddw2.download(&mut w2v)?;
+        ddb1.download(&mut b1v)?;
+        ddb2.download(&mut b2v)?;
+        ddxn.download(&mut xnv)?;
+        Ok(MoeBwd {
+            d_w1: Mat::from_vec(d, w1_cols, w1v),
+            d_b1: b1v,
+            d_w2: Mat::from_vec(n_experts * d_ff, d, w2v),
+            d_b2: b2v,
+            dxn: Mat::from_vec(t_len, d, xnv),
+        })
     }
 
     /// `h_final @ head` **tanpa mengunduh hasilnya**. Matriks (T x vocab) — 100 MB pada
@@ -1192,6 +1406,55 @@ pub struct LogitsDev {
     h_final: DevBuf,
     t_len: usize,
     vocab: usize,
+}
+
+/// State MoE yang tinggal di VRAM antara forward dan backward.
+///
+/// `xn`, bobot `w1`/`w2`, dan `pre`/`hidden` per expert semuanya disimpan: forward sudah
+/// menghitungnya, backward pasti membutuhkannya lagi. Dulu semuanya turun ke host lalu
+/// naik kembali (30 MB per langkah) hanya untuk dipakai loop CPU.
+pub struct MoeDev {
+    xn: DevBuf,
+    w1: DevBuf,
+    w2: DevBuf,
+    experts: Vec<MoeExpertDev>,
+    t_len: usize,
+    d: usize,
+    d_ff: usize,
+}
+
+pub struct MoeExpertDev {
+    idx: DevBuf,
+    pre: DevBuf,
+    hidden: DevBuf,
+    n: usize,
+}
+
+/// Gradien MoE hasil `moe_bwd_dev`, semuanya sudah di host.
+pub struct MoeBwd {
+    pub d_w1: Mat,
+    pub d_b1: Vec<f32>,
+    pub d_w2: Mat,
+    pub d_b2: Vec<f32>,
+    pub dxn: Mat,
+}
+
+impl MoeDev {
+    /// Unduh `pre`/`hidden` per expert. Hanya untuk jalur cadangan dan gate paritas —
+    /// jalur GPU tidak membutuhkannya di host.
+    pub fn download_pre_hidden(&self) -> Result<(Vec<Mat>, Vec<Mat>), String> {
+        let mut pre = Vec::with_capacity(self.experts.len());
+        let mut hidden = Vec::with_capacity(self.experts.len());
+        for ex in self.experts.iter() {
+            let mut p = vec![0.0f32; ex.n * self.d_ff];
+            let mut h = vec![0.0f32; ex.n * self.d_ff];
+            ex.pre.download(&mut p)?;
+            ex.hidden.download(&mut h)?;
+            pre.push(Mat::from_vec(ex.n, self.d_ff, p));
+            hidden.push(Mat::from_vec(ex.n, self.d_ff, h));
+        }
+        Ok((pre, hidden))
+    }
 }
 
 impl LogitsDev {

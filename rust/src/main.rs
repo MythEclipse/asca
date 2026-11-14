@@ -981,12 +981,13 @@ fn cmd_gpu(args: &[String]) {
         println!("  delta_scan isolasi sekuens: galat batch={batch} vs {batch}x batch=1 {leak:.3e}");
     }
 
-    // --- paritas MoE device-resident vs jalur CPU
+    // --- paritas MoE device-resident vs jalur CPU (forward dan backward)
     //
     // Jalur MoE memakai gather -> GEMM (offset kolom) -> bias -> SiLU -> GEMM -> scatter
-    // di device. Yang mudah salah di situ: offset kolom `w1`, offset baris `w2`, dan
-    // bias per expert. Gate ini membandingkan keluaran blok plus cache-nya (`pre`,
-    // `hidden`) dengan jalur CPU yang sudah diverifikasi gradcheck.
+    // di device, lalu backward-nya memakai kernel ta/tb ber-offset. Yang mudah salah di
+    // situ: offset kolom `w1`, offset baris `w2`, bias per expert, dan letak `pre`/`hidden`
+    // per expert. Gate ini membandingkan keluaran, aktivasi cache, DAN gradiennya dengan
+    // jalur CPU yang sudah diverifikasi gradcheck.
     {
         use asca_rs::model::HashMoe;
         let (t_len, d, d_ff, n_experts) = (1024usize, 192usize, 384usize, 8usize);
@@ -1001,6 +1002,22 @@ fn cmd_gpu(args: &[String]) {
         let (out_cpu, c_cpu) = moe_cpu.forward(&x, &ids);
         cuda::set_enabled(true);
         let (out_gpu, c_gpu) = moe_gpu.forward(&x, &ids);
+        let (pe, he) = c_gpu
+            .dev
+            .as_ref()
+            .expect("MoE GPU tanpa state device")
+            .download_pre_hidden()
+            .expect("unduh pre/hidden");
+        let mut pre_gpu = vec![0.0f32; t_len * d_ff];
+        let mut hidden_gpu = vec![0.0f32; t_len * d_ff];
+        for (e, rows) in c_cpu.buckets.iter().enumerate() {
+            for (i, &t) in rows.iter().enumerate() {
+                let lo = i * d_ff;
+                pre_gpu[t * d_ff..(t + 1) * d_ff].copy_from_slice(&pe[e].d[lo..lo + d_ff]);
+                hidden_gpu[t * d_ff..(t + 1) * d_ff]
+                    .copy_from_slice(&he[e].d[lo..lo + d_ff]);
+            }
+        }
         let rel = |a: &[f32], b: &[f32]| {
             let mut e = 0.0f32;
             let mut sc = 1e-9f32;
@@ -1011,10 +1028,25 @@ fn cmd_gpu(args: &[String]) {
             e / sc
         };
         println!(
-            "  moe device: out rel {:.3e}, pre rel {:.3e}, hidden rel {:.3e}",
+            "  moe device: out {:.3e}, pre {:.3e}, hidden {:.3e}",
             rel(&out_cpu.d, &out_gpu.d),
-            rel(&c_cpu.pre, &c_gpu.pre),
-            rel(&c_cpu.hidden, &c_gpu.hidden)
+            rel(&c_cpu.pre, &pre_gpu),
+            rel(&c_cpu.hidden, &hidden_gpu)
+        );
+        // backward: dout acak, lalu bandingkan seluruh gradien
+        let mut dout = Mat::zeros(t_len, d);
+        dout.fill_rand(&mut rng, 0.1);
+        cuda::set_enabled(false);
+        let dx_cpu = moe_cpu.backward(&c_cpu, &dout);
+        cuda::set_enabled(true);
+        let dx_gpu = moe_gpu.backward(&c_gpu, &dout);
+        println!(
+            "  moe device bwd: dx {:.3e}, d_w1 {:.3e}, d_b1 {:.3e}, d_w2 {:.3e}, d_b2 {:.3e}",
+            rel(&dx_cpu.d, &dx_gpu.d),
+            rel(&moe_cpu.w1.grad.d, &moe_gpu.w1.grad.d),
+            rel(&moe_cpu.b1.grad.d, &moe_gpu.b1.grad.d),
+            rel(&moe_cpu.w2.grad.d, &moe_gpu.w2.grad.d),
+            rel(&moe_cpu.b2.grad.d, &moe_gpu.b2.grad.d)
         );
     }
 

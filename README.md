@@ -106,16 +106,17 @@ block per (head, sequence) with the whole time loop inside the kernel. Parity wi
 ≤ 2.6e-7 relative, gradients match the verified CPU BPTT to 8.0e-7, and training loss is
 identical.
 
-Keeping the delta block, the output head and the MoE forward on the GPU is worth **+62%**
-on a 20-core laptop (3,530 → 5,709 tok/s) and **+81%** on a Colab T4 with 2 vCPUs
-(1,010 → 1,831 tok/s, 12.7M parameters), with per-step PCIe traffic down 71%
-(1,602 → 460 MB) — but only after the state history stopped crossing PCIe. The first attempt
+Keeping the delta block, the output head and the whole MoE block (forward *and* backward)
+on the GPU is worth **+113%** on a 20-core laptop (3,530 → 7,503 tok/s) and **+289%** on a
+Colab T4 with 2 vCPUs (1,010 → 3,933 tok/s, 12.7M parameters), with per-step PCIe traffic
+down 71% (1,602 → 469 MB) — but only after the state history stopped crossing PCIe. The first attempt
 moved *just* the scan and was **slower** (3,265 tok/s): the BPTT was still on the CPU, so
 313 MB of state had to be downloaded every step. Device-resident state plus a BPTT kernel
 fixed it. The output head followed the same pattern (bit-identical, 523 → 31 MB/step).
-The MoE forward followed too: gather/GEMM/bias/SiLU/GEMM/scatter now run entirely on the
-device, and a leading-dimension GEMM kernel lets all experts share one weight upload
-(382 → 79 MB/step). AdamW did not: keeping its moments on the device still lost to plain
+The MoE block followed too: gather/GEMM/bias/SiLU/GEMM/scatter *and* the whole expert
+backward now run on the device, and leading-dimension GEMM kernels let all experts share
+one weight upload (382 → 79 MB/step). The backward alone was worth +31% on the laptop and
++115% on a 2-vCPU T4, where eight expert threads were fighting over two cores. AdamW did not: keeping its moments on the device still lost to plain
 CPU updates, even on 2 vCPUs, so that path is now opt-in — a measured negative result is
 worth more than a plausible-looking optimisation. See [`docs/CUDA.md`](docs/CUDA.md).
 

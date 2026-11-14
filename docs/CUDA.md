@@ -217,6 +217,54 @@ akumulasi GEMM, bukan beda rumus).
 
 Loss tidak berubah di semua konfigurasi (6,1714 / val 6,1422; bench 2,0200).
 
+### 3e. MoE backward ikut pindah — dan itu lompatan terbesar di T4
+
+Setelah forward-nya di device, `moe.bwd` jadi sisa pekerjaan CPU terbesar: 106 ms per
+langkah, murni `thread::scope` atas 8 expert. Di T4 yang hanya 2 vCPU, delapan thread
+berebut dua core.
+
+Sekarang seluruh rantai gradien per expert jalan di device, memakai `pre`/`hidden`/bobot
+yang **sudah ada di VRAM sejak forward**:
+
+| langkah | operasi |
+|---|---|
+| 1 | gather `dout` ke baris expert |
+| 2 | `dW2 = hidden^T dout` (kernel `matmul_ta_ld_f32`, offset baris) |
+| 3 | `db2 = jumlah kolom dout` (kernel `colsum_f32`) |
+| 4 | `dpre = dout w2^T` (kernel `matmul_tb_f32`) |
+| 5 | `dpre *= silu'(pre)` (kernel `silu_bwd_f32`) |
+| 6 | `db1 = jumlah kolom dpre` |
+| 7 | `dW1 = xn^T dpre` (offset kolom `e*d_ff` pada satu buffer bersama) |
+| 8 | `dxn = dpre w1[:, expert]^T` lalu scatter |
+
+Efek sampingnya sama pentingnya: `pre`/`hidden` tidak perlu turun ke host lagi, dan
+SiLU dihitung ke buffer terpisah (`silu_out_f32`) supaya `pre` tetap utuh untuk turunannya.
+
+| | sebelum | sesudah |
+|---|---|---|
+| `moe.bwd` | 106,0 ms/langkah | **37,1** (-65%) |
+| `moe.fwd` | 41,5 ms/langkah | **22,0** (`pre`/`hidden` tidak turun lagi) |
+| tok/s laptop | 5.709 | **7.503** (+31,4%) |
+| tok/s T4 | 1.831 | **3.933** (+115%) |
+
+Lalu lintas naik sedikit (460 → 469 MB/langkah): yang hilang 30 MB `pre`/`hidden`, yang
+tambah 37 MB gradien `dW1`/`dW2` yang memang harus sampai ke host untuk optimizer. Itu
+pertukaran yang jelas menang — 69 ms kerja CPU per langkah versus 9 MB.
+
+Gate gradiennya lengkap: `asca gpu` membandingkan `dx`, `d_w1`, `d_b1`, `d_w2`, `d_b2`
+jalur device versus jalur CPU — 1,2e-6 / 7,4e-7 / 3,9e-7 / 3,8e-7 / 0,0e0.
+
+### Total sejauh ini
+
+| | awal | sekarang | perubahan |
+|---|---|---|---|
+| laptop (12,7M, b8 x s256) | 3.530 tok/s | **7.503** | +113% |
+| T4 (config sama) | 1.010 tok/s | **3.933** | +289% |
+| lalu lintas per langkah | 1.602 MB | **469 MB** | -71% |
+| bench model kecil (ASCA) | 28.014 tok/s | **40.600** | rasio vs dense 1,77x -> 2,62x |
+
+Loss tidak berubah di semua konfigurasi (6,1714 / val 6,1422; bench 2,0200).
+
 ### Bug yang ditemukan gate-nya sendiri
 
 Kernel `delta_bwd_f32` versi pertama menghasilkan galat **0,87 relatif** — bukan beda

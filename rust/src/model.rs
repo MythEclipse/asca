@@ -60,6 +60,10 @@ pub struct MoeCache {
     pub route: Vec<usize>,
     /// indeks token per expert; dasar pengelompokan di forward dan backward
     pub buckets: Vec<Vec<usize>>,
+    /// State di VRAM (kalau forward jalan di GPU). Kalau ini ada, `pre`/`hidden` di atas
+    /// sengaja kosong: keduanya tinggal di device dan hanya diunduh kalau backward
+    /// terpaksa jatuh ke jalur CPU.
+    pub dev: Option<crate::cuda::MoeDev>,
 }
 
 #[inline]
@@ -111,6 +115,30 @@ impl HashMoe {
     /// expert dan menaruh loop bobot di luar, satu baris `w1`/`w2` dibaca sekali
     /// lalu dipakai untuk semua token expert itu — pola GEMM yang sebenarnya.
 
+    /// `pre`/`hidden` sebagai vektor rata (T x d_ff), diunduh dari VRAM kalau perlu.
+    fn cache_activations(&self, cache: &MoeCache) -> (Vec<f32>, Vec<f32>) {
+        if !cache.pre.is_empty() {
+            return (cache.pre.clone(), cache.hidden.clone());
+        }
+        let dev = cache
+            .dev
+            .as_ref()
+            .expect("cache tanpa pre dan tanpa state device");
+        let (pe, he) = dev.download_pre_hidden().expect("unduh pre/hidden gagal");
+        let d_ff = self.d_ff;
+        let t_len = cache.x.rows;
+        let mut pre = vec![0.0f32; t_len * d_ff];
+        let mut hidden = vec![0.0f32; t_len * d_ff];
+        for (e, rows) in cache.buckets.iter().enumerate() {
+            for (i, &t) in rows.iter().enumerate() {
+                let lo = i * d_ff;
+                pre[t * d_ff..(t + 1) * d_ff].copy_from_slice(&pe[e].d[lo..lo + d_ff]);
+                hidden[t * d_ff..(t + 1) * d_ff].copy_from_slice(&he[e].d[lo..lo + d_ff]);
+            }
+        }
+        (pre, hidden)
+    }
+
     /// Jalur GPU: tiap expert jadi GEMM biasa setelah barisnya dikumpulkan.
     ///
     /// Versi CPU menghitung `xn @ w1[:, expert]` sebagai loop per kolom dengan `axpy`
@@ -130,9 +158,8 @@ impl HashMoe {
         }
         let g = crate::cuda::gpu().unwrap();
         // Seluruh rantai gather -> GEMM -> bias -> SiLU -> GEMM -> scatter dijalankan di
-        // device. Yang turun hanya `out` dan `pre`; `hidden` dihitung ulang di host dari
-        // `pre` dengan rumus yang sama persis, jadi tidak perlu diunduh.
-        let (out, per_expert, per_expert_hidden) = g
+        // device, dan `pre`/`hidden` tetap di sana untuk backward. Yang turun hanya `out`.
+        let (out, dev) = g
             .moe_forward_dev(
                 &xn,
                 &self.w1.value,
@@ -143,25 +170,16 @@ impl HashMoe {
                 d_ff,
             )
             .expect("moe_forward_dev gagal");
-        let mut pre = vec![0.0f32; t_len * d_ff];
-        let mut hidden = vec![0.0f32; t_len * d_ff];
-        for (e, rows) in buckets.iter().enumerate() {
-            let (pe, he) = (&per_expert[e], &per_expert_hidden[e]);
-            for (i, &t) in rows.iter().enumerate() {
-                let lo = i * d_ff;
-                pre[t * d_ff..(t + 1) * d_ff].copy_from_slice(&pe.d[lo..lo + d_ff]);
-                hidden[t * d_ff..(t + 1) * d_ff].copy_from_slice(&he.d[lo..lo + d_ff]);
-            }
-        }
         (
             out,
             MoeCache {
                 x: x.clone(),
                 xn,
-                pre,
-                hidden,
+                pre: Vec::new(),
+                hidden: Vec::new(),
                 route,
                 buckets: buckets.to_vec(),
+                dev: Some(dev),
             },
         )
     }
@@ -282,6 +300,7 @@ impl HashMoe {
                 hidden,
                 route,
                 buckets,
+                dev: None,
             },
         )
     }
@@ -318,6 +337,31 @@ impl HashMoe {
     }
 
     pub fn backward(&mut self, cache: &MoeCache, dout: &Mat) -> Mat {
+        // Jalur GPU: seluruh rantai gradien expert di device, memakai `pre`/`hidden`/
+        // bobot yang sudah ada di VRAM sejak forward.
+        if let Some(dev) = cache.dev.as_ref() {
+            if crate::cuda::offload("moe") {
+                if let Some(g) = crate::cuda::gpu() {
+                    if let Ok(b) = g.moe_bwd_dev(dev, dout) {
+                        self.w1.grad.axpy(1.0, &b.d_w1);
+                        self.w2.grad.axpy(1.0, &b.d_w2);
+                        for (a, v) in self.b1.grad.d.iter_mut().zip(b.d_b1.iter()) {
+                            *a += *v;
+                        }
+                        for (a, v) in self.b2.grad.d.iter_mut().zip(b.d_b2.iter()) {
+                            *a += *v;
+                        }
+                        return crate::prof::time(6, || {
+                            rmsnorm_rows_backward(&cache.x, &b.dxn, EPS)
+                        });
+                    }
+                }
+            }
+        }
+        // Jalur CPU. Kalau forward-nya jalan di GPU, aktivasi yang dibutuhkan baru
+        // diunduh di sini — bukan di setiap langkah.
+        let (pre_v, hidden_v) = self.cache_activations(cache);
+        let (pre_r, hidden_r) = (&pre_v, &hidden_v);
         let (t_len, d) = (cache.x.rows, cache.x.cols);
         let d_ff = self.d_ff;
         let mut dxn = Mat::zeros(t_len, d);
@@ -374,7 +418,7 @@ impl HashMoe {
                     for &t in rows.iter() {
                         let dr = dout.row(t);
                         for j in 0..d_ff {
-                            let hj = cache.hidden[t * d_ff + j];
+                            let hj = hidden_r[t * d_ff + j];
                             if hj == 0.0 {
                                 continue;
                             }
@@ -394,7 +438,7 @@ impl HashMoe {
                     }
                     for (i, &t) in rows.iter().enumerate() {
                         for j in 0..d_ff {
-                            let pre = cache.pre[t * d_ff + j];
+                            let pre = pre_r[t * d_ff + j];
                             let sg = 1.0 / (1.0 + (-pre).exp());
                             let dh = dpre[i * d_ff + j] * (sg * (1.0 + pre * (1.0 - sg)));
                             db1[j] += dh;
