@@ -31,6 +31,8 @@ pub fn num_threads() -> usize {
 /// biaya membuat thread lebih besar daripada matmul-nya sendiri - dan langkah training
 /// punya banyak matmul kecil (per head, per expert) yang justru akan melambat.
 const PAR_MIN_MAC: usize = 1 << 18;
+/// Ambang jumlah elemen sebelum update AdamW dipecah ke beberapa thread.
+const PAR_MIN_ADAM: usize = 1 << 14;
 
 impl Mat {
     pub fn zeros(rows: usize, cols: usize) -> Self {
@@ -380,14 +382,40 @@ impl AdamW {
         let bc1 = 1.0 - b1.powi(self.step as i32);
         let bc2 = 1.0 - b2.powi(self.step as i32);
         let lr = self.lr * (bc1 / bc2).sqrt();
-        for i in 0..p.value.d.len() {
-            let g = p.grad.d[i];
-            p.m.d[i] = b1 * p.m.d[i] + (1.0 - b1) * g;
-            p.v.d[i] = b2 * p.v.d[i] + (1.0 - b2) * g * g;
-            let update = p.m.d[i] / (p.v.d[i].sqrt() + self.eps * bc2.sqrt());
-            // weight decay decoupled hanya untuk bobot, bukan bias (dipanggil terpisah)
-            p.value.d[i] -= self.lr * self.wd * p.value.d[i];
-            p.value.d[i] -= lr * update;
+        // Loop-invariant: versi lama memanggil bc2.sqrt() untuk SETIAP elemen, yaitu
+        // 12,7 juta akar kuadrat per langkah pada model 12,7 juta parameter.
+        let eps_t = self.eps * bc2.sqrt();
+        let wd = self.lr * self.wd;
+        let n = p.value.d.len();
+        let nt = num_threads();
+        let chunk = n.div_ceil(nt.max(1));
+        let body = |vpart: &mut [f32], mpart: &mut [f32], vvpart: &mut [f32], gpart: &[f32]| {
+            for i in 0..vpart.len() {
+                let g = gpart[i];
+                mpart[i] = b1 * mpart[i] + (1.0 - b1) * g;
+                vvpart[i] = b2 * vvpart[i] + (1.0 - b2) * g * g;
+                let upd = mpart[i] / (vvpart[i].sqrt() + eps_t);
+                vpart[i] -= wd * vpart[i];
+                vpart[i] -= lr * upd;
+            }
+        };
+        // Update AdamW sepenuhnya independen per elemen, jadi dipecah ke beberapa thread.
+        // Ambang menjaga parameter kecil (bias) tidak membayar biaya pembuatan thread.
+        if nt <= 1 || n < PAR_MIN_ADAM {
+            body(&mut p.value.d, &mut p.m.d, &mut p.v.d, &p.grad.d);
+            return;
         }
+        let mut vi = p.value.d.chunks_mut(chunk);
+        let mut mi = p.m.d.chunks_mut(chunk);
+        let mut vv = p.v.d.chunks_mut(chunk);
+        let gi = p.grad.d.chunks(chunk);
+        std::thread::scope(|s| {
+            for (((vpart, mpart), vvpart), gpart) in
+                vi.by_ref().zip(mi.by_ref()).zip(vv.by_ref()).zip(gi)
+            {
+                let body = &body;
+                s.spawn(move || body(vpart, mpart, vvpart, gpart));
+            }
+        });
     }
 }
