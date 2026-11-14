@@ -45,6 +45,9 @@ curve: build
 prepare:
 	bash scripts/prepare_corpus.sh $(MB) $(VOCAB)
 
+genstat:
+	$(BIN) genstat --ckpt $(CKPT) --tokenizer $(TOK) --samples 8 --tokens 120
+
 analyze:
 	awk -f scripts/analyze_curve.sh $(LOG)
 

@@ -32,6 +32,7 @@ fn main() {
         "bpe" => cmd_bpe(&args),
         "tokenize" => cmd_tokenize(&args),
         "chat" => cmd_chat(&args),
+        "genstat" => cmd_genstat(&args),
         _ => {
             println!("asca — ASCA v2 (tanpa attention, state konstan, Rust murni)");
             println!("pakai:");
@@ -551,6 +552,122 @@ fn cmd_chat(args: &[String]) {
         println!();
     }
 }
+
+/// Ukur kualitas generasi tanpa perlu penilaian manusia.
+///
+/// Val loss hanya mengukur seberapa baik model menebak token berikutnya pada teks yang
+/// diberikan; ia tidak menangkap mode collapse (model yang mengulang kalimat yang sama
+/// tetap punya loss rendah). Karena itu di sini diukur dua hal yang saling melengkapi:
+///
+///   distinct-n : rasio n-gram unik terhadap total n-gram. Turun = model mulai mengulang.
+///   rep-4      : 1 - distinct-4, yaitu laju pengulangan 4-gram.
+///   kata/kalim : panjang kalimat rata-rata, penanda apakah model berhenti menulis
+///                potongan pendek.
+///
+/// Semua diukur pada keluaran model sendiri dengan prompt tetap, sehingga bisa
+/// dibandingkan antar checkpoint.
+fn cmd_genstat(args: &[String]) {
+    let ckpt = arg(args, "--ckpt", "");
+    let (model, cfg) = train::load(&ckpt, 0).expect("gagal load checkpoint");
+    let tokpath = arg(args, "--tokenizer", "");
+    let bpe = Bpe::load(&tokpath).expect("gagal muat tokenizer");
+    let n_samples: usize = arg(args, "--samples", "8").parse().unwrap();
+    let max_new: usize = arg(args, "--tokens", "120").parse().unwrap();
+    let temp: f32 = arg(args, "--temp", "0.8").parse().unwrap();
+    let top_p: f32 = arg(args, "--top-p", "0.95").parse().unwrap();
+    let prompts = [
+        "Once upon a time, there was a little girl named Lily",
+        "One day, a small dog found a big red ball",
+        "The sun was shining and the children went outside",
+        "Tom was sad because he lost his toy",
+    ];
+    let mut rng = Rng::new(7);
+    let mut all_words: Vec<String> = Vec::new();
+    for si in 0..n_samples {
+        let prompt = prompts[si % prompts.len()];
+        let mut ids = bpe.encode(prompt.as_bytes());
+        ids.retain(|&i| (i as usize) < cfg.vocab);
+        let mut st = model.new_decode_state();
+        let mut logits = None;
+        for &id in ids.iter() {
+            logits = Some(model.step(id, &mut st));
+        }
+        let mut text = String::new();
+        for _ in 0..max_new {
+            let lg = logits.as_ref().unwrap();
+            let row = lg.row(0);
+            let v = row.len();
+            let mut idx: Vec<usize> = (0..v).collect();
+            let k = 40.min(v);
+            idx.sort_unstable_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+            idx.truncate(k);
+            let max = idx.iter().map(|&i| row[i]).fold(f32::NEG_INFINITY, f32::max);
+            let mut probs: Vec<(usize, f32)> =
+                idx.iter().map(|&i| (i, ((row[i] - max) / temp).exp())).collect();
+            probs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let total: f32 = probs.iter().map(|x| x.1).sum();
+            let mut acc = 0.0;
+            let mut cut = probs.len();
+            for (i, (_, p)) in probs.iter().enumerate() {
+                acc += p / total;
+                if acc >= top_p {
+                    cut = i + 1;
+                    break;
+                }
+            }
+            probs.truncate(cut);
+            let sum: f32 = probs.iter().map(|x| x.1).sum();
+            let mut r = rng.uniform() * sum;
+            let mut pick = probs[0].0;
+            for &(i, p) in probs.iter() {
+                r -= p;
+                if r <= 0.0 {
+                    pick = i;
+                    break;
+                }
+            }
+            let chunk = bpe.decode(&[pick as u32]);
+            if let Ok(s) = std::str::from_utf8(&chunk) {
+                text.push_str(s);
+            }
+            logits = Some(model.step(pick as u32, &mut st));
+        }
+        all_words.extend(
+            text.split_whitespace()
+                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+                .filter(|w| !w.is_empty()),
+        );
+    }
+    let total = all_words.len() as f32;
+    let distinct = |n: usize| -> f32 {
+        let mut set = std::collections::HashSet::new();
+        let mut count = 0usize;
+        for w in all_words.windows(n) {
+            set.insert(w.join(" "));
+            count += 1;
+        }
+        if count == 0 {
+            return 0.0;
+        }
+        set.len() as f32 / count as f32
+    };
+    println!(
+        "genstat: {n_samples} sampel x {max_new} token (temp {temp}, top-p {top_p})"
+    );
+    println!("  kata total   : {:.0}", total);
+    println!("  distinct-1   : {:.4}", distinct(1));
+    println!("  distinct-2   : {:.4}", distinct(2));
+    println!("  distinct-3   : {:.4}", distinct(3));
+    println!("  rep-4        : {:.4}", 1.0 - distinct(4));
+    println!("  vocab unik   : {}", {
+        let mut s = std::collections::HashSet::new();
+        for w in all_words.iter() {
+            s.insert(w.clone());
+        }
+        s.len()
+    });
+}
+
 
 fn cmd_gpu(args: &[String]) {
     use asca_rs::cuda;
