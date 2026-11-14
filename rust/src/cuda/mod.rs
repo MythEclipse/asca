@@ -453,6 +453,95 @@ impl Gpu {
         Ok(Mat::from_vec(rows, cols, out))
     }
 
+    /// Kumpulkan baris `idx` dari `src` menjadi matriks kontigu (n x cols).
+    pub fn gather_rows(&self, src: &Mat, idx: &[usize]) -> Result<Mat, String> {
+        let (n, cols) = (idx.len(), src.cols);
+        let dsrc = DevBuf::new(src.d.len() * 4)?;
+        let didx = DevBuf::new(n * 4)?;
+        let ddst = DevBuf::new(n * cols * 4)?;
+        dsrc.upload(&src.d)?;
+        let idx_i: Vec<i32> = idx.iter().map(|&i| i as i32).collect();
+        unsafe {
+            let rc = sys::cuMemcpyHtoD_v2(didx.0, idx_i.as_ptr() as *const c_void, n * 4);
+            if rc != sys::SUCCESS {
+                return Err(sys::err(rc));
+            }
+        }
+        let (mut nr, mut c) = (n as i32, cols as i32);
+        self.launch(
+            "gather_rows_f32",
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &dsrc.0 as *const _ as *mut c_void,
+                &didx.0 as *const _ as *mut c_void,
+                &ddst.0 as *const _ as *mut c_void,
+                &mut nr as *mut _ as *mut c_void,
+                &mut c as *mut _ as *mut c_void,
+            ],
+        )?;
+        unsafe { sys::cuCtxSynchronize() };
+        let mut out = vec![0.0f32; n * cols];
+        ddst.download(&mut out)?;
+        Ok(Mat::from_vec(n, cols, out))
+    }
+
+    /// Sebar baris `src` ke posisi `idx` pada `dst` (dst diubah di tempat).
+    pub fn scatter_rows(&self, src: &Mat, idx: &[usize], dst: &mut Mat) -> Result<(), String> {
+        let (n, cols) = (idx.len(), src.cols);
+        let dsrc = DevBuf::new(src.d.len() * 4)?;
+        let didx = DevBuf::new(n * 4)?;
+        let ddst = DevBuf::new(dst.d.len() * 4)?;
+        dsrc.upload(&src.d)?;
+        ddst.upload(&dst.d)?;
+        let idx_i: Vec<i32> = idx.iter().map(|&i| i as i32).collect();
+        unsafe {
+            let rc = sys::cuMemcpyHtoD_v2(didx.0, idx_i.as_ptr() as *const c_void, n * 4);
+            if rc != sys::SUCCESS {
+                return Err(sys::err(rc));
+            }
+        }
+        let (mut nr, mut c) = (n as i32, cols as i32);
+        self.launch(
+            "scatter_rows_f32",
+            (n as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &dsrc.0 as *const _ as *mut c_void,
+                &didx.0 as *const _ as *mut c_void,
+                &ddst.0 as *const _ as *mut c_void,
+                &mut nr as *mut _ as *mut c_void,
+                &mut c as *mut _ as *mut c_void,
+            ],
+        )?;
+        unsafe { sys::cuCtxSynchronize() };
+        ddst.download(&mut dst.d)?;
+        Ok(())
+    }
+
+    /// SiLU di tempat.
+    pub fn silu_inplace(&self, x: &mut Mat) -> Result<(), String> {
+        let n = x.d.len();
+        let dx = DevBuf::new(n * 4)?;
+        dx.upload(&x.d)?;
+        let mut n_i = n as i32;
+        self.launch(
+            "silu_f32",
+            ((n as u32).div_ceil(256), 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &dx.0 as *const _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        unsafe { sys::cuCtxSynchronize() };
+        dx.download(&mut x.d)?;
+        Ok(())
+    }
+
     pub fn delta_fwd(
         &self,
         q: &Mat,

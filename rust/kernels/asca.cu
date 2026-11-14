@@ -260,3 +260,35 @@ extern "C" __global__ void adamw_f32(float* __restrict__ val,
     p -= lr * m_val / (sqrtf(v_val) + eps_t);
     val[idx] = p;
 }
+
+// ------------------------------------------------------- gather / scatter / silu
+// MoE mengelompokkan token per expert. Supaya expert bisa dihitung sebagai GEMM
+// biasa (bukan loop per baris), baris token dikumpulkan dulu ke buffer kontigu,
+// dihitung, lalu disebar kembali ke posisi aslinya.
+extern "C" __global__ void gather_rows_f32(const float* __restrict__ src,
+                                           const int* __restrict__ idx,
+                                           float* __restrict__ dst, int n_rows, int cols) {
+    const int r = blockIdx.x;
+    if (r >= n_rows) return;
+    const float* s = src + (long)idx[r] * cols;
+    float* d = dst + (long)r * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) d[c] = s[c];
+}
+
+extern "C" __global__ void scatter_rows_f32(const float* __restrict__ src,
+                                            const int* __restrict__ idx,
+                                            float* __restrict__ dst, int n_rows, int cols) {
+    const int r = blockIdx.x;
+    if (r >= n_rows) return;
+    const float* s = src + (long)r * cols;
+    float* d = dst + (long)idx[r] * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) d[c] = s[c];
+}
+
+extern "C" __global__ void silu_f32(float* __restrict__ x, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        const float v = x[i];
+        x[i] = v / (1.0f + expf(-v));
+    }
+}

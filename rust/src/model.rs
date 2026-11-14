@@ -102,16 +102,112 @@ impl HashMoe {
     /// (token berganti expert di setiap baris). Dengan mengelompokkan token per
     /// expert dan menaruh loop bobot di luar, satu baris `w1`/`w2` dibaca sekali
     /// lalu dipakai untuk semua token expert itu — pola GEMM yang sebenarnya.
-    pub fn forward(&self, x: &Mat, ids: &[u32]) -> (Mat, MoeCache) {
+
+    /// Salinan kolom expert `e` dari w1 (d_model x n_experts*d_ff) -> (d_model x d_ff).
+    fn expert_w1(&self, e: usize) -> Mat {
+        let d = self.w1.value.rows;
+        let d_ff = self.d_ff;
+        let mut out = Mat::zeros(d, d_ff);
+        for r in 0..d {
+            let src = &self.w1.value.row(r)[e * d_ff..(e + 1) * d_ff];
+            out.row_mut(r).copy_from_slice(src);
+        }
+        out
+    }
+
+    /// Salinan baris expert `e` dari w2 (n_experts*d_ff x d_model) -> (d_ff x d_model).
+    fn expert_w2(&self, e: usize) -> Mat {
+        let d = self.w2.value.cols;
+        let d_ff = self.d_ff;
+        let mut out = Mat::zeros(d_ff, d);
+        for r in 0..d_ff {
+            let src = self.w2.value.row(e * d_ff + r);
+            out.row_mut(r).copy_from_slice(src);
+        }
+        out
+    }
+
+    /// Jalur GPU: tiap expert jadi GEMM biasa setelah barisnya dikumpulkan.
+    ///
+    /// Versi CPU menghitung `xn @ w1[:, expert]` sebagai loop per kolom dengan `axpy`
+    /// per baris token — itu bagian terbesar MoE (15% forward + 23% backward dari total
+    /// waktu training) dan tidak pernah menyentuh GPU karena bentuknya bukan GEMM.
+    /// Dengan gather -> GEMM -> SiLU -> GEMM -> scatter, seluruh pekerjaan berat menjadi
+    /// matmul yang memang sudah punya jalur GPU.
+    fn forward_gpu(&self, x: &Mat, _ids: &[u32], buckets: &[Vec<usize>]) -> (Mat, MoeCache) {
         let (t_len, d) = (x.rows, x.cols);
         let d_ff = self.d_ff;
         let xn = crate::prof::time(6, || rmsnorm_rows(x, EPS));
         let mut route = vec![0usize; t_len];
+        for (e, rows) in buckets.iter().enumerate() {
+            for &t in rows.iter() {
+                route[t] = e;
+            }
+        }
+        let mut pre = vec![0.0f32; t_len * d_ff];
+        let mut hidden = vec![0.0f32; t_len * d_ff];
+        let mut out = Mat::zeros(t_len, d);
+        let g = crate::cuda::gpu().unwrap();
+        for (e, rows) in buckets.iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let xe = g.gather_rows(&xn, rows).expect("gather gagal");
+            let w1e = self.expert_w1(e);
+            let mut pe = xe.matmul(&w1e);
+            let b1 = &self.b1.value.d[e * d_ff..(e + 1) * d_ff];
+            for i in 0..pe.rows {
+                let row = pe.row_mut(i);
+                for j in 0..d_ff {
+                    row[j] += b1[j];
+                }
+            }
+            let mut he = pe.clone();
+            g.silu_inplace(&mut he).expect("silu gagal");
+            let w2e = self.expert_w2(e);
+            let mut oe = he.matmul(&w2e);
+            let b2 = &self.b2.value.d;
+            for i in 0..oe.rows {
+                let row = oe.row_mut(i);
+                for c in 0..d {
+                    row[c] += b2[c];
+                }
+            }
+            g.scatter_rows(&oe, rows, &mut out).expect("scatter gagal");
+            for (i, &t) in rows.iter().enumerate() {
+                pre[t * d_ff..(t + 1) * d_ff].copy_from_slice(&pe.row(i));
+                hidden[t * d_ff..(t + 1) * d_ff].copy_from_slice(&he.row(i));
+            }
+        }
+        (
+            out,
+            MoeCache {
+                x: x.clone(),
+                xn,
+                pre,
+                hidden,
+                route,
+                buckets: buckets.to_vec(),
+            },
+        )
+    }
+
+    pub fn forward(&self, x: &Mat, ids: &[u32]) -> (Mat, MoeCache) {
+        let (t_len, d) = (x.rows, x.cols);
+        let d_ff = self.d_ff;
         let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); self.n_experts];
         for t in 0..t_len {
-            let e = hash_route(ids[t], self.n_experts);
-            route[t] = e;
-            buckets[e].push(t);
+            buckets[hash_route(ids[t], self.n_experts)].push(t);
+        }
+        if crate::cuda::available() && t_len * d * d_ff >= 1 << 21 {
+            return self.forward_gpu(x, ids, &buckets);
+        }
+        let xn = crate::prof::time(6, || rmsnorm_rows(x, EPS));
+        let mut route = vec![0usize; t_len];
+        for (e, rows) in buckets.iter().enumerate() {
+            for &t in rows.iter() {
+                route[t] = e;
+            }
         }
 
         // Tiap expert mendapat buffer kontigu miliknya sendiri. Sebelumnya semua expert
