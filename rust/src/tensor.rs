@@ -249,6 +249,13 @@ pub fn sigmoid(x: f32) -> f32 {
 
 /// RMSNorm per baris (tanpa bobot, untuk kesederhanaan verifikasi gradien).
 pub fn rmsnorm_rows(x: &Mat, eps: f32) -> Mat {
+    if crate::cuda::available() && x.d.len() >= 65536 {
+        if let Some(g) = crate::cuda::gpu() {
+            if let Ok((y, _)) = g.rmsnorm(x, eps) {
+                return y;
+            }
+        }
+    }
     let mut out = Mat::zeros(x.rows, x.cols);
     let cols = x.cols;
     for r in 0..x.rows {
@@ -265,6 +272,13 @@ pub fn rmsnorm_rows(x: &Mat, eps: f32) -> Mat {
 
 /// Backward RMSNorm: `dx = inv * (dy - x_hat * mean(dy * x_hat))`.
 pub fn rmsnorm_rows_backward(x: &Mat, dy: &Mat, eps: f32) -> Mat {
+    if crate::cuda::available() && x.d.len() >= 65536 {
+        if let Some(g) = crate::cuda::gpu() {
+            if let Ok(dx) = g.rmsnorm_bwd(x, dy, eps) {
+                return dx;
+            }
+        }
+    }
     let mut dx = Mat::zeros(x.rows, x.cols);
     let cols = x.cols;
     for r in 0..x.rows {
@@ -387,6 +401,25 @@ impl AdamW {
         let eps_t = self.eps * bc2.sqrt();
         let wd = self.lr * self.wd;
         let n = p.value.d.len();
+        if crate::cuda::available() && n >= 32768 {
+            if let Some(g) = crate::cuda::gpu() {
+                if g.adamw_update(
+                    &mut p.value.d,
+                    &p.grad.d,
+                    &mut p.m.d,
+                    &mut p.v.d,
+                    lr,
+                    b1,
+                    b2,
+                    eps_t,
+                    wd,
+                )
+                .is_ok()
+                {
+                    return;
+                }
+            }
+        }
         let nt = num_threads();
         let chunk = n.div_ceil(nt.max(1));
         let body = |vpart: &mut [f32], mpart: &mut [f32], vvpart: &mut [f32], gpart: &[f32]| {

@@ -23,18 +23,36 @@ pub struct Gpu {
     _ctx: sys::Context,
 }
 
-struct DevBuf(sys::DevicePtr);
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// Caching memory allocator sederhana:
+/// cuMemAlloc_v2 dan cuMemFree_v2 adalah operasi driver yang memblokir dan sangat lambat jika
+/// dipanggil puluhan kali per langkah training. DevBuf sekarang meminjam dari pool per-ukuran,
+/// dan saat di-drop dikembalikan ke pool untuk digunakan kembali tanpa pemanggilan driver.
+static POOL: Mutex<Option<HashMap<usize, Vec<sys::DevicePtr>>>> = Mutex::new(None);
+
+pub struct DevBuf(pub sys::DevicePtr, pub usize);
 
 impl DevBuf {
-    fn new(bytes: usize) -> Result<Self, String> {
+    pub fn new(bytes: usize) -> Result<Self, String> {
+        let sz = bytes.max(4).next_power_of_two();
+        if let Ok(mut pool) = POOL.lock() {
+            let map = pool.get_or_insert_with(HashMap::new);
+            if let Some(list) = map.get_mut(&sz) {
+                if let Some(p) = list.pop() {
+                    return Ok(DevBuf(p, sz));
+                }
+            }
+        }
         let mut p = sys::DevicePtr(0);
-        let rc = unsafe { sys::cuMemAlloc_v2(&mut p, bytes.max(4)) };
+        let rc = unsafe { sys::cuMemAlloc_v2(&mut p, sz) };
         if rc != sys::SUCCESS {
             return Err(sys::err(rc));
         }
-        Ok(DevBuf(p))
+        Ok(DevBuf(p, sz))
     }
-    fn upload(&self, data: &[f32]) -> Result<(), String> {
+    pub fn upload(&self, data: &[f32]) -> Result<(), String> {
         let rc = unsafe {
             sys::cuMemcpyHtoD_v2(
                 self.0,
@@ -48,7 +66,7 @@ impl DevBuf {
             Ok(())
         }
     }
-    fn download(&self, out: &mut [f32]) -> Result<(), String> {
+    pub fn download(&self, out: &mut [f32]) -> Result<(), String> {
         let rc = unsafe {
             sys::cuMemcpyDtoH_v2(
                 out.as_mut_ptr() as *mut c_void,
@@ -66,8 +84,16 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     fn drop(&mut self) {
-        unsafe {
-            sys::cuMemFree_v2(self.0);
+        if self.0.0 != 0 {
+            if let Ok(mut pool) = POOL.lock() {
+                if let Some(map) = pool.as_mut() {
+                    map.entry(self.1).or_default().push(self.0);
+                    return;
+                }
+            }
+            unsafe {
+                sys::cuMemFree_v2(self.0);
+            }
         }
     }
 }
@@ -274,6 +300,159 @@ impl Gpu {
 
     /// Delta rule forward untuk semua head sekaligus (satu blok per head).
     #[allow(clippy::too_many_arguments)]
+    /// Cross-entropy loss dan backward di GPU.
+    /// Mengembalikan loss rata-rata dan mengisi `dlogits`.
+    pub fn cross_entropy_bwd(&self, logits: &Mat, targets: &[u32]) -> Result<(f32, Mat), String> {
+        let (t_len, v) = (logits.rows, logits.cols);
+        assert_eq!(
+            t_len,
+            targets.len(),
+            "targets len harus sama dengan logits rows"
+        );
+        let d_logits = DevBuf::new(t_len * v * 4)?;
+        let d_targets = DevBuf::new(t_len * 4)?;
+        let d_dlogits = DevBuf::new(t_len * v * 4)?;
+        let d_losses = DevBuf::new(t_len * 4)?;
+
+        d_logits.upload(&logits.d)?;
+        unsafe {
+            let rc =
+                sys::cuMemcpyHtoD_v2(d_targets.0, targets.as_ptr() as *const c_void, t_len * 4);
+            if rc != sys::SUCCESS {
+                return Err(sys::err(rc));
+            }
+        }
+
+        let mut t_i = t_len as i32;
+        let mut v_i = v as i32;
+        let mut inv_t = 1.0f32 / t_len as f32;
+
+        self.launch(
+            "cross_entropy_bwd_f32",
+            (t_len as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &d_logits.0 as *const _ as *mut c_void,
+                &d_targets.0 as *const _ as *mut c_void,
+                &d_dlogits.0 as *const _ as *mut c_void,
+                &d_losses.0 as *const _ as *mut c_void,
+                &mut t_i as *mut _ as *mut c_void,
+                &mut v_i as *mut _ as *mut c_void,
+                &mut inv_t as *mut _ as *mut c_void,
+            ],
+        )?;
+        unsafe { sys::cuCtxSynchronize() };
+
+        let mut losses = vec![0.0f32; t_len];
+        d_losses.download(&mut losses)?;
+        let loss = losses.iter().sum::<f32>() * inv_t;
+
+        let mut dlogits_out = vec![0.0f32; t_len * v];
+        d_dlogits.download(&mut dlogits_out)?;
+
+        Ok((loss, Mat::from_vec(t_len, v, dlogits_out)))
+    }
+
+    /// Update AdamW di GPU untuk satu parameter.
+    pub fn adamw_update(
+        &self,
+        val: &mut [f32],
+        grad: &[f32],
+        m: &mut [f32],
+        v: &mut [f32],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps_t: f32,
+        wd: f32,
+    ) -> Result<(), String> {
+        let n = val.len();
+        assert_eq!(n, grad.len());
+        assert_eq!(n, m.len());
+        assert_eq!(n, v.len());
+
+        let d_val = DevBuf::new(n * 4)?;
+        let d_grad = DevBuf::new(n * 4)?;
+        let d_m = DevBuf::new(n * 4)?;
+        let d_v = DevBuf::new(n * 4)?;
+
+        d_val.upload(val)?;
+        d_grad.upload(grad)?;
+        d_m.upload(m)?;
+        d_v.upload(v)?;
+
+        let mut lr_i = lr;
+        let mut b1_i = beta1;
+        let mut b2_i = beta2;
+        let mut eps_i = eps_t;
+        let mut wd_i = wd;
+        let mut n_i = n as i32;
+
+        let block = 256u32;
+        let grid = (n as u32).div_ceil(block);
+
+        self.launch(
+            "adamw_f32",
+            (grid, 1, 1),
+            (block, 1, 1),
+            0,
+            vec![
+                &d_val.0 as *const _ as *mut c_void,
+                &d_grad.0 as *const _ as *mut c_void,
+                &d_m.0 as *const _ as *mut c_void,
+                &d_v.0 as *const _ as *mut c_void,
+                &mut lr_i as *mut _ as *mut c_void,
+                &mut b1_i as *mut _ as *mut c_void,
+                &mut b2_i as *mut _ as *mut c_void,
+                &mut eps_i as *mut _ as *mut c_void,
+                &mut wd_i as *mut _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        unsafe { sys::cuCtxSynchronize() };
+
+        d_val.download(val)?;
+        d_m.download(m)?;
+        d_v.download(v)?;
+
+        Ok(())
+    }
+
+    /// RMSNorm backward di GPU: dx = inv * (dy - xhat * mean(dy * xhat)).
+    pub fn rmsnorm_bwd(&self, x: &Mat, dy: &Mat, eps: f32) -> Result<Mat, String> {
+        let (rows, cols) = (x.rows, x.cols);
+        assert_eq!(rows, dy.rows);
+        assert_eq!(cols, dy.cols);
+        let dx_buf = DevBuf::new(x.d.len() * 4)?;
+        let dy_buf = DevBuf::new(dy.d.len() * 4)?;
+        let dout_buf = DevBuf::new(x.d.len() * 4)?;
+
+        dx_buf.upload(&x.d)?;
+        dy_buf.upload(&dy.d)?;
+
+        let (mut r, mut c) = (rows as i32, cols as i32);
+        let mut e = eps;
+        self.launch(
+            "rmsnorm_bwd_f32",
+            (rows as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &dx_buf.0 as *const _ as *mut c_void,
+                &dy_buf.0 as *const _ as *mut c_void,
+                &dout_buf.0 as *const _ as *mut c_void,
+                &mut r as *mut _ as *mut c_void,
+                &mut c as *mut _ as *mut c_void,
+                &mut e as *mut _ as *mut c_void,
+            ],
+        )?;
+        unsafe { sys::cuCtxSynchronize() };
+        let mut out = vec![0.0f32; x.d.len()];
+        dout_buf.download(&mut out)?;
+        Ok(Mat::from_vec(rows, cols, out))
+    }
+
     pub fn delta_fwd(
         &self,
         q: &Mat,

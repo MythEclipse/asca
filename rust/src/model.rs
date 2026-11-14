@@ -569,51 +569,20 @@ impl Model {
     pub fn backward(&mut self, cache: &ModelCache, logits: &Mat, targets: &[u32]) -> f32 {
         let t_len = logits.rows;
         let v = self.cfg.vocab;
-        let mut dlogits = Mat::zeros(t_len, v);
-        // Cross-entropy atas vocab adalah pekerjaan TERBESAR yang tidak terlihat di
-        // profil: t_len x vocab = 2048 x 12288 = 25 juta panggilan exp() per langkah,
-        // single-threaded, ditambah satu pass terpisah untuk membagi seluruh matriks
-        // dengan t_len. Diukur: 42,8% waktu dinding training tidak masuk scope mana pun,
-        // dan ini penyebab utamanya.
-        //
-        // Sekarang baris dipecah ke beberapa thread, dan pembagian dengan t_len dilipat
-        // ke dalam loop yang sama sehingga tidak ada pass kedua atas 25 juta elemen.
-        let nt = crate::tensor::num_threads();
-        let inv = 1.0 / t_len as f32;
-        let chunk = t_len.div_ceil(nt.max(1));
-        let mut loss_parts = vec![0.0f32; t_len.div_ceil(chunk).max(1)];
-        let lp = &mut loss_parts;
-        let mut it = lp.iter_mut();
-        std::thread::scope(|s| {
-            for (ci, dpart) in dlogits.d.chunks_mut(chunk * v).enumerate() {
-                let start = ci * chunk;
-                let len = dpart.len() / v;
-                let lslot = it.next().unwrap();
-                let lg = &*logits;
-                let tg = targets;
-                s.spawn(move || {
-                    let mut l = 0.0f32;
-                    for i in 0..len {
-                        let t = start + i;
-                        let row = &lg.d[t * v..(t + 1) * v];
-                        let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                        let mut sum = 0.0f32;
-                        for c in 0..v {
-                            sum += (row[c] - max).exp();
-                        }
-                        let lse = max + sum.ln();
-                        l += lse - row[tg[t] as usize];
-                        let drow = &mut dpart[i * v..(i + 1) * v];
-                        for c in 0..v {
-                            drow[c] = (row[c] - lse).exp() * inv;
-                        }
-                        drow[tg[t] as usize] -= inv;
-                    }
-                    *lslot = l;
-                });
+        // Jalur GPU: cross-entropy + softmax backward dihitung dalam satu kernel terpadu
+        // per token di GPU. Menghilangkan 25 juta exp/ln di CPU dan transfer 100 MB dlogits.
+        let (loss, dlogits) = if crate::cuda::available() && t_len * v >= 65536 {
+            if let Some(g) = crate::cuda::gpu() {
+                match g.cross_entropy_bwd(logits, targets) {
+                    Ok(res) => res,
+                    Err(_) => cpu_cross_entropy(logits, targets, v),
+                }
+            } else {
+                cpu_cross_entropy(logits, targets, v)
             }
-        });
-        let loss: f32 = loss_parts.iter().sum::<f32>() * inv;
+        } else {
+            cpu_cross_entropy(logits, targets, v)
+        };
 
         // head
         let d_head = crate::prof::time(9, || cache.h_final.matmul_ta(&dlogits));
@@ -651,4 +620,46 @@ pub fn step(model: &mut Model, opt: &mut AdamW) {
     for p in model.params_mut() {
         opt.update(p);
     }
+}
+
+fn cpu_cross_entropy(logits: &Mat, targets: &[u32], v: usize) -> (f32, Mat) {
+    let t_len = logits.rows;
+    let mut dlogits = Mat::zeros(t_len, v);
+    let nt = crate::tensor::num_threads();
+    let inv = 1.0 / t_len as f32;
+    let chunk = t_len.div_ceil(nt.max(1));
+    let mut loss_parts = vec![0.0f32; t_len.div_ceil(chunk).max(1)];
+    let lp = &mut loss_parts;
+    let mut it = lp.iter_mut();
+    std::thread::scope(|s| {
+        for (ci, dpart) in dlogits.d.chunks_mut(chunk * v).enumerate() {
+            let start = ci * chunk;
+            let len = dpart.len() / v;
+            let lslot = it.next().unwrap();
+            let lg = &*logits;
+            let tg = targets;
+            s.spawn(move || {
+                let mut l = 0.0f32;
+                for i in 0..len {
+                    let t = start + i;
+                    let row = &lg.d[t * v..(t + 1) * v];
+                    let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for c in 0..v {
+                        sum += (row[c] - max).exp();
+                    }
+                    let lse = max + sum.ln();
+                    l += lse - row[tg[t] as usize];
+                    let drow = &mut dpart[i * v..(i + 1) * v];
+                    for c in 0..v {
+                        drow[c] = (row[c] - lse).exp() * inv;
+                    }
+                    drow[tg[t] as usize] -= inv;
+                }
+                *lslot = l;
+            });
+        }
+    });
+    let loss: f32 = loss_parts.iter().sum::<f32>() * inv;
+    (loss, dlogits)
 }

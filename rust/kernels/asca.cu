@@ -175,3 +175,88 @@ extern "C" __global__ void delta_fwd_f32(const float* __restrict__ q,  // (T, H*
         __syncthreads();
     }
 }
+
+// ------------------------------------------------ cross-entropy + softmax backward
+// 1 blok per baris (token t), 256 threads per block.
+// Menghitung loss per token dan mengisi dlogits[t, :] = (p - 1_target) * inv_T.
+extern "C" __global__ void cross_entropy_bwd_f32(const float* __restrict__ logits,
+                                                const unsigned int* __restrict__ targets,
+                                                float* __restrict__ dlogits,
+                                                float* __restrict__ losses,
+                                                int T, int V, float inv_T) {
+    const int t = blockIdx.x;
+    if (t >= T) return;
+    const float* row = logits + (long)t * V;
+    float* drow = dlogits + (long)t * V;
+    const unsigned int target = targets[t];
+
+    __shared__ float sbuf[256];
+
+    // 1. cari max lokal
+    float lmax = -1e38f;
+    for (int c = threadIdx.x; c < V; c += blockDim.x) {
+        float val = row[c];
+        if (val > lmax) lmax = val;
+    }
+    sbuf[threadIdx.x] = lmax;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            if (sbuf[threadIdx.x + s] > sbuf[threadIdx.x]) {
+                sbuf[threadIdx.x] = sbuf[threadIdx.x + s];
+            }
+        }
+        __syncthreads();
+    }
+    const float max_val = sbuf[0];
+    __syncthreads();
+
+    // 2. sum exp
+    float lsum = 0.0f;
+    for (int c = threadIdx.x; c < V; c += blockDim.x) {
+        lsum += expf(row[c] - max_val);
+    }
+    sbuf[threadIdx.x] = lsum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            sbuf[threadIdx.x] += sbuf[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    const float sum_exp = sbuf[0];
+    const float lse = max_val + logf(sum_exp);
+
+    if (threadIdx.x == 0) {
+        losses[t] = (target < (unsigned int)V) ? (lse - row[target]) : 0.0f;
+    }
+
+    // 3. dlogits = (exp(row - lse) - (c == target ? 1 : 0)) * inv_T
+    for (int c = threadIdx.x; c < V; c += blockDim.x) {
+        float p = expf(row[c] - lse);
+        if (c == target) p -= 1.0f;
+        drow[c] = p * inv_T;
+    }
+}
+
+// ------------------------------------------------------------------ AdamW
+extern "C" __global__ void adamw_f32(float* __restrict__ val,
+                                     const float* __restrict__ grad,
+                                     float* __restrict__ m,
+                                     float* __restrict__ v,
+                                     float lr, float beta1, float beta2,
+                                     float eps_t, float wd, int N) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= N) return;
+    float g = grad[idx];
+    float p = val[idx];
+    if (wd > 0.0f) {
+        p -= lr * wd * p;
+    }
+    float m_val = beta1 * m[idx] + (1.0f - beta1) * g;
+    float v_val = beta2 * v[idx] + (1.0f - beta2) * g * g;
+    m[idx] = m_val;
+    v[idx] = v_val;
+    p -= lr * m_val / (sqrtf(v_val) + eps_t);
+    val[idx] = p;
+}
