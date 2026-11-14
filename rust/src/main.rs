@@ -426,6 +426,21 @@ fn cmd_sample(args: &[String]) {
 /// REPL untuk benar-benar memakai model: satu baris masukan, jawaban mengalir token demi
 /// token. Memakai jalur decode inkremental yang sama dengan `sample`, jadi biaya per token
 /// konstan dan konteks percakapan bisa terus tumbuh tanpa melambat.
+/// Panjang awalan `b` yang valid sebagai UTF-8. Dipakai untuk menahan byte terakhir yang
+/// mungkin masih separuh karakter, sekaligus menahan calon penanda berhenti.
+fn utf8_prefix_len(b: &[u8]) -> usize {
+    for cut in (0..=b.len()).rev() {
+        if std::str::from_utf8(&b[..cut]).is_ok() {
+            return cut;
+        }
+    }
+    0
+}
+
+/// Penanda batas cerita di korpus. Model mempelajarinya dan akan menghasilkannya sendiri;
+/// tanpa ini, penanda itu ikut tercetak sebagai "<|endoftext|>" di tengah jawaban.
+const STOP_MARK: &[u8] = b"<|endoftext|>";
+
 fn cmd_chat(args: &[String]) {
     use std::io::{BufRead, Write};
     let ckpt = arg(args, "--ckpt", "");
@@ -537,17 +552,28 @@ fn cmd_chat(args: &[String]) {
                 None => vec![pick as u8],
             };
             out_bytes.extend_from_slice(&chunk);
-            if let Ok(s) = std::str::from_utf8(&out_bytes) {
-                print!("{s}");
+            let mut stop = false;
+            if let Some(p) = out_bytes
+                .windows(STOP_MARK.len())
+                .position(|w| w == STOP_MARK)
+            {
+                out_bytes.truncate(p);
+                stop = true;
+            }
+            // Tahan byte terakhir yang mungkin masih separuh karakter atau calon awal
+            // penanda berhenti, supaya tidak ada karakter rusak yang tercetak.
+            let hold = if stop { 0 } else { STOP_MARK.len() - 1 };
+            let upto = out_bytes.len().saturating_sub(hold);
+            let n = utf8_prefix_len(&out_bytes[..upto]);
+            if n > 0 {
+                print!("{}", String::from_utf8_lossy(&out_bytes[..n]));
                 let _ = std::io::stdout().flush();
-                out_bytes.clear();
+                out_bytes.drain(..n);
+            }
+            if stop {
+                break;
             }
             logits = Some(model.step(pick as u32, &mut st));
-            if let Some(b) = &bpe {
-                if b.decode(&[pick as u32]).first() == Some(&b'\n') {
-                    break;
-                }
-            }
         }
         println!();
     }
@@ -637,6 +663,11 @@ fn cmd_genstat(args: &[String]) {
             }
             logits = Some(model.step(pick as u32, &mut st));
         }
+        // Buang penanda batas cerita supaya tidak terhitung sebagai kata.
+        let text = match text.find("<|endoftext|>") {
+            Some(p) => text[..p].to_string(),
+            None => text,
+        };
         all_words.extend(
             text.split_whitespace()
                 .map(|w| {
