@@ -88,6 +88,35 @@ dalamnya — sisanya matmul dan akumulasi bias di host. Kernel BPTT-nya sendiri
 ~12 ms/langkah (48 blok, 256 langkah sekuensial, ~10 `__syncthreads` per langkah) ditambah
 ~10 ms transfer; BPTT CPU yang digantikannya ~35 ms.
 
+### Di T4 (target sebenarnya)
+
+Angka di atas dari laptop (20 core, RTX 4050). Di Colab T4 dengan 2 vCPU, scan dan BPTT
+CPU jadi jauh lebih mahal, sehingga keuntungannya jauh lebih besar. Empat konfigurasi,
+config identik (12,7M params, batch 8 x seq 256, 20 langkah, corpus tokenized 12.288):
+
+| konfigurasi | tok/s |
+|---|---|
+| MoE CPU + delta CPU | 907 |
+| delta CPU, MoE GPU | 1.010 |
+| MoE CPU, delta GPU | 1.158 |
+| **MoE GPU + delta GPU** | **1.374** |
+
+Jadi blok delta bernilai **+36%** di T4 (1.010 → 1.374) versus +12,4% di laptop — persis
+karena 2 vCPU. Catatan: 1.010 tok/s cocok dengan profil Colab Anda sebelumnya (1.055),
+jadi pembandingnya nyata.
+
+Dua hal yang perlu dicatat jujur:
+
+- **Angka 1.628 tok/s "sebelumnya" belum terjelaskan.** Keempat konfigurasi di atas
+  memakai config yang sama dan tidak ada yang mencapainya; kemungkinan besar config atau
+  corpus pengukurannya berbeda (seq_len/batch/eval). Sebelum menyebut ini berhasil,
+  konfigurasi 1.628 itu perlu direproduksi — kalau tidak, pembandingnya apel vs jeruk.
+- **MoE forward di GPU tetap menang di T4** meski `scatter_rows` membuang salinan
+  (1.158 → 1.374, +18,6%). Keluhan Anda soal 144 MB/langkah itu benar sebagai biaya, tapi
+  di 2 vCPU biaya itu masih lebih murah daripada MoE di CPU. Di laptop (20 core)
+  urutannya bisa terbalik — karena itu `ASCA_GPU_OFF=moe` sekarang ada, supaya bisa diukur
+  per mesin, bukan ditebak.
+
 ### Bug yang ditemukan gate-nya sendiri
 
 Kernel `delta_bwd_f32` versi pertama menghasilkan galat **0,87 relatif** — bukan beda

@@ -106,8 +106,8 @@ block per (head, sequence) with the whole time loop inside the kernel. Parity wi
 ≤ 2.6e-7 relative, gradients match the verified CPU BPTT to 8.0e-7, and training loss is
 identical.
 
-Moving the delta block to the GPU is worth **+12.4%** (3,530 → 3,967 tok/s, 12.7M
-parameters) — but only after the state history stopped crossing PCIe. The first attempt
+Moving the delta block to the GPU is worth **+12.4%** on a 20-core laptop (3,530 → 3,967
+tok/s) and **+36%** on a Colab T4 with 2 vCPUs (1,010 → 1,374 tok/s, 12.7M parameters) — but only after the state history stopped crossing PCIe. The first attempt
 moved *just* the scan and was **slower** (3,265 tok/s): the BPTT was still on the CPU, so
 313 MB of state had to be downloaded every step. Device-resident state plus a BPTT kernel
 fixed it. The same instrumentation now says where the remaining 1.6 GB/step of traffic

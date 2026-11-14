@@ -199,7 +199,10 @@ impl HashMoe {
         for t in 0..t_len {
             buckets[hash_route(ids[t], self.n_experts)].push(t);
         }
-        if crate::cuda::available() && t_len * d * d_ff >= 1 << 21 {
+        // `ASCA_GPU_OFF=moe` memaksa jalur CPU: jalur GPU di bawah memakai gather/scatter
+        // per expert, dan itu terbukti bisa lebih lambat daripada CPU kalau biaya
+        // salinannya lebih besar dari kerja matmulnya (lihat docs/CUDA.md §3b).
+        if crate::cuda::offload("moe") && t_len * d * d_ff >= 1 << 21 {
             return self.forward_gpu(x, ids, &buckets);
         }
         let xn = crate::prof::time(6, || rmsnorm_rows(x, EPS));
