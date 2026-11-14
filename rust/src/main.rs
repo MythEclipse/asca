@@ -981,6 +981,52 @@ fn cmd_gpu(args: &[String]) {
         println!("  delta_scan isolasi sekuens: galat batch={batch} vs {batch}x batch=1 {leak:.3e}");
     }
 
+    // --- paritas kepala output device-resident vs jalur host
+    //
+    // Yang diuji bukan cuma angkanya, tapi bahwa memindahkan logits ke VRAM tidak
+    // mengubah loss maupun gradien: `dlogits` yang dulu naik-turun 4x harus menghasilkan
+    // d_head dan dh yang sama persis dengan jalur yang mengunduhnya.
+    {
+        let (t_len, d, v) = (512usize, 192usize, 12288usize);
+        let mut h_final = Mat::zeros(t_len, d);
+        h_final.fill_rand(&mut rng, 0.5);
+        let mut head = Mat::zeros(d, v);
+        head.fill_rand(&mut rng, 0.05);
+        let targets: Vec<u32> = (0..t_len).map(|_| (rng.uniform() * v as f32) as u32).collect();
+        let g = cuda::gpu().unwrap();
+        // jalur device
+        let dev = g.head_forward_dev(&h_final, &head).expect("head fwd dev");
+        let head_t = head.transpose();
+        let (loss_dev, d_head_dev, dh_dev) = g
+            .head_bwd_dev(&dev, &targets, &head_t)
+            .expect("head bwd dev");
+        // jalur host (logits turun, CE, dua GEMM)
+        let logits = h_final.matmul(&head);
+        let (loss_host, dlogits) = g.cross_entropy_bwd(&logits, &targets).expect("CE");
+        let d_head_host = h_final.matmul_ta(&dlogits);
+        let dh_host = dlogits.matmul_t(&head);
+        let rel = |a: &Mat, b: &Mat| {
+            let mut e = 0.0f32;
+            let mut sc = 1e-9f32;
+            for i in 0..a.d.len() {
+                e = e.max((a.d[i] - b.d[i]).abs());
+                sc = sc.max(a.d[i].abs());
+            }
+            e / sc
+        };
+        println!(
+            "  head device: loss {loss_dev:.6} vs {loss_host:.6} (selisih {:.2e}), d_head rel {:.3e}, dh rel {:.3e}",
+            (loss_dev - loss_host).abs(),
+            rel(&d_head_dev, &d_head_host),
+            rel(&dh_dev, &dh_host)
+        );
+        println!(
+            "  head device: H2D+D2H {:.1} MB vs jalur host {:.1} MB per langkah",
+            (t_len * d * 4 + d * v * 4 + d * v * 4 + t_len * d * 4) as f64 / 1e6,
+            (t_len * v * 4 * 2 + t_len * v * 4 * 2 + d * v * 4 + t_len * d * 4) as f64 / 1e6
+        );
+    }
+
     // --- paritas gradien blok delta: BPTT di GPU vs BPTT di CPU
     //
     // Ini gate yang sebenarnya untuk `delta_bwd_f32`: kernelnya harus menghasilkan

@@ -16,6 +16,7 @@ fn main() {
     let model = Model::new(Config::tiny(), &mut Rng::new(17));
 
     let (logits, _) = model.forward(&ids, 1);
+    let logits = logits.to_host();
     let mut st = model.new_decode_state();
     let mut worst = 0.0f32;
     let mut scale = 1e-9f32;

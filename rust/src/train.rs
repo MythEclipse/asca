@@ -319,8 +319,19 @@ pub fn save_resume(path: &str, model: &Model, step: usize) -> std::io::Result<()
     f.write_all(&(step as u64).to_le_bytes())?;
     for p in model.params() {
         f.write_all(&(p.numel() as u64).to_le_bytes())?;
-        for m in [&p.value, &p.m, &p.v] {
-            for v in m.d.iter() {
+        // Momen Adam bisa tinggal di VRAM (jalur resident). Yang ditulis harus yang
+        // benar-benar dipakai, bukan salinan host yang sudah basi.
+        let (m_own, v_own);
+        let (m_ref, v_ref) = match crate::cuda::param_moments(crate::cuda::param_key(&p.m.d)) {
+            Some((mm, vv)) => {
+                m_own = mm;
+                v_own = vv;
+                (&m_own, &v_own)
+            }
+            None => (&p.m.d, &p.v.d),
+        };
+        for m in [&p.value.d, m_ref, v_ref] {
+            for v in m.iter() {
                 f.write_all(&v.to_le_bytes())?;
             }
         }

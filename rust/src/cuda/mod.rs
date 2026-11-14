@@ -32,6 +32,46 @@ pub fn reset_stats() {
     LAUNCHES.store(0, Ordering::Relaxed);
 }
 
+/// Momen Adam (`m`, `v`) yang tinggal di VRAM, dikunci per parameter.
+///
+/// Kuncinya alamat buffer `m` di host: `Param` tidak pernah mengalokasi ulang `m`, jadi
+/// alamatnya stabil sepanjang training. Cache dibersihkan lewat [`reset_param_cache`]
+/// setiap kali model baru dibuat — tanpa itu, model yang kebetulan memakai alamat yang
+/// sama akan mewarisi momen milik model sebelumnya, dan hasilnya salah tanpa error.
+static PARAM_DEV: OnceLock<std::sync::Mutex<std::collections::HashMap<(usize, usize), (DevBuf, DevBuf)>>> =
+    OnceLock::new();
+
+fn param_dev() -> &'static std::sync::Mutex<std::collections::HashMap<(usize, usize), (DevBuf, DevBuf)>>
+{
+    PARAM_DEV.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Buang semua momen yang tersimpan di VRAM. Wajib dipanggil saat model baru dibuat.
+pub fn reset_param_cache() {
+    if let Some(m) = PARAM_DEV.get() {
+        m.lock().unwrap().clear();
+    }
+}
+
+/// Kunci cache untuk satu parameter.
+pub fn param_key(m: &[f32]) -> (usize, usize) {
+    (m.as_ptr() as usize, m.len())
+}
+
+/// Salinan momen dari VRAM, kalau parameter ini punya state di device.
+/// Dipakai checkpoint resume: yang ditulis harus momen yang benar-benar dipakai,
+/// bukan salinan host yang sudah basi.
+pub fn param_moments(key: (usize, usize)) -> Option<(Vec<f32>, Vec<f32>)> {
+    let map = param_dev().lock().unwrap();
+    let (dm, dv) = map.get(&key)?;
+    let n = key.1;
+    let mut m = vec![0.0f32; n];
+    let mut v = vec![0.0f32; n];
+    dm.download(&mut m).ok()?;
+    dv.download(&mut v).ok()?;
+    Some((m, v))
+}
+
 /// Ringkasan lalu lintas device. `steps` dipakai untuk membagi rata-rata per langkah.
 pub fn stats_report(steps: u64) -> String {
     let h2d = H2D_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
@@ -301,6 +341,144 @@ impl Gpu {
         Ok(Mat::from_vec(m, n, out))
     }
 
+    /// `C = A @ B` dengan semua operand sudah di device — tanpa satu pun transfer.
+    fn matmul_raw(
+        &self,
+        a: &DevBuf,
+        b: &DevBuf,
+        c: &DevBuf,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, n as i32);
+        self.launch(
+            "matmul_f32",
+            (((n as u32).div_ceil(32)), ((m as u32).div_ceil(32)), 1),
+            (32, 32, 1),
+            0,
+            vec![
+                &a.0 as *const _ as *mut c_void,
+                &b.0 as *const _ as *mut c_void,
+                &c.0 as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// `C = A^T @ B` dengan semua operand sudah di device.
+    fn matmul_ta_raw(
+        &self,
+        a: &DevBuf,
+        b: &DevBuf,
+        c: &DevBuf,
+        k: usize,
+        m: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let (mut mi, mut ki, mut ni) = (m as i32, k as i32, n as i32);
+        self.launch(
+            "matmul_ta_f32",
+            (((n as u32).div_ceil(32)), ((m as u32).div_ceil(32)), 1),
+            (32, 32, 1),
+            0,
+            vec![
+                &a.0 as *const _ as *mut c_void,
+                &b.0 as *const _ as *mut c_void,
+                &c.0 as *const _ as *mut c_void,
+                &mut mi as *mut _ as *mut c_void,
+                &mut ki as *mut _ as *mut c_void,
+                &mut ni as *mut _ as *mut c_void,
+            ],
+        )
+    }
+
+    /// `h_final @ head` **tanpa mengunduh hasilnya**. Matriks (T x vocab) — 100 MB pada
+    /// config 12,7M — tetap di VRAM dan langsung dipakai cross-entropy backward.
+    pub fn head_forward_dev(&self, h_final: &Mat, head: &Mat) -> Result<LogitsDev, String> {
+        let (t_len, d) = (h_final.rows, h_final.cols);
+        let v = head.cols;
+        assert_eq!(head.rows, d, "head_forward_dev: dimensi head tidak cocok");
+        let d_h = DevBuf::new(h_final.d.len() * 4)?;
+        let d_w = DevBuf::new(head.d.len() * 4)?;
+        let d_l = DevBuf::new(t_len * v * 4)?;
+        d_h.upload(&h_final.d)?;
+        d_w.upload(&head.d)?;
+        self.matmul_raw(&d_h, &d_w, &d_l, t_len, d, v)?;
+        unsafe { sys::cuCtxSynchronize() };
+        Ok(LogitsDev {
+            logits: d_l,
+            h_final: d_h,
+            t_len,
+            vocab: v,
+        })
+    }
+
+    /// Cross-entropy backward + dua GEMM kepala, seluruhnya di device.
+    ///
+    /// Mengembalikan `(loss, d_head, dh)`. `dlogits` — matriks (T x vocab) yang dulu
+    /// diunduh lalu diunggah dua kali lagi — tidak pernah menyentuh host.
+    pub fn head_bwd_dev(
+        &self,
+        dev: &LogitsDev,
+        targets: &[u32],
+        head_t: &Mat,
+    ) -> Result<(f32, Mat, Mat), String> {
+        let (t_len, v) = (dev.t_len, dev.vocab);
+        assert_eq!(targets.len(), t_len, "head_bwd_dev: targets tidak cocok");
+        let d = head_t.cols;
+        assert_eq!(head_t.rows, v, "head_bwd_dev: head_t harus (vocab, d)");
+        let d_targets = DevBuf::new(t_len * 4)?;
+        let d_dlogits = DevBuf::new(t_len * v * 4)?;
+        let d_losses = DevBuf::new(t_len * 4)?;
+        let d_head = DevBuf::new(d * v * 4)?;
+        let d_dh = DevBuf::new(t_len * d * 4)?;
+        let d_ht = DevBuf::new(head_t.d.len() * 4)?;
+        d_ht.upload(&head_t.d)?;
+        unsafe {
+            let rc =
+                sys::cuMemcpyHtoD_v2(d_targets.0, targets.as_ptr() as *const c_void, t_len * 4);
+            if rc != sys::SUCCESS {
+                return Err(sys::err(rc));
+            }
+        }
+        let (mut t_i, mut v_i) = (t_len as i32, v as i32);
+        let mut inv_t = 1.0f32 / t_len as f32;
+        self.launch(
+            "cross_entropy_bwd_f32",
+            (t_len as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &dev.logits.0 as *const _ as *mut c_void,
+                &d_targets.0 as *const _ as *mut c_void,
+                &d_dlogits.0 as *const _ as *mut c_void,
+                &d_losses.0 as *const _ as *mut c_void,
+                &mut t_i as *mut _ as *mut c_void,
+                &mut v_i as *mut _ as *mut c_void,
+                &mut inv_t as *mut _ as *mut c_void,
+            ],
+        )?;
+        // d_head = h_final^T @ dlogits ; dh = dlogits @ head^T
+        self.matmul_ta_raw(&dev.h_final, &d_dlogits, &d_head, t_len, d, v)?;
+        self.matmul_raw(&d_dlogits, &d_ht, &d_dh, t_len, v, d)?;
+        unsafe { sys::cuCtxSynchronize() };
+        let mut losses = vec![0.0f32; t_len];
+        d_losses.download(&mut losses)?;
+        let loss = losses.iter().sum::<f32>() * inv_t;
+        let mut d_head_out = vec![0.0f32; d * v];
+        d_head.download(&mut d_head_out)?;
+        let mut d_h_out = vec![0.0f32; t_len * d];
+        d_dh.download(&mut d_h_out)?;
+        Ok((
+            loss,
+            Mat::from_vec(d, v, d_head_out),
+            Mat::from_vec(t_len, d, d_h_out),
+        ))
+    }
+
     /// RMSNorm per baris di GPU. Mengembalikan (y, inv_rms).
     pub fn rmsnorm(&self, x: &Mat, eps: f32) -> Result<(Mat, Vec<f32>), String> {
         let (rows, cols) = (x.rows, x.cols);
@@ -386,6 +564,65 @@ impl Gpu {
         d_dlogits.download(&mut dlogits_out)?;
 
         Ok((loss, Mat::from_vec(t_len, v, dlogits_out)))
+    }
+
+    /// AdamW dengan momen `m`/`v` yang tetap di VRAM antar langkah.
+    ///
+    /// Versi per operasi menyalin 7 buffer per parameter per langkah (nilai, gradien, m,
+    /// v naik; nilai, m, v turun) — 357 MB/langkah pada model 12,7M. Dengan momen yang
+    /// tinggal di device, tinggal 3 salinan: nilai + gradien naik, nilai turun.
+    #[allow(clippy::too_many_arguments)]
+    pub fn adamw_resident(
+        &self,
+        key: (usize, usize),
+        val: &mut [f32],
+        grad: &[f32],
+        m0: &[f32],
+        v0: &[f32],
+        lr: f32,
+        beta1: f32,
+        beta2: f32,
+        eps_t: f32,
+        wd: f32,
+    ) -> Result<(), String> {
+        let n = val.len();
+        assert_eq!(n, grad.len());
+        let d_val = DevBuf::new(n * 4)?;
+        let d_grad = DevBuf::new(n * 4)?;
+        d_val.upload(val)?;
+        d_grad.upload(grad)?;
+        let mut map = param_dev().lock().unwrap();
+        if !map.contains_key(&key) {
+            let dm = DevBuf::new(n * 4)?;
+            let dv = DevBuf::new(n * 4)?;
+            dm.upload(m0)?;
+            dv.upload(v0)?;
+            map.insert(key, (dm, dv));
+        }
+        let (dm, dv) = map.get(&key).expect("momen baru saja disisipkan");
+        let mut n_i = n as i32;
+        let (mut lr_c, mut b1, mut b2, mut eps_c, mut wd_c) = (lr, beta1, beta2, eps_t, wd);
+        self.launch(
+            "adamw_f32",
+            (n.div_ceil(256) as u32, 1, 1),
+            (256, 1, 1),
+            0,
+            vec![
+                &d_val.0 as *const _ as *mut c_void,
+                &d_grad.0 as *const _ as *mut c_void,
+                &dm.0 as *const _ as *mut c_void,
+                &dv.0 as *const _ as *mut c_void,
+                &mut lr_c as *mut _ as *mut c_void,
+                &mut b1 as *mut _ as *mut c_void,
+                &mut b2 as *mut _ as *mut c_void,
+                &mut eps_c as *mut _ as *mut c_void,
+                &mut wd_c as *mut _ as *mut c_void,
+                &mut n_i as *mut _ as *mut c_void,
+            ],
+        )?;
+        unsafe { sys::cuCtxSynchronize() };
+        d_val.download(val)?;
+        Ok(())
     }
 
     /// Update AdamW di GPU untuk satu parameter.
@@ -731,6 +968,28 @@ pub struct DeltaDev {
     pub dh: usize,
 }
 
+/// Logits kepala output yang tinggal di VRAM antara forward dan backward.
+///
+/// Yang disimpan bukan cuma `logits` (T x vocab) tapi juga `h_final` (T x d), karena
+/// `d_head = h_final^T @ dlogits` membutuhkannya lagi dan mengunggahnya ulang hanya
+/// membuang waktu.
+pub struct LogitsDev {
+    logits: DevBuf,
+    h_final: DevBuf,
+    t_len: usize,
+    vocab: usize,
+}
+
+impl LogitsDev {
+    /// Unduh logits ke host. Dipakai jalur evaluasi dan fallback kalau GPU gagal —
+    /// bukan jalur training.
+    pub fn to_host(&self) -> Result<Mat, String> {
+        let mut out = vec![0.0f32; self.t_len * self.vocab];
+        self.logits.download(&mut out)?;
+        Ok(Mat::from_vec(self.t_len, self.vocab, out))
+    }
+}
+
 impl DeltaDev {
     /// Unduh riwayat state. Hanya untuk uji paritas — jalur training memakai
     /// [`Gpu::delta_bwd_dev`] dan tidak pernah menyalinnya ke host.
@@ -788,6 +1047,29 @@ pub fn set_enabled(v: bool) {
 /// komponen satu per satu, sehingga kontribusi tiap komponen bisa diukur A/B pada
 /// binary yang sama — tanpa itu, membandingkan "semua GPU" lawan "semua CPU" hanya
 /// memberi satu angka gabungan dan tidak bisa menyalahkan komponen mana pun.
+/// Komponen yang **terukur lebih lambat** di GPU, jadi hanya dipakai kalau diminta
+/// eksplisit lewat `ASCA_GPU_ON=adamw`.
+///
+/// AdamW masuk kategori ini: 3 salinan state optimizer (153 MB/langkah pada model 12,7M)
+/// lebih mahal daripada 12,7 juta update di CPU — bahkan di Colab T4 yang hanya 2 vCPU
+/// (terukur 1.866 vs 1.650 tok/s). Yang menang bukan memindahkan hitungannya ke GPU,
+/// tapi berhenti menyalin state-nya; itu baru mungkin kalau seluruh model tinggal di
+/// device.
+pub fn offload_opt_in(component: &str) -> bool {
+    static ON: OnceLock<Vec<String>> = OnceLock::new();
+    let on = ON.get_or_init(|| {
+        std::env::var("ASCA_GPU_ON")
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    available() && on.iter().any(|c| c == component)
+}
+
 pub fn offload(component: &str) -> bool {
     static OFF: OnceLock<Vec<String>> = OnceLock::new();
     let off = OFF.get_or_init(|| {

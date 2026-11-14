@@ -401,7 +401,26 @@ impl AdamW {
         let eps_t = self.eps * bc2.sqrt();
         let wd = self.lr * self.wd;
         let n = p.value.d.len();
-        if crate::cuda::available() && n >= 32768 {
+        // Jalur utama: momen tinggal di VRAM, jadi hanya nilai + gradien yang naik dan
+        // nilai yang turun (3 salinan, bukan 7).
+        if crate::cuda::offload_opt_in("adamw") && n >= 32768 {
+            if let Some(g) = crate::cuda::gpu() {
+                let key = crate::cuda::param_key(&p.m.d);
+                if g.adamw_resident(
+                    key, &mut p.value.d, &p.grad.d, &p.m.d, &p.v.d, lr, b1, b2, eps_t, wd,
+                )
+                .is_ok()
+                {
+                    return;
+                }
+            }
+        }
+        // Jalur cadangan: momen di host mungkin basi kalau jalur resident sempat dipakai.
+        if let Some((mm, vv)) = crate::cuda::param_moments(crate::cuda::param_key(&p.m.d)) {
+            p.m.d.copy_from_slice(&mm);
+            p.v.d.copy_from_slice(&vv);
+        }
+        if crate::cuda::offload_opt_in("adamw") && n >= 32768 {
             if let Some(g) = crate::cuda::gpu() {
                 if g.adamw_update(
                     &mut p.value.d,

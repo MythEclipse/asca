@@ -13,6 +13,11 @@ use crate::tensor::{AdamW, Mat, Param, Rng, rmsnorm_rows, rmsnorm_rows_backward}
 
 pub const EPS: f32 = 1e-6;
 
+/// Ambang pemakaian GPU untuk kepala output, dalam elemen logits (T x vocab).
+/// Sama dengan ambang cross-entropy: di bawah ini salinan dan peluncuran kernel lebih
+/// mahal daripada kerja hitungnya.
+pub const HEAD_GPU_MIN: usize = 65536;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub vocab: usize,
@@ -484,6 +489,29 @@ pub struct Layer {
     pub moe: HashMoe,
 }
 
+/// Logits kepala output.
+///
+/// `Dev` berarti matriks (T x vocab) — 100 MB pada config 12,7M — masih di VRAM.
+/// Tanpa ini, satu langkah menyalinnya empat kali: turun setelah GEMM kepala, naik untuk
+/// cross-entropy, turun lagi sebagai `dlogits`, lalu naik dua kali untuk dua GEMM kepala
+/// di backward.
+pub enum Logits {
+    Host(Mat),
+    Dev(crate::cuda::LogitsDev),
+}
+
+impl Logits {
+    pub fn to_host(&self) -> Mat {
+        match self {
+            Logits::Host(m) => m.clone(),
+            Logits::Dev(d) => d.to_host().expect("unduh logits gagal"),
+        }
+    }
+    pub fn is_dev(&self) -> bool {
+        matches!(self, Logits::Dev(_))
+    }
+}
+
 pub struct Model {
     pub cfg: Config,
     pub embed: Param,
@@ -517,6 +545,9 @@ pub struct ModelCache {
 
 impl Model {
     pub fn new(cfg: Config, rng: &mut Rng) -> Self {
+        // Model baru = alamat parameter baru; momen Adam milik model sebelumnya di VRAM
+        // tidak boleh ikut terbawa (kuncinya alamat, jadi bisa bertabrakan).
+        crate::cuda::reset_param_cache();
         let mut embed = Mat::zeros(cfg.vocab, cfg.d_model);
         embed.fill_rand(rng, 0.02);
         let mut head = Mat::zeros(cfg.d_model, cfg.vocab);
@@ -604,7 +635,7 @@ impl Model {
         h_final.matmul(&self.head.value)
     }
 
-    pub fn forward(&self, ids: &[u32], batch: usize) -> (Mat, ModelCache) {
+    pub fn forward(&self, ids: &[u32], batch: usize) -> (Logits, ModelCache) {
         let t_len = ids.len();
         let d = self.cfg.d_model;
         let mut x0 = Mat::zeros(t_len, d);
@@ -634,7 +665,16 @@ impl Model {
             });
         }
         let h_final = crate::prof::time(6, || rmsnorm_rows(&x, EPS));
-        let logits = crate::prof::time(7, || h_final.matmul(&self.head.value));
+        let logits = crate::prof::time(7, || {
+            if crate::cuda::offload("head") && t_len * self.cfg.vocab >= HEAD_GPU_MIN {
+                if let Some(g) = crate::cuda::gpu() {
+                    if let Ok(l) = g.head_forward_dev(&h_final, &self.head.value) {
+                        return Logits::Dev(l);
+                    }
+                }
+            }
+            Logits::Host(h_final.matmul(&self.head.value))
+        });
         (
             logits,
             ModelCache {
@@ -649,6 +689,7 @@ impl Model {
     /// Loss saja (untuk gradcheck / evaluasi), tanpa menyentuh gradien.
     pub fn loss(&self, ids: &[u32], targets: &[u32]) -> f32 {
         let (logits, _) = self.forward(ids, 1);
+        let logits = logits.to_host();
         let v = self.cfg.vocab;
         let mut loss = 0.0f32;
         for t in 0..logits.rows {
@@ -663,30 +704,56 @@ impl Model {
         loss / logits.rows as f32
     }
 
-    /// Backward + cross-entropy. `targets[t]` = byte berikutnya.
-    /// Mengembalikan loss rata-rata per token dan mengakumulasi gradien.
-    pub fn backward(&mut self, cache: &ModelCache, logits: &Mat, targets: &[u32]) -> f32 {
-        let t_len = logits.rows;
-        let v = self.cfg.vocab;
-        // Jalur GPU: cross-entropy + softmax backward dihitung dalam satu kernel terpadu
-        // per token di GPU. Menghilangkan 25 juta exp/ln di CPU dan transfer 100 MB dlogits.
-        let (loss, dlogits) = if crate::cuda::available() && t_len * v >= 65536 {
-            if let Some(g) = crate::cuda::gpu() {
-                match g.cross_entropy_bwd(logits, targets) {
-                    Ok(res) => res,
-                    Err(_) => cpu_cross_entropy(logits, targets, v),
-                }
-            } else {
-                cpu_cross_entropy(logits, targets, v)
+    /// Jalur kepala output dengan logits di host: cross-entropy (GPU kalau besar, kalau
+    /// tidak CPU) lalu dua GEMM kepala. Dipakai kalau logits tidak tinggal di VRAM.
+    fn head_bwd_host(
+        &self,
+        cache: &ModelCache,
+        logits: &Mat,
+        targets: &[u32],
+        v: usize,
+    ) -> (f32, Mat, Mat) {
+        let (loss, dlogits) = if crate::cuda::available() && logits.rows * v >= HEAD_GPU_MIN {
+            match crate::cuda::gpu().map(|g| g.cross_entropy_bwd(logits, targets)) {
+                Some(Ok(res)) => res,
+                _ => cpu_cross_entropy(logits, targets, v),
             }
         } else {
             cpu_cross_entropy(logits, targets, v)
         };
-
-        // head
         let d_head = crate::prof::time(9, || cache.h_final.matmul_ta(&dlogits));
-        self.head.grad.axpy(1.0, &d_head);
         let dh = crate::prof::time(9, || dlogits.matmul_t(&self.head.value));
+        (loss, d_head, dh)
+    }
+
+    /// Backward + cross-entropy. `targets[t]` = byte berikutnya.
+    /// Mengembalikan loss rata-rata per token dan mengakumulasi gradien.
+    pub fn backward(&mut self, cache: &ModelCache, logits: &Logits, targets: &[u32]) -> f32 {
+        let v = self.cfg.vocab;
+        // Dua jalur kepala output. Kalau logits tinggal di VRAM, cross-entropy dan kedua
+        // GEMM kepala jalan di sana dan `dlogits` (100 MB) tidak pernah ke host.
+        let (loss, d_head, dh) = match logits {
+            Logits::Dev(dev) if crate::cuda::offload("head") => {
+                let head_t = self.head.value.transpose();
+                let res = crate::prof::time(9, || {
+                    crate::cuda::gpu().map(|g| g.head_bwd_dev(dev, targets, &head_t))
+                });
+                match res {
+                    Some(Ok(r)) => r,
+                    // GPU gagal di tengah jalan: turunkan logits, kerjakan di CPU.
+                    _ => {
+                        let lg = dev.to_host().expect("unduh logits gagal");
+                        self.head_bwd_host(cache, &lg, targets, v)
+                    }
+                }
+            }
+            Logits::Dev(dev) => {
+                let lg = dev.to_host().expect("unduh logits gagal");
+                self.head_bwd_host(cache, &lg, targets, v)
+            }
+            Logits::Host(lg) => self.head_bwd_host(cache, lg, targets, v),
+        };
+        self.head.grad.axpy(1.0, &d_head);
 
         let mut dx = rmsnorm_rows_backward(&cache.layers.last().unwrap().x_out, &dh, EPS);
         for (li, layer) in self.layers.iter_mut().enumerate().rev() {

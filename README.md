@@ -106,13 +106,15 @@ block per (head, sequence) with the whole time loop inside the kernel. Parity wi
 ≤ 2.6e-7 relative, gradients match the verified CPU BPTT to 8.0e-7, and training loss is
 identical.
 
-Moving the delta block to the GPU is worth **+12.4%** on a 20-core laptop (3,530 → 3,967
-tok/s) and **+36%** on a Colab T4 with 2 vCPUs (1,010 → 1,374 tok/s, 12.7M parameters) — but only after the state history stopped crossing PCIe. The first attempt
+Keeping the delta block and the output head on the GPU is worth **+47%** on a 20-core
+laptop (3,530 → 5,198 tok/s) and **+85%** on a Colab T4 with 2 vCPUs (1,010 → 1,866 tok/s,
+12.7M parameters), with per-step PCIe traffic down 54% (1,602 → 743 MB) — but only after the state history stopped crossing PCIe. The first attempt
 moved *just* the scan and was **slower** (3,265 tok/s): the BPTT was still on the CPU, so
 313 MB of state had to be downloaded every step. Device-resident state plus a BPTT kernel
-fixed it. The same instrumentation now says where the remaining 1.6 GB/step of traffic
-is: the output head and AdamW still round-trip `logits` (100 MB) and 12.7M optimizer
-states on every step. See [`docs/CUDA.md`](docs/CUDA.md).
+fixed it. The output head followed the same pattern (bit-identical, 523 → 31 MB/step).
+AdamW did not: keeping its moments on the device still lost to plain CPU updates, even on
+2 vCPUs, so that path is now opt-in — a measured negative result is worth more than a
+plausible-looking optimisation. See [`docs/CUDA.md`](docs/CUDA.md).
 
 ## Repository layout
 

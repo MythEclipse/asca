@@ -117,6 +117,53 @@ Dua hal yang perlu dicatat jujur:
   urutannya bisa terbalik — karena itu `ASCA_GPU_OFF=moe` sekarang ada, supaya bisa diukur
   per mesin, bukan ditebak.
 
+### 3c. Kepala output tinggal di device — dan AdamW yang justru kalah
+
+Dua kandidat berikutnya dari data lalu lintas: kepala output (~500 MB/langkah) dan AdamW
+(~357 MB/langkah). Yang pertama menang, yang kedua **kalah** — dan angka negatifnya
+dicatat di sini karena itu yang mencegah jalur lambat dipertahankan.
+
+**Kepala output.** `logits` (T x vocab, 100 MB) dulu turun setelah GEMM kepala, naik lagi
+untuk cross-entropy, turun sebagai `dlogits`, lalu naik dua kali untuk dua GEMM kepala di
+backward. Sekarang `head_forward_dev` menyimpannya di VRAM dan `head_bwd_dev` menjalankan
+cross-entropy + `d_head = h_final^T dlogits` + `dh = dlogits head^T` di sana. Hasilnya
+**bit-identik** (loss, `d_head`, `dh` selisih 0,0e0) dan lalu lintasnya 523 MB → 31 MB per
+langkah (T=2048).
+
+| | laptop (20 core) | T4 (2 vCPU) |
+|---|---|---|
+| kepala di host | 4.088 tok/s | 1.443 tok/s |
+| kepala di device | **4.837** (+18,3%) | **1.650** (+14,4%) |
+
+**AdamW.** Momen `m`/`v` (2 x 50,9 MB) bisa tinggal di VRAM, jadi salinannya turun dari 7
+buffer per parameter menjadi 3. Tapi tetap **lebih lambat daripada CPU**, bahkan di T4:
+
+| AdamW | laptop | T4 |
+|---|---|---|
+| per operasi (7 salinan, kode lama) | 4.837 → turun | — |
+| momen di VRAM (3 salinan) | 5.145 tok/s | 1.650 tok/s |
+| CPU (12,7 juta update) | **5.198 tok/s** | **1.866 tok/s** |
+
+Jadi jalur AdamW GPU yang lama itu **regresi**: 153 MB/langkah lebih mahal daripada
+12,7 juta update di CPU, bahkan dengan 2 vCPU. Sekarang AdamW jalan di CPU secara default
+dan jalur GPU-nya hanya aktif kalau diminta (`ASCA_GPU_ON=adamw`). Pelajarannya sama
+dengan `scatter_rows`: memindahkan hitungan ke GPU tidak menolong kalau state-nya tetap
+harus menyeberang. Yang menang adalah berhenti menyalin — dan itu baru mungkin kalau
+seluruh model tinggal di device.
+
+### Total sejauh ini
+
+| | awal | sekarang | perubahan |
+|---|---|---|---|
+| laptop (12,7M, b8 x s256) | 3.530 tok/s | **5.198** | +47% |
+| T4 (config sama) | 1.010 tok/s | **1.866** | +85% |
+| lalu lintas per langkah | 1.602 MB | **743 MB** | -54% |
+
+Loss di semua konfigurasi tetap 6,1714 (20 langkah) dan 6,1421–6,1422 (val). Sisa 743 MB
+per langkah berasal dari parameter yang diunggah ulang oleh setiap operasi dan dari
+aktivasi antar layer — keduanya baru bisa hilang dengan memindahkan seluruh model ke
+device, bukan per komponen.
+
 ### Bug yang ditemukan gate-nya sendiri
 
 Kernel `delta_bwd_f32` versi pertama menghasilkan galat **0,87 relatif** — bukan beda

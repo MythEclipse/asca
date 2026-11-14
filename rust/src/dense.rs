@@ -179,6 +179,8 @@ impl DenseLayer {
 
 impl DenseModel {
     pub fn new(cfg: DenseCfg, rng: &mut Rng) -> Self {
+        // Lihat catatan di `Model::new`: momen Adam di VRAM dikunci alamat parameter.
+        crate::cuda::reset_param_cache();
         let mut embed = Mat::zeros(cfg.vocab, cfg.d_model);
         embed.fill_rand(rng, 0.02);
         let mut head = Mat::zeros(cfg.d_model, cfg.vocab);
