@@ -74,18 +74,37 @@ impl Drop for DevBuf {
 
 impl Gpu {
     fn init() -> Option<Gpu> {
-        let ptx = PTX?;
-        unsafe {
-            if sys::cuInit(0) != sys::SUCCESS {
+        // Setiap kegagalan dicatat BESERTA kode errornya. Versi sebelumnya hanya
+        // `return None` di lima tempat berbeda, sehingga "GPU tidak tersedia" tidak bisa
+        // dibedakan antara driver tidak ada, PTX gagal JIT, atau arsitektur tidak cocok.
+        // Di mesin lain itu berarti menebak.
+        macro_rules! gagal {
+            ($tahap:expr, $rc:expr) => {{
+                let _ = INIT_ERR.set(format!("{} (kode {})", $tahap, $rc));
                 return None;
+            }};
+        }
+        let ptx = match PTX {
+            Some(p) => p,
+            None => {
+                let _ = INIT_ERR.set(format!("PTX tidak ter-embed saat build (arch {ARCH})"));
+                return None;
+            }
+        };
+        unsafe {
+            let rc = sys::cuInit(0);
+            if rc != sys::SUCCESS {
+                gagal!("cuInit gagal - driver CUDA tidak termuat", rc);
             }
             let mut dev = sys::Device(0);
-            if sys::cuDeviceGet(&mut dev, 0) != sys::SUCCESS {
-                return None;
+            let rc = sys::cuDeviceGet(&mut dev, 0);
+            if rc != sys::SUCCESS {
+                gagal!("cuDeviceGet gagal - tidak ada GPU terlihat", rc);
             }
             let mut ctx = sys::Context(std::ptr::null_mut());
-            if sys::cuCtxCreate_v2(&mut ctx, 0, dev) != sys::SUCCESS {
-                return None;
+            let rc = sys::cuCtxCreate_v2(&mut ctx, 0, dev);
+            if rc != sys::SUCCESS {
+                gagal!("cuCtxCreate gagal", rc);
             }
             let mut buf = vec![0u8; 256];
             sys::cuDeviceGetName(buf.as_mut_ptr() as *mut i8, 255, dev);
@@ -96,9 +115,16 @@ impl Gpu {
             sys::cuDeviceGetAttribute(&mut sm_count, sys::ATTRIBUTE_MULTIPROCESSORS, dev);
 
             let mut module = sys::Module(std::ptr::null_mut());
-            let src = CString::new(ptx).ok()?;
-            if sys::cuModuleLoadData(&mut module, src.as_ptr() as *const c_void) != sys::SUCCESS {
-                return None;
+            let src = match CString::new(ptx) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = INIT_ERR.set("PTX mengandung byte nol".to_string());
+                    return None;
+                }
+            };
+            let rc = sys::cuModuleLoadData(&mut module, src.as_ptr() as *const c_void);
+            if rc != sys::SUCCESS {
+                gagal!("PTX gagal dimuat/JIT untuk arch target", rc);
             }
             Some(Gpu {
                 name,
@@ -305,6 +331,9 @@ unsafe impl Sync for Gpu {}
 
 static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
 
+/// Alasan konkret kegagalan inisialisasi GPU, untuk diagnosis di mesin baru.
+static INIT_ERR: OnceLock<String> = OnceLock::new();
+
 /// `None` kalau tidak ada nvcc saat build, PTX gagal dimuat, atau tidak ada device.
 pub fn gpu() -> Option<&'static Gpu> {
     GPU.get_or_init(Gpu::init).as_ref()
@@ -337,7 +366,10 @@ pub fn set_enabled(v: bool) {
 pub fn describe() -> String {
     match gpu() {
         Some(g) => format!("GPU: {} ({} SM, {}, {})", g.name, g.sm_count, ARCH, NVCC),
-        None => format!("GPU: tidak tersedia (arch target {ARCH})"),
+        None => match INIT_ERR.get() {
+            Some(e) => format!("GPU: tidak tersedia (arch target {ARCH}) - {e}"),
+            None => format!("GPU: tidak tersedia (arch target {ARCH})"),
+        },
     }
 }
 
